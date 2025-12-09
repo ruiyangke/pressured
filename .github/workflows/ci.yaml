@@ -1,0 +1,236 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:3
+
+    steps:
+      - name: Install dependencies
+        run: |
+          apk add --no-cache \
+            git \
+            build-base \
+            cmake \
+            pkgconfig \
+            curl-dev \
+            json-c-dev \
+            lua5.4-dev \
+            openssl-dev
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure CMake
+        env:
+          CMAKE_BUILD_TYPE: ${{ env.BUILD_TYPE }}
+        run: |
+          mkdir -p build
+          cd build
+          cmake -DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE" ..
+
+      - name: Build
+        env:
+          CMAKE_BUILD_TYPE: ${{ env.BUILD_TYPE }}
+        run: cmake --build build --config "$CMAKE_BUILD_TYPE"
+
+      - name: Run Tests
+        run: cd build && ctest --output-on-failure
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install linters
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cppcheck clang-format
+
+      - name: Run cppcheck
+        run: |
+          cppcheck --enable=warning,style,performance,portability \
+            --suppress=missingIncludeSystem \
+            --suppress=constParameterPointer \
+            --suppress=constVariablePointer \
+            --suppress=constParameter \
+            --suppress=constVariable \
+            --suppress=constParameterCallback \
+            --suppress=variableScope \
+            --suppress=unreadVariable \
+            --suppress=unusedStructMember \
+            --suppress=shadowVariable \
+            --suppress=normalCheckLevelMaxBranches \
+            --error-exitcode=1 \
+            src/ include/ plugins/
+
+      - name: Check formatting
+        run: |
+          find src include plugins \( -name '*.c' -o -name '*.h' \) | \
+            xargs clang-format --dry-run --Werror
+
+  helm-lint:
+    name: Helm Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+
+      - name: Lint Helm chart
+        run: helm lint charts/pressured
+
+      - name: Template Helm chart
+        run: helm template test charts/pressured --debug
+
+  docker-build:
+    name: Docker Build (Test)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: pressured:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Build and push dev images on main branch only (multi-arch with native runners)
+  docker-push-dev:
+    name: Push Dev Image (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    needs: [build-and-test, lint, docker-build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        with:
+          images: ghcr.io/${{ env.GITHUB_REPOSITORY }}
+          tags: |
+            type=raw,value=dev
+            type=sha,prefix=dev-
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.runner }}
+          path: ${{ runner.temp }}/digests
+          if-no-files-found: error
+          retention-days: 1
+
+  # Merge digests and push multi-arch manifest
+  docker-push-dev-manifest:
+    name: Push Dev Multi-arch Manifest
+    runs-on: ubuntu-latest
+    needs: [docker-push-dev]
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v6
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=dev
+            type=sha,prefix=dev-
+
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)

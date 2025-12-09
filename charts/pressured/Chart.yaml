@@ -1,0 +1,17 @@
+apiVersion: v2
+name: pressured
+description: A minimal, pluggable pre-OOM watcher for Kubernetes
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - kubernetes
+  - oom
+  - memory
+  - monitoring
+  - observability
+home: https://github.com/ruiyangke/pressured
+sources:
+  - https://github.com/ruiyangke/pressured
+maintainers:
+  - name: Rui Yang

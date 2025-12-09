@@ -1,0 +1,40 @@
+{{- if and .Values.rbac.create (eq .Values.mode "cluster") -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "pressured.fullname" . }}
+  labels:
+    {{- include "pressured.labels" . | nindent 4 }}
+rules:
+  # Read nodes (required for Kubelet API access in cluster mode)
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  # Proxy to kubelet (for stats/summary endpoint)
+  - apiGroups: [""]
+    resources: ["nodes/proxy"]
+    verbs: ["get"]
+  # Read pods (for container discovery)
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Read events (for OOM kill detection)
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "pressured.fullname" . }}
+  labels:
+    {{- include "pressured.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "pressured.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "pressured.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

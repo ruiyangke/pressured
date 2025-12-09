@@ -1,0 +1,199 @@
+{{- if eq .Values.mode "cluster" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pressured.fullname" . }}
+  labels:
+    {{- include "pressured.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "pressured.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.lua.enabled }}
+        checksum/lua-scripts: {{ include (print $.Template.BasePath "/lua-configmap.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "pressured.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "pressured.serviceAccountName" . }}
+      {{- if .Values.priorityClassName }}
+      priorityClassName: {{ .Values.priorityClassName }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- $tag := .Values.image.tag | default .Chart.AppVersion }}
+          {{- if not $tag }}
+          {{- fail "image.tag or Chart.AppVersion must be set" }}
+          {{- end }}
+          image: "{{ .Values.image.repository }}:{{ $tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--config"
+            - "/etc/pressured/config.json"
+            {{- if .Values.config.log_level }}
+            - "--log-level"
+            - {{ .Values.config.log_level | quote }}
+            {{- end }}
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - "test -f /proc/1/exe"
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - "test -f /proc/1/exe"
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/pressured
+              readOnly: true
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            {{- if and .Values.lua.enabled (or .Values.lua.scripts .Values.lua.existingConfigMap) }}
+            - name: lua-scripts
+              mountPath: {{ .Values.lua.scriptsDir }}
+              readOnly: true
+            {{- end }}
+            {{- if and .Values.storage.enabled (eq .Values.storage.backend "gcs") .Values.storage.gcs.existingSecret }}
+            - name: gcs-credentials
+              mountPath: /var/secrets/google
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            # Plugin directory for loading plugins
+            - name: PRESSURED_PLUGIN_DIR
+              value: "/usr/local/lib/pressured/plugins"
+            {{- if .Values.lua.enabled }}
+            {{- if .Values.lua.inlineScript }}
+            # Inline Lua script (takes precedence over script files)
+            - name: PRESSURED_LUA_INLINE
+              value: {{ .Values.lua.inlineScript | quote }}
+            {{- else if or .Values.lua.scripts .Values.lua.existingConfigMap }}
+            # Directory containing Lua script files
+            - name: PRESSURED_LUA_SCRIPTS_DIR
+              value: {{ .Values.lua.scriptsDir | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.storage.enabled }}
+            # Storage configuration
+            - name: PRESSURED_STORAGE_PATH
+              value: {{ .Values.storage.local.path | quote }}
+            {{- if eq .Values.storage.backend "s3" }}
+            {{- if .Values.storage.s3.existingSecret }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.storage.s3.existingSecret }}
+                  key: {{ .Values.storage.s3.accessKeyIdKey }}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.storage.s3.existingSecret }}
+                  key: {{ .Values.storage.s3.secretAccessKeyKey }}
+            {{- end }}
+            # S3 config (bucket, prefix, endpoint) is read from config.json
+            # AWS_REGION is set for credential chain compatibility
+            - name: AWS_REGION
+              value: {{ .Values.storage.s3.region | quote }}
+            {{- end }}
+            {{- if eq .Values.storage.backend "gcs" }}
+            {{- if .Values.storage.gcs.existingSecret }}
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: "/var/secrets/google/{{ .Values.storage.gcs.serviceAccountKeyKey }}"
+            {{- end }}
+            {{- end }}
+            {{- if eq .Values.storage.backend "azure" }}
+            - name: AZURE_STORAGE_ACCOUNT
+              value: {{ .Values.storage.azure.storageAccount | quote }}
+            {{- if .Values.storage.azure.existingSecret }}
+            - name: AZURE_STORAGE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.storage.azure.existingSecret }}
+                  key: {{ .Values.storage.azure.storageAccountKeyKey }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.extraEnvVars }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "pressured.fullname" . }}
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim | default (include "pressured.fullname" .) }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir: {}
+        {{- if and .Values.lua.enabled (or .Values.lua.scripts .Values.lua.existingConfigMap) }}
+        - name: lua-scripts
+          configMap:
+            name: {{ .Values.lua.existingConfigMap | default (printf "%s-lua-scripts" (include "pressured.fullname" .)) }}
+        {{- end }}
+        {{- if and .Values.storage.enabled (eq .Values.storage.backend "gcs") .Values.storage.gcs.existingSecret }}
+        - name: gcs-credentials
+          secret:
+            secretName: {{ .Values.storage.gcs.existingSecret }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

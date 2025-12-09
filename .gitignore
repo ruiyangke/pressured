@@ -1,0 +1,50 @@
+# C build artifacts
+/build/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+.cmake/
+
+# Nix
+/.direnv/
+result
+result-*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.clangd/
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*.log
+*.tmp
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Debug
+core
+*.dSYM/
+vgcore.*
+
+# Generated
+*.pb
+*.pb.gz

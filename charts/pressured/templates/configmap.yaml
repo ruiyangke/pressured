@@ -1,0 +1,88 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pressured.fullname" . }}
+  labels:
+    {{- include "pressured.labels" . | nindent 4 }}
+data:
+  config.json: |
+    {
+      "source": {
+        "mode": {{ if eq .Values.mode "cluster" }}"kubelet"{{ else }}"cgroup"{{ end }},
+        "poll_interval_ms": {{ if eq .Values.mode "cluster" }}{{ .Values.config.source.kubelet.poll_interval_ms }}{{ else }}{{ .Values.config.source.cgroup.poll_interval_ms }}{{ end }},
+        "cgroup": {
+          "path": {{ .Values.config.source.cgroup.path | quote }}
+        },
+        "kubelet": {
+          {{- $kubeletItems := list }}
+          {{- if .Values.config.source.kubelet.namespace_filter }}
+          {{- $kubeletItems = append $kubeletItems (printf "\"namespace_filter\": %s" (.Values.config.source.kubelet.namespace_filter | quote)) }}
+          {{- end }}
+          {{- if .Values.config.source.kubelet.label_selector }}
+          {{- $kubeletItems = append $kubeletItems (printf "\"label_selector\": %s" (.Values.config.source.kubelet.label_selector | quote)) }}
+          {{- end }}
+          {{- if $kubeletItems }}
+          {{ join ",\n          " $kubeletItems | nindent 10 }}
+          {{- end }}
+        }
+      },
+      "thresholds": {
+        "warn_percent": {{ .Values.config.thresholds.warn_percent }},
+        "critical_percent": {{ .Values.config.thresholds.critical_percent }},
+        "hysteresis_percent": {{ .Values.config.thresholds.hysteresis_percent }},
+        "cooldown_seconds": {{ .Values.config.thresholds.cooldown_seconds }}
+      },
+      {{- if .Values.storage.enabled }}
+      "storage": {
+        "backend": {{ .Values.storage.backend | quote }},
+        {{- if eq .Values.storage.backend "local" }}
+        "local": {
+          "path": {{ .Values.storage.local.path | quote }}
+        }
+        {{- else if eq .Values.storage.backend "s3" }}
+        "s3": {
+          "bucket": {{ .Values.storage.s3.bucket | quote }},
+          "prefix": {{ .Values.storage.s3.prefix | quote }},
+          "region": {{ .Values.storage.s3.region | quote }}
+          {{- if .Values.storage.s3.endpoint }},
+          "endpoint": {{ .Values.storage.s3.endpoint | quote }}
+          {{- end }}
+        }
+        {{- else if eq .Values.storage.backend "gcs" }}
+        "gcs": {
+          "bucket": {{ .Values.storage.gcs.bucket | quote }},
+          "prefix": {{ .Values.storage.gcs.prefix | quote }}
+        }
+        {{- else if eq .Values.storage.backend "azure" }}
+        "azure": {
+          "container": {{ .Values.storage.azure.container | quote }},
+          "prefix": {{ .Values.storage.azure.prefix | quote }},
+          "storage_account": {{ .Values.storage.azure.storageAccount | quote }}
+        }
+        {{- end }}
+      },
+      {{- end }}
+      {{- if or .Values.lua.enabled (and .Values.storage.enabled (ne .Values.storage.backend "local")) }}
+      "plugins": {
+        {{- if .Values.lua.enabled }}
+        "lua": {
+          {{- if .Values.lua.inlineScript }}
+          "inline_script": {{ .Values.lua.inlineScript | quote }}
+          {{- else if or .Values.lua.scripts .Values.lua.existingConfigMap }}
+          "scripts_dir": {{ .Values.lua.scriptsDir | quote }}
+          {{- end }}
+          {{- if .Values.lua.timeoutMs }},
+          "timeout_ms": {{ .Values.lua.timeoutMs }}
+          {{- end }}
+        }{{ if and .Values.storage.enabled (ne .Values.storage.backend "local") }},{{ end }}
+        {{- end }}
+        {{- if and .Values.storage.enabled (ne .Values.storage.backend "local") }}
+        "storage_local": {
+          "enabled": false
+        }
+        {{- end }}
+      },
+      {{- end }}
+      "dry_run": {{ .Values.config.dry_run }},
+      "log_level": {{ .Values.config.log_level | quote }}
+    }
