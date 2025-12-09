@@ -1,0 +1,18 @@
+{{- if and .Values.lua.enabled (not .Values.lua.existingConfigMap) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pressured.fullname" . }}-lua-scripts
+  labels:
+    {{- include "pressured.labels" . | nindent 4 }}
+data:
+  {{- if .Values.lua.scripts }}
+  {{- range $name, $content := .Values.lua.scripts }}
+  {{ $name }}: |
+    {{- $content | nindent 4 }}
+  {{- end }}
+  {{- else }}
+  # Empty ConfigMap - scripts can be added via inline or external mount
+  .keep: ""
+  {{- end }}
+{{- end }}

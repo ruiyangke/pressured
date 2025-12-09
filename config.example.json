@@ -1,0 +1,34 @@
+{
+    "poll_interval_ms": 1000,
+    "log_level": "info",
+    "dry_run": false,
+
+    "source": {
+        "type": "cgroup",
+        "cgroup_path": "/sys/fs/cgroup"
+    },
+
+    "thresholds": {
+        "warn_percent": 70,
+        "critical_percent": 85,
+        "hysteresis_percent": 5,
+        "cooldown_seconds": 60
+    },
+
+    "plugin_dir": "/usr/local/lib/pressured/plugins",
+    "lua_script_path": "/etc/pressured/scripts/handler.lua",
+
+    "storage": {
+        "type": "local",
+        "local": {
+            "path": "/var/lib/pressured/data",
+            "retention_days": 7
+        },
+        "s3": {
+            "bucket": "my-heap-dumps",
+            "region": "us-east-1",
+            "prefix": "heap-dumps/",
+            "endpoint": ""
+        }
+    }
+}

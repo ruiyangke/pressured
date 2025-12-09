@@ -1,0 +1,21 @@
+{{- if and .Values.podDisruptionBudget.enabled (eq .Values.mode "cluster") }}
+{{- if not (or .Values.podDisruptionBudget.minAvailable .Values.podDisruptionBudget.maxUnavailable) }}
+{{- fail "podDisruptionBudget.minAvailable or podDisruptionBudget.maxUnavailable must be set when podDisruptionBudget.enabled is true" }}
+{{- end }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "pressured.fullname" . }}
+  labels:
+    {{- include "pressured.labels" . | nindent 4 }}
+spec:
+  {{- if .Values.podDisruptionBudget.minAvailable }}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  {{- end }}
+  {{- if .Values.podDisruptionBudget.maxUnavailable }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "pressured.selectorLabels" . | nindent 6 }}
+{{- end }}

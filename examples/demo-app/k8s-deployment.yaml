@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-app
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memory-stress
+  namespace: demo-app
+  labels:
+    app: memory-stress
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: memory-stress
+  template:
+    metadata:
+      labels:
+        app: memory-stress
+    spec:
+      containers:
+        - name: stress
+          image: memory-stress:latest
+          imagePullPolicy: Never
+          env:
+            - name: MEMORY_LIMIT_MB
+              value: "100"
+          resources:
+            limits:
+              memory: "100Mi"
+              cpu: "100m"
+            requests:
+              memory: "50Mi"
+              cpu: "50m"

@@ -1,0 +1,217 @@
+# Default values for pressured
+# This is a YAML-formatted file.
+
+# Deployment mode: "sidecar" or "cluster"
+# - sidecar: Use as sidecar container (not deployed by this chart)
+# - cluster: Deploy as central monitoring service
+mode: cluster
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/ruiyangke/pressured
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use
+  # If not set and create is true, a name is generated using the fullname template
+  name: ""
+
+# RBAC configuration
+rbac:
+  # Create ClusterRole and ClusterRoleBinding
+  create: true
+
+podAnnotations: {}
+
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  limits:
+    cpu: 200m
+    memory: 256Mi
+  requests:
+    cpu: 50m
+    memory: 64Mi
+
+# Priority class for production workloads
+# Use "system-cluster-critical" for critical monitoring
+priorityClassName: ""
+
+# Topology spread constraints for high availability
+topologySpreadConstraints: []
+# Example for spreading across zones:
+# - maxSkew: 1
+#   topologyKey: topology.kubernetes.io/zone
+#   whenUnsatisfiable: ScheduleAnyway
+#   labelSelector:
+#     matchLabels:
+#       app.kubernetes.io/name: pressured
+
+# Pod Disruption Budget for availability during updates
+podDisruptionBudget:
+  enabled: false
+  # minAvailable: 1
+  # maxUnavailable: 0
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+# pressured configuration
+config:
+  # Source configuration
+  source:
+    # Mode: "cgroup" (sidecar) or "kubelet" (cluster)
+    # Automatically set based on .Values.mode
+    # Cgroup source settings (sidecar mode)
+    cgroup:
+      path: "/sys/fs/cgroup"
+      poll_interval_ms: 1000
+    # Kubelet source settings (cluster mode)
+    kubelet:
+      poll_interval_ms: 10000
+      namespace_filter: ""  # Comma-separated list, empty = all
+      label_selector: ""    # e.g., "app=myapp"
+
+  # Threshold configuration
+  thresholds:
+    warn_percent: 80
+    critical_percent: 90
+    hysteresis_percent: 5
+    cooldown_seconds: 60
+
+  # Dry-run mode (log only, no actions)
+  dry_run: false
+
+  # Log level: trace, debug, info, warn, error
+  log_level: info
+
+# Lua scripting plugin configuration
+lua:
+  # Enable Lua plugin
+  enabled: false
+  # Directory containing .lua scripts (mounted from ConfigMap)
+  scriptsDir: "/scripts"
+  # Script execution timeout in milliseconds
+  timeoutMs: 5000
+  # Inline Lua script (alternative to scripts ConfigMap)
+  # Example:
+  # inlineScript: |
+  #   function on_event(event, ctx)
+  #     log.info("OOM event: " .. event.pod_name)
+  #     return "ok"
+  #   end
+  inlineScript: ""
+  # Lua scripts as ConfigMap entries (name -> script content)
+  # Each entry becomes a .lua file mounted in scriptsDir
+  scripts: {}
+  # Example:
+  #   alert.lua: |
+  #     function on_event(event, ctx)
+  #       if event.severity == "critical" then
+  #         log.warn(string.format("CRITICAL: %s/%s at %.1f%%",
+  #           event.namespace, event.pod_name, event.usage_percent))
+  #       end
+  #       return "ok"
+  #     end
+
+# Storage plugin configuration
+storage:
+  # Enable storage plugin
+  enabled: false
+  # Storage backend: local, s3, gcs, azure
+  backend: local
+  # Local storage settings
+  local:
+    path: "/data/dumps"
+  # S3 storage settings
+  s3:
+    bucket: ""
+    prefix: "oom-dumps/"
+    region: "us-west-2"
+    endpoint: ""  # Custom endpoint for S3-compatible storage
+    # IRSA (IAM Roles for Service Accounts) - recommended for EKS
+    # Set the role ARN and leave existingSecret empty
+    irsaRoleArn: ""
+    # Credentials from secret (alternative to IRSA)
+    existingSecret: ""
+    # Secret keys (default: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+    accessKeyIdKey: "AWS_ACCESS_KEY_ID"
+    secretAccessKeyKey: "AWS_SECRET_ACCESS_KEY"
+  # GCS storage settings
+  gcs:
+    bucket: ""
+    prefix: "oom-dumps/"
+    # Service account JSON from secret
+    existingSecret: ""
+    serviceAccountKeyKey: "credentials.json"
+  # Azure Blob storage settings
+  azure:
+    container: ""
+    prefix: "oom-dumps/"
+    storageAccount: ""
+    # Credentials from secret
+    existingSecret: ""
+    storageAccountKeyKey: "AZURE_STORAGE_KEY"
+
+# Persistent volume for local storage
+persistence:
+  enabled: false
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 10Gi
+  annotations: {}
+  # Existing claim to use
+  existingClaim: ""
+
+# Extra environment variables
+extraEnvVars: []
+#  - name: WEBHOOK_TOKEN
+#    valueFrom:
+#      secretKeyRef:
+#        name: webhook-secret
+#        key: token
+
+# Extra volumes
+extraVolumes: []
+
+# Extra volume mounts
+extraVolumeMounts: []
+
+# Metrics and monitoring
+metrics:
+  # Enable prometheus metrics (future feature)
+  enabled: false
+  port: 9090
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}

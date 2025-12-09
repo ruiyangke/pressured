@@ -1,0 +1,143 @@
+🎉 pressured has been installed!
+
+{{- if eq .Values.mode "cluster" }}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MODE: Cluster (central monitoring)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The pressured is monitoring memory usage of pods cluster-wide.
+
+📊 Check Status:
+  kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "pressured.name" . }}
+
+📜 View Logs:
+  kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "pressured.name" . }} -f
+
+{{- else }}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MODE: Sidecar
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Note: This chart does not deploy anything in sidecar mode.
+Use the pressured container image directly in your pod specs:
+
+  containers:
+  - name: pressured
+    image: {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
+    args: ["--config", "/etc/pressured/config.json"]
+    volumeMounts:
+    - name: cgroup
+      mountPath: /sys/fs/cgroup
+      readOnly: true
+{{- end }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONFIGURATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Thresholds:
+  • Warning:    {{ .Values.config.thresholds.warn_percent }}%
+  • Critical:   {{ .Values.config.thresholds.critical_percent }}%
+  • Hysteresis: {{ .Values.config.thresholds.hysteresis_percent }}%
+  • Cooldown:   {{ .Values.config.thresholds.cooldown_seconds }}s
+
+{{- if .Values.config.source.kubelet.namespace_filter }}
+Namespace Filter: {{ .Values.config.source.kubelet.namespace_filter }}
+{{- end }}
+
+{{- if .Values.config.source.kubelet.label_selector }}
+Label Selector: {{ .Values.config.source.kubelet.label_selector }}
+{{- end }}
+
+{{- if .Values.lua.enabled }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LUA PLUGIN: ✓ Enabled
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Scripts Directory: {{ .Values.lua.scriptsDir }}
+Timeout: {{ .Values.lua.timeoutMs }}ms
+{{- if .Values.lua.scripts }}
+Loaded Scripts:
+{{- range $name, $_ := .Values.lua.scripts }}
+  • {{ $name }}
+{{- end }}
+{{- end }}
+{{- if .Values.lua.inlineScript }}
+Using inline script
+{{- end }}
+{{- end }}
+
+{{- if .Values.storage.enabled }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STORAGE: ✓ {{ .Values.storage.backend | upper }}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{{- if eq .Values.storage.backend "local" }}
+Path: {{ .Values.storage.local.path }}
+{{- if .Values.persistence.enabled }}
+Persistent Volume: {{ .Values.persistence.size }}
+{{- else }}
+⚠️  Using emptyDir - data will be lost on pod restart!
+    Enable persistence for production: --set persistence.enabled=true
+{{- end }}
+{{- else if eq .Values.storage.backend "s3" }}
+Bucket: s3://{{ .Values.storage.s3.bucket }}/{{ .Values.storage.s3.prefix }}
+Region: {{ .Values.storage.s3.region }}
+{{- if .Values.storage.s3.irsaRoleArn }}
+Credentials: IRSA ({{ .Values.storage.s3.irsaRoleArn }})
+{{- else if .Values.storage.s3.existingSecret }}
+Credentials: From secret '{{ .Values.storage.s3.existingSecret }}'
+{{- else }}
+⚠️  No credentials configured! Set storage.s3.irsaRoleArn (recommended) or storage.s3.existingSecret
+{{- end }}
+{{- else if eq .Values.storage.backend "gcs" }}
+Bucket: gs://{{ .Values.storage.gcs.bucket }}/{{ .Values.storage.gcs.prefix }}
+{{- if .Values.storage.gcs.existingSecret }}
+Credentials: From secret '{{ .Values.storage.gcs.existingSecret }}'
+{{- else }}
+⚠️  No credentials configured! Set storage.gcs.existingSecret
+{{- end }}
+{{- else if eq .Values.storage.backend "azure" }}
+Container: https://{{ .Values.storage.azure.storageAccount }}.blob.core.windows.net/{{ .Values.storage.azure.container }}/{{ .Values.storage.azure.prefix }}
+{{- if .Values.storage.azure.existingSecret }}
+Credentials: From secret '{{ .Values.storage.azure.existingSecret }}'
+{{- else }}
+⚠️  No credentials configured! Set storage.azure.existingSecret
+{{- end }}
+{{- end }}
+{{- else }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STORAGE: ✗ Disabled
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+To enable storage for heap dumps:
+
+Local storage:
+  helm upgrade {{ .Release.Name }} pressured/pressured \
+    --set storage.enabled=true \
+    --set persistence.enabled=true
+
+S3 storage (with IRSA - recommended for EKS):
+  helm upgrade {{ .Release.Name }} pressured/pressured \
+    --set storage.enabled=true \
+    --set storage.backend=s3 \
+    --set storage.s3.bucket=my-bucket \
+    --set storage.s3.irsaRoleArn=arn:aws:iam::123456789012:role/pressured-s3
+
+S3 storage (with static credentials):
+  helm upgrade {{ .Release.Name }} pressured/pressured \
+    --set storage.enabled=true \
+    --set storage.backend=s3 \
+    --set storage.s3.bucket=my-bucket \
+    --set storage.s3.existingSecret=aws-credentials
+{{- end }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DOCUMENTATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📚 Full documentation: https://github.com/ruiyangke/pressured
+🐛 Report issues: https://github.com/ruiyangke/pressured/issues
