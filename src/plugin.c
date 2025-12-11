@@ -89,12 +89,13 @@ void plugin_manager_free(plugin_manager_t *pm) {
  * Load policy: IMPLICIT (default: enabled)
  *   - Plugin loads unless plugins.<name>.enabled = false
  *   - The "enabled" field is reserved in each plugin's config section
+ *   - Plugin names use kebab-case (e.g., "local-storage", "s3-storage")
  *
  * Config example:
  *   {
  *     "plugins": {
  *       "lua": { "enabled": true, "script": "alert.lua" },
- *       "local_storage": { "enabled": false }
+ *       "local-storage": { "enabled": false }
  *     }
  *   }
  * ═══════════════════════════════════════════════════════════════════════════ */
