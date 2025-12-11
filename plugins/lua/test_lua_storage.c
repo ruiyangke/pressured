@@ -2,13 +2,14 @@
  * Test Lua Storage bindings in the Lua plugin
  *
  * Tests the storage module exposed to Lua scripts using the local storage
- * plugin. Uses the new 5-symbol plugin protocol with plugin_manager.
+ * plugin. Uses the new service registry architecture.
  */
 
 #include "log.h"
 #include "plugin.h"
 #include "plugin_manager.h"
 #include "pressured.h"
+#include "service_registry.h"
 #include "storage.h"
 #include <assert.h>
 #include <stdio.h>
@@ -37,26 +38,36 @@ static int run_lua_test(const char *name, const char *script) {
   // Set the script for this test
   setenv("PRESSURED_LUA_INLINE", script, 1);
 
-  // Create fresh plugin manager for each test
-  plugin_manager_t *test_pm = plugin_manager_new();
-  if (!test_pm)
+  // Create service registry and plugin manager
+  service_registry_t *sr = service_registry_new();
+  if (!sr)
     return 0;
+
+  plugin_manager_t *test_pm = plugin_manager_new(sr);
+  if (!test_pm) {
+    service_registry_free(sr);
+    return 0;
+  }
 
   // Load storage plugin first
   setenv("PRESSURED_STORAGE_PATH", "/tmp/lua_storage_test", 1);
-  if (plugin_manager_load(test_pm, "plugins/storage_local.so", NULL) != 0) {
+  if (plugin_manager_load(test_pm, "plugins/local-storage.so", NULL) != 0) {
     printf("    Failed to load storage plugin\n");
     plugin_manager_free(test_pm);
+    service_registry_free(sr);
     return 0;
   }
 
   // Load lua plugin
-  if (plugin_manager_load(test_pm, "plugins/pressured_plugin_lua.so", NULL) !=
-      0) {
+  if (plugin_manager_load(test_pm, "plugins/lua.so", NULL) != 0) {
     printf("    Failed to load lua plugin\n");
     plugin_manager_free(test_pm);
+    service_registry_free(sr);
     return 0;
   }
+
+  // Initialize all services (creates storage and action instances)
+  service_registry_init_all(sr);
 
   // Create test event
   pressured_event_t event = {0};
@@ -69,10 +80,22 @@ static int run_lua_test(const char *name, const char *script) {
   event.severity = SEVERITY_CRITICAL;
   event.previous_severity = SEVERITY_WARN;
 
-  // Dispatch event - scripts return "pass" or "fail"
-  int handled = plugin_manager_dispatch(test_pm, &event, 0);
+  // Dispatch event via service registry - scripts return "pass" or "fail"
+  int handled = 0;
+  if (service_registry_has(sr, "action")) {
+    service_ref_t ref = service_registry_acquire(sr, "action");
+    if (service_ref_valid(&ref)) {
+      action_t *action = (action_t *)ref.instance;
+      if (action && action->on_event) {
+        action->on_event(action, &event, 0);
+        handled = 1;
+      }
+      service_ref_release(&ref);
+    }
+  }
 
   pressured_event_free(&event);
+  service_registry_free(sr);
   plugin_manager_free(test_pm);
 
   return handled == 1;

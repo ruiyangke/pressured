@@ -18,6 +18,7 @@
 #include "log.h"
 #include "plugin.h"
 #include "pprof.h"
+#include "service_registry.h"
 #include "storage.h"
 
 // Silence warnings from cwisstable
@@ -875,21 +876,6 @@ cleanup:
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Public API implementation
-// ─────────────────────────────────────────────────────────────────────────────
-
-PRESSURED_PLUGIN_EXPORT void pprof_results_free(pprof_results_t *results) {
-  if (results) {
-    for (size_t i = 0; i < results->count; i++)
-      free(results->funcs[i].name);
-    free(results->funcs);
-    results->funcs = NULL;
-    results->count = 0;
-    results->total_inuse = 0;
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Plugin handle
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -908,15 +894,53 @@ static int pprof_top_mem_functions(pprof_analyzer_t *a, storage_t *storage,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Plugin lifecycle
+// Service registration
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct pressured_plugin_ctx {
-  int initialized;
+  /* Reserved for future use (e.g., global config) */
+  int _reserved;
 };
 
+static void *pprof_factory(void *userdata) {
+  (void)userdata;
+
+  pprof_handle_t *h = calloc(1, sizeof(pprof_handle_t));
+  if (!h)
+    return NULL;
+
+  h->base.top_mem_functions = pprof_top_mem_functions;
+
+  log_debug("pprof: created analyzer handle");
+  return h;
+}
+
+static void pprof_destructor(void *instance, void *userdata) {
+  (void)userdata;
+  if (instance) {
+    log_debug("pprof: destroyed analyzer handle");
+    free(instance);
+  }
+}
+
+static const char *pprof_tags[] = {"profiling", "heap", "golang", NULL};
+
+static const service_metadata_t analyzer_service_meta = {
+    .type = "analyzer",
+    .provider = "pprof",
+    .version = "1.0.0",
+    .description = "pprof heap analyzer for Go applications",
+    .priority = 100,
+    .tags = pprof_tags,
+    .dependencies = NULL,
+    .interface_version = 1,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plugin lifecycle (3-symbol protocol)
+// ─────────────────────────────────────────────────────────────────────────────
+
 static const pressured_plugin_metadata_t plugin_metadata = {
-    .types = PPROF_PLUGIN_TYPE,
     .name = "pprof",
     .major_version = 1,
     .minor_version = 0,
@@ -928,14 +952,23 @@ pressured_plugin_get_metadata(void) {
 }
 
 PRESSURED_PLUGIN_EXPORT pressured_plugin_ctx_t *
-pressured_plugin_load(const char *config_json) {
+pressured_plugin_load(const char *config_json, service_registry_t *sr) {
   (void)config_json;
 
   pressured_plugin_ctx_t *ctx = calloc(1, sizeof(pressured_plugin_ctx_t));
   if (!ctx)
     return NULL;
 
-  ctx->initialized = 1;
+  // Register analyzer service with the registry
+  int rc = service_registry_register(sr, &analyzer_service_meta,
+                                     SERVICE_SCOPE_SINGLETON, pprof_factory,
+                                     pprof_destructor, ctx);
+  if (rc != 0) {
+    log_error("pprof: failed to register with service registry");
+    free(ctx);
+    return NULL;
+  }
+
   log_info("pprof: heap analyzer v1.0 loaded");
   return ctx;
 }
@@ -945,31 +978,5 @@ pressured_plugin_unload(pressured_plugin_ctx_t *ctx) {
   if (ctx) {
     log_debug("pprof: plugin unloaded");
     free(ctx);
-  }
-}
-
-PRESSURED_PLUGIN_EXPORT pressured_plugin_handle_t *
-pressured_plugin_create(pressured_plugin_ctx_t *ctx, uint32_t type) {
-  if (!ctx || type != PPROF_PLUGIN_TYPE)
-    return NULL;
-
-  pprof_handle_t *h = calloc(1, sizeof(pprof_handle_t));
-  if (!h)
-    return NULL;
-
-  h->base.top_mem_functions = pprof_top_mem_functions;
-
-  log_debug("pprof: created analyzer handle");
-  return (pressured_plugin_handle_t *)h;
-}
-
-PRESSURED_PLUGIN_EXPORT void
-pressured_plugin_destroy(pressured_plugin_ctx_t *ctx, uint32_t type,
-                         pressured_plugin_handle_t *handle) {
-  (void)ctx;
-  (void)type;
-  if (handle) {
-    log_debug("pprof: destroyed analyzer handle");
-    free(handle);
   }
 }

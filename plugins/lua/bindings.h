@@ -14,11 +14,16 @@
 
 // Context keys for Lua registry
 #define LUA_REG_HTTP_CLIENT "pressured_http_client"
+#define LUA_REG_STORAGE "pressured_storage"
+#define LUA_REG_SERVICE_REGISTRY "pressured_service_registry"
+
+// Forward declarations
+typedef struct service_registry service_registry_t;
 
 // Register binding modules
 void lua_register_log(lua_State *L);
 void lua_register_ctx(lua_State *L);
 void lua_register_http(lua_State *L, http_client_t *client);
-void lua_register_storage(lua_State *L);
+void lua_register_storage(lua_State *L, service_registry_t *sr);
 
 #endif // LUA_BINDINGS_H

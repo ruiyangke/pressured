@@ -5,6 +5,7 @@
 
 #include "log.h"
 #include "plugin_manager.h"
+#include "service_registry.h"
 #include "storage.h"
 #include <assert.h>
 #include <stdio.h>
@@ -13,7 +14,7 @@
 #include <unistd.h>
 
 // Path to built plugin
-#define PLUGIN_PATH "./plugins/storage_local.so"
+#define PLUGIN_PATH "./plugins/local-storage.so"
 
 static void test_streaming_write_read(storage_t *s) {
   printf("  test_streaming_write_read: ");
@@ -165,8 +166,12 @@ int main(void) {
   // Set environment variable for storage path
   setenv("PRESSURED_STORAGE_PATH", dir, 1);
 
+  // Create service registry
+  service_registry_t *sr = service_registry_new();
+  assert(sr != NULL);
+
   // Load plugin using plugin manager
-  plugin_manager_t *pm = plugin_manager_new();
+  plugin_manager_t *pm = plugin_manager_new(sr);
   assert(pm != NULL);
 
   int rc = plugin_manager_load(pm, PLUGIN_PATH, NULL);
@@ -174,13 +179,22 @@ int main(void) {
     printf("  ERROR: failed to load plugin from %s\n", PLUGIN_PATH);
     printf("  Make sure to run from build directory\n");
     plugin_manager_free(pm);
+    service_registry_free(sr);
     return 1;
   }
 
-  // Get storage interface - handle embeds vtable, cast directly
-  storage_t *s =
-      (storage_t *)plugin_manager_get_handle(pm, PRESSURED_PLUGIN_TYPE_STORAGE);
-  assert(s != NULL);
+  // Initialize all services
+  service_registry_init_all(sr);
+
+  // Get storage via service registry
+  service_ref_t ref = service_registry_acquire(sr, "storage");
+  if (!service_ref_valid(&ref)) {
+    printf("  ERROR: no storage service registered\n");
+    plugin_manager_free(pm);
+    service_registry_free(sr);
+    return 1;
+  }
+  storage_t *s = (storage_t *)ref.instance;
 
   // Run tests
   test_streaming_write_read(s);
@@ -188,7 +202,12 @@ int main(void) {
   test_large_streaming(s);
   test_not_found(s);
 
-  // Cleanup
+  // Release storage reference (no-op for singletons)
+  service_ref_release(&ref);
+
+  // Cleanup - service registry must be freed before plugin manager
+  // (destructors need to run while plugin code is still loaded)
+  service_registry_free(sr);
   plugin_manager_free(pm);
 
   // Remove temp directory

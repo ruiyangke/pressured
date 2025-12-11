@@ -60,21 +60,35 @@ test-s3: build ## Run S3 storage tests (requires LocalStack)
 ##@ Code Quality
 
 lint: ## Run static analysis (cppcheck if available)
-	@which cppcheck > /dev/null && cppcheck --enable=all \
-		--suppress=missingIncludeSystem \
-		--suppress=unusedFunction \
-		--suppress=constParameterCallback \
-		--suppress=unknownMacro \
-		--suppress=syntaxError:plugins/pprof/cwisstable.h \
-		--suppress=staticFunction:src/log.c \
-		-I include -I src -I plugins/lua -I plugins/storage \
-		src/ include/ plugins/ || echo "cppcheck not installed, skipping"
+	@if command -v cppcheck > /dev/null 2>&1; then \
+		cppcheck --enable=warning,style,performance,portability \
+			--suppressions-list=.cppcheck \
+			--suppress=missingIncludeSystem \
+			--suppress=unusedFunction \
+			--suppress=constParameterCallback \
+			--suppress=constParameterPointer \
+			--suppress=constVariablePointer \
+			--suppress=normalCheckLevelMaxBranches \
+			--error-exitcode=1 \
+			-I include -I src -I plugins/lua -I plugins/storage -I plugins/pprof \
+			src/ include/ plugins/; \
+	else \
+		echo "cppcheck not installed, skipping"; \
+	fi
 
 format: ## Format code with clang-format
-	@which clang-format > /dev/null && find src include plugins \( -name '*.c' -o -name '*.h' \) ! -name 'cwisstable.h' | xargs clang-format -i || echo "clang-format not installed, skipping"
+	@if command -v clang-format > /dev/null 2>&1; then \
+		find src include plugins \( -name '*.c' -o -name '*.h' \) ! -name 'cwisstable.h' | xargs clang-format -i; \
+	else \
+		echo "clang-format not installed, skipping"; \
+	fi
 
 format-check: ## Check code formatting
-	@which clang-format > /dev/null && find src include plugins \( -name '*.c' -o -name '*.h' \) ! -name 'cwisstable.h' | xargs clang-format --dry-run --Werror || echo "clang-format not installed, skipping"
+	@if command -v clang-format > /dev/null 2>&1; then \
+		find src include plugins \( -name '*.c' -o -name '*.h' \) ! -name 'cwisstable.h' | xargs clang-format --dry-run --Werror; \
+	else \
+		echo "clang-format not installed, skipping"; \
+	fi
 
 ##@ Docker
 

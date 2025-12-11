@@ -1,13 +1,14 @@
 /*
  * pprof analyzer tests
  *
- * Tests the purpose-built pprof heap analyzer using storage API.
+ * Tests the pprof heap analyzer using service registry and storage API.
  */
 
 #include "log.h"
 #include "plugin.h"
 #include "plugin_manager.h"
 #include "pprof.h"
+#include "service_registry.h"
 #include "storage.h"
 #include <assert.h>
 #include <dlfcn.h>
@@ -16,60 +17,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define PPROF_PLUGIN_TYPE (1 << 2)
-
-static void *plugin_handle = NULL;
-static pressured_plugin_ctx_t *plugin_ctx = NULL;
-
-// Plugin function pointers
-static pressured_plugin_get_metadata_fn get_metadata;
-static pressured_plugin_load_fn plugin_load;
-static pressured_plugin_unload_fn plugin_unload;
-static pressured_plugin_create_fn plugin_create;
-static pressured_plugin_destroy_fn plugin_destroy;
-
-// pprof-specific function - for freeing results
-typedef void (*pprof_results_free_fn)(pprof_results_t *results);
-static pprof_results_free_fn results_free;
-
-static int load_plugin(void) {
-  plugin_handle = dlopen("./plugins/pprof_plugin.so", RTLD_NOW);
-  if (!plugin_handle) {
-    fprintf(stderr, "Failed to load plugin: %s\n", dlerror());
-    return -1;
-  }
-
-  get_metadata = (pressured_plugin_get_metadata_fn)dlsym(
-      plugin_handle, "pressured_plugin_get_metadata");
-  plugin_load =
-      (pressured_plugin_load_fn)dlsym(plugin_handle, "pressured_plugin_load");
-  plugin_unload = (pressured_plugin_unload_fn)dlsym(plugin_handle,
-                                                    "pressured_plugin_unload");
-  plugin_create = (pressured_plugin_create_fn)dlsym(plugin_handle,
-                                                    "pressured_plugin_create");
-  plugin_destroy = (pressured_plugin_destroy_fn)dlsym(
-      plugin_handle, "pressured_plugin_destroy");
-
-  // Load pprof-specific function for freeing results
-  results_free =
-      (pprof_results_free_fn)dlsym(plugin_handle, "pprof_results_free");
-
-  if (!get_metadata || !plugin_load || !plugin_unload || !plugin_create ||
-      !plugin_destroy || !results_free) {
-    fprintf(stderr, "Failed to resolve plugin symbols\n");
-    dlclose(plugin_handle);
-    return -1;
-  }
-
-  return 0;
-}
-
-static void unload_plugin(void) {
-  if (plugin_handle) {
-    dlclose(plugin_handle);
-    plugin_handle = NULL;
-  }
-}
+#define PPROF_PLUGIN_PATH "./plugins/pprof.so"
+#define STORAGE_PLUGIN_PATH "./plugins/local-storage.so"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test: Plugin metadata
@@ -78,32 +27,66 @@ static void unload_plugin(void) {
 static void test_metadata(void) {
   printf("test_metadata: ");
 
+  void *handle = dlopen(PPROF_PLUGIN_PATH, RTLD_NOW);
+  if (!handle) {
+    printf("FAIL (dlopen: %s)\n", dlerror());
+    return;
+  }
+
+  pressured_plugin_get_metadata_fn get_metadata =
+      (pressured_plugin_get_metadata_fn)dlsym(handle,
+                                              "pressured_plugin_get_metadata");
+  assert(get_metadata != NULL);
+
   const pressured_plugin_metadata_t *meta = get_metadata();
   assert(meta != NULL);
   assert(strcmp(meta->name, "pprof") == 0);
-  assert(meta->types == PPROF_PLUGIN_TYPE);
   assert(meta->major_version == 1);
 
+  dlclose(handle);
   printf("PASS\n");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Test: Plugin lifecycle
+// Test: Plugin lifecycle via service registry
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void test_lifecycle(void) {
   printf("test_lifecycle: ");
 
-  plugin_ctx = plugin_load(NULL);
-  assert(plugin_ctx != NULL);
+  service_registry_t *sr = service_registry_new();
+  assert(sr != NULL);
 
-  pressured_plugin_handle_t *handle =
-      plugin_create(plugin_ctx, PPROF_PLUGIN_TYPE);
-  assert(handle != NULL);
+  plugin_manager_t *pm = plugin_manager_new(sr);
+  assert(pm != NULL);
 
-  plugin_destroy(plugin_ctx, PPROF_PLUGIN_TYPE, handle);
-  plugin_unload(plugin_ctx);
-  plugin_ctx = NULL;
+  int rc = plugin_manager_load(pm, PPROF_PLUGIN_PATH, NULL);
+  if (rc != 0) {
+    printf("FAIL (load returned %d)\n", rc);
+    service_registry_free(sr);
+    plugin_manager_free(pm);
+    return;
+  }
+
+  // Initialize all services
+  service_registry_init_all(sr);
+
+  // Acquire analyzer service
+  service_ref_t ref = service_registry_acquire(sr, "analyzer");
+  if (!service_ref_valid(&ref)) {
+    printf("FAIL (no analyzer service registered)\n");
+    service_registry_free(sr);
+    plugin_manager_free(pm);
+    return;
+  }
+
+  pprof_analyzer_t *a = (pprof_analyzer_t *)ref.instance;
+  assert(a != NULL);
+  assert(a->top_mem_functions != NULL);
+
+  service_ref_release(&ref);
+  service_registry_free(sr);
+  plugin_manager_free(pm);
 
   printf("PASS\n");
 }
@@ -122,7 +105,6 @@ static void test_top_mem_functions(void) {
   }
 
   // Extract directory and filename from test_file path
-  // We'll set the storage root to the directory containing the file
   char *test_file_copy = strdup(test_file);
   char *test_file_copy2 = strdup(test_file);
   char *dir = dirname(test_file_copy);
@@ -131,54 +113,81 @@ static void test_top_mem_functions(void) {
   // Set storage root to the directory containing the pprof file
   setenv("PRESSURED_STORAGE_PATH", dir, 1);
 
-  // Load storage plugin
-  plugin_manager_t *pm = plugin_manager_new();
+  // Create service registry and plugin manager
+  service_registry_t *sr = service_registry_new();
+  assert(sr != NULL);
+
+  plugin_manager_t *pm = plugin_manager_new(sr);
   assert(pm != NULL);
 
-  int rc = plugin_manager_load(pm, "./plugins/storage_local.so", NULL);
+  // Load storage plugin first
+  int rc = plugin_manager_load(pm, STORAGE_PLUGIN_PATH, NULL);
   if (rc != 0) {
     printf("FAIL (failed to load storage plugin)\n");
     free(test_file_copy);
     free(test_file_copy2);
+    service_registry_free(sr);
     plugin_manager_free(pm);
     return;
   }
 
-  // Get storage interface
-  storage_t *storage =
-      (storage_t *)plugin_manager_get_handle(pm, PRESSURED_PLUGIN_TYPE_STORAGE);
-  assert(storage != NULL);
+  // Load pprof analyzer plugin
+  rc = plugin_manager_load(pm, PPROF_PLUGIN_PATH, NULL);
+  if (rc != 0) {
+    printf("FAIL (failed to load pprof plugin)\n");
+    free(test_file_copy);
+    free(test_file_copy2);
+    service_registry_free(sr);
+    plugin_manager_free(pm);
+    return;
+  }
 
-  // Now load and test the pprof analyzer
-  plugin_ctx = plugin_load(NULL);
-  assert(plugin_ctx != NULL);
+  // Initialize all services
+  service_registry_init_all(sr);
 
-  pressured_plugin_handle_t *handle =
-      plugin_create(plugin_ctx, PPROF_PLUGIN_TYPE);
-  assert(handle != NULL);
+  // Acquire storage service
+  service_ref_t storage_ref = service_registry_acquire(sr, "storage");
+  if (!service_ref_valid(&storage_ref)) {
+    printf("FAIL (no storage service)\n");
+    free(test_file_copy);
+    free(test_file_copy2);
+    service_registry_free(sr);
+    plugin_manager_free(pm);
+    return;
+  }
+  storage_t *storage = (storage_t *)storage_ref.instance;
 
-  // Cast to analyzer interface
-  pprof_analyzer_t *a = (pprof_analyzer_t *)handle;
+  // Acquire analyzer service
+  service_ref_t analyzer_ref = service_registry_acquire(sr, "analyzer");
+  if (!service_ref_valid(&analyzer_ref)) {
+    printf("FAIL (no analyzer service)\n");
+    service_ref_release(&storage_ref);
+    free(test_file_copy);
+    free(test_file_copy2);
+    service_registry_free(sr);
+    plugin_manager_free(pm);
+    return;
+  }
+  pprof_analyzer_t *a = (pprof_analyzer_t *)analyzer_ref.instance;
 
   // Get top 5 memory-consuming functions (0 = use default)
-  // Use storage API - filename is the key since storage root is the directory
   pprof_results_t results = {0};
   rc = a->top_mem_functions(a, storage, filename, 0, &results);
 
   if (rc != 0) {
     printf("FAIL (analyze error: %d - %s)\n", rc, pprof_strerror(rc));
-    plugin_destroy(plugin_ctx, PPROF_PLUGIN_TYPE, handle);
-    plugin_unload(plugin_ctx);
-    plugin_manager_free(pm);
+    service_ref_release(&analyzer_ref);
+    service_ref_release(&storage_ref);
     free(test_file_copy);
     free(test_file_copy2);
+    service_registry_free(sr);
+    plugin_manager_free(pm);
     return;
   }
 
   printf("\n\n  TOP %zu MEMORY FUNCTIONS\n", results.count);
-  printf("  "
-         "═════════════════════════════════════════════════════════════════════"
-         "═══════════\n\n");
+  printf("  ════════════════════════════════════════════════════════════════"
+         "══════════════\n\n");
 
   for (size_t i = 0; i < results.count; i++) {
     const pprof_func_stat_t *f = &results.funcs[i];
@@ -187,9 +196,8 @@ static void test_top_mem_functions(void) {
     printf("     └─ %.2f MB (%ld objects)\n\n", mb, (long)f->inuse_objects);
   }
 
-  printf("  "
-         "═════════════════════════════════════════════════════════════════════"
-         "═══════════\n");
+  printf("  ════════════════════════════════════════════════════════════════"
+         "══════════════\n");
   printf("  Total in-use: %.2f MB\n\n",
          (double)results.total_inuse / (1024.0 * 1024.0));
 
@@ -198,15 +206,14 @@ static void test_top_mem_functions(void) {
   assert(results.total_inuse > 0);
 
   // Free results
-  results_free(&results);
+  pprof_results_free(&results);
 
-  plugin_destroy(plugin_ctx, PPROF_PLUGIN_TYPE, handle);
-  plugin_unload(plugin_ctx);
-  plugin_ctx = NULL;
-
-  plugin_manager_free(pm);
+  service_ref_release(&analyzer_ref);
+  service_ref_release(&storage_ref);
   free(test_file_copy);
   free(test_file_copy2);
+  service_registry_free(sr);
+  plugin_manager_free(pm);
 
   printf("  PASS\n");
 }
@@ -216,18 +223,13 @@ static void test_top_mem_functions(void) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 int main(void) {
-  printf("=== pprof analyzer tests ===\n\n");
+  log_init(LOG_INFO);
 
-  if (load_plugin() != 0) {
-    fprintf(stderr, "Failed to load pprof plugin\n");
-    return 1;
-  }
+  printf("=== pprof analyzer tests ===\n\n");
 
   test_metadata();
   test_lifecycle();
   test_top_mem_functions();
-
-  unload_plugin();
 
   printf("\nAll tests passed!\n");
   return 0;

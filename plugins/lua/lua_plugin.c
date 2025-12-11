@@ -2,7 +2,7 @@
  * Lua Plugin for Pressured
  *
  * Loads and executes Lua scripts on memory pressure events.
- * Uses the 5-symbol plugin protocol.
+ * Uses the 3-symbol plugin protocol (get_metadata, load, unload).
  *
  * Lua API:
  *   log.trace/debug/info/warn/error(msg)
@@ -19,6 +19,7 @@
 #include "log.h"
 #include "plugin.h"
 #include "pressured.h"
+#include "service_registry.h"
 #include <dirent.h>
 #include <json-c/json.h>
 #include <lauxlib.h>
@@ -44,6 +45,7 @@ typedef struct {
 struct pressured_plugin_ctx {
   char *config_json;       // Full config JSON for Lua global 'config' table
   lua_plugin_config_t cfg; // Parsed plugin config
+  service_registry_t *sr;  // Service registry for storage access
 };
 
 // Parse plugin config from plugins.lua section of full config JSON
@@ -446,7 +448,7 @@ static lua_action_t *lua_action_create(pressured_plugin_ctx_t *ctx) {
   lua_register_log(a->L);
   lua_register_ctx(a->L);
   lua_register_http(a->L, a->http_client);
-  lua_register_storage(a->L);
+  lua_register_storage(a->L, ctx->sr);
   register_config(a->L, ctx->config_json);
 
   // Load script(s) from plugins.lua config
@@ -537,23 +539,67 @@ static void lua_action_destroy(lua_action_t *a) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5-Symbol Plugin Protocol
+// Service Metadata (for service registry)
 // ─────────────────────────────────────────────────────────────────────────────
 
-static pressured_plugin_metadata_t metadata = {
-    .types = PRESSURED_PLUGIN_TYPE_ACTION,
+static const char *lua_tags[] = {"scripting", "lua", NULL};
+
+static const service_metadata_t action_service_meta = {
+    .type = "action",
+    .provider = "lua",
+    .version = "1.0.0",
+    .description = "Execute Lua scripts on memory events",
+    .priority = 100, /* Default action handler */
+    .tags = lua_tags,
+    .dependencies = NULL,
+    .interface_version = 1,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plugin Metadata
+// ─────────────────────────────────────────────────────────────────────────────
+
+static const pressured_plugin_metadata_t metadata = {
     .name = "lua",
     .major_version = 1,
     .minor_version = 0,
-    .description = "Execute Lua scripts on memory events"};
+    .description = "Execute Lua scripts on memory events",
+};
 
 PRESSURED_PLUGIN_EXPORT const pressured_plugin_metadata_t *
 pressured_plugin_get_metadata(void) {
   return &metadata;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Service Factory
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void *lua_action_factory(void *userdata) {
+  pressured_plugin_ctx_t *ctx = userdata;
+
+  lua_action_t *a = lua_action_create(ctx);
+  if (!a)
+    return NULL;
+
+  log_debug("lua: created action instance");
+  return a;
+}
+
+static void lua_action_destructor(void *instance, void *userdata) {
+  (void)userdata;
+  if (instance) {
+    log_debug("lua: destroyed action instance");
+    lua_action_destroy((lua_action_t *)instance);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plugin Lifecycle
+// ─────────────────────────────────────────────────────────────────────────────
+
 PRESSURED_PLUGIN_EXPORT pressured_plugin_ctx_t *
-pressured_plugin_load(const char *config_json) {
+pressured_plugin_load(const char *config_json, service_registry_t *sr) {
   pressured_plugin_ctx_t *ctx = calloc(1, sizeof(pressured_plugin_ctx_t));
   if (!ctx)
     return NULL;
@@ -562,8 +608,25 @@ pressured_plugin_load(const char *config_json) {
     ctx->config_json = strdup(config_json);
   }
 
+  // Store service registry for storage access
+  ctx->sr = sr;
+
   // Parse plugin-specific config from plugins.lua section
   parse_plugin_config(ctx, config_json);
+
+  /* Register action service with the registry */
+  int rc = service_registry_register(
+      sr, &action_service_meta, SERVICE_SCOPE_SINGLETON, lua_action_factory,
+      lua_action_destructor, ctx);
+  if (rc != 0) {
+    log_error("lua: failed to register with service registry");
+    free(ctx->config_json);
+    free(ctx->cfg.script);
+    free(ctx->cfg.scripts_dir);
+    free(ctx->cfg.inline_script);
+    free(ctx);
+    return NULL;
+  }
 
   log_info("lua plugin loaded");
   return ctx;
@@ -579,24 +642,4 @@ pressured_plugin_unload(pressured_plugin_ctx_t *ctx) {
   free(ctx->cfg.inline_script);
   free(ctx);
   log_info("lua plugin unloaded");
-}
-
-PRESSURED_PLUGIN_EXPORT pressured_plugin_handle_t *
-pressured_plugin_create(pressured_plugin_ctx_t *ctx, uint32_t type) {
-  if (type != PRESSURED_PLUGIN_TYPE_ACTION) {
-    log_error("lua plugin: unsupported type %u", type);
-    return NULL;
-  }
-
-  lua_action_t *a = lua_action_create(ctx);
-  return (pressured_plugin_handle_t *)a;
-}
-
-PRESSURED_PLUGIN_EXPORT void
-pressured_plugin_destroy(pressured_plugin_ctx_t *ctx, uint32_t type,
-                         pressured_plugin_handle_t *h) {
-  (void)ctx;
-  if (type != PRESSURED_PLUGIN_TYPE_ACTION)
-    return;
-  lua_action_destroy((lua_action_t *)h);
 }

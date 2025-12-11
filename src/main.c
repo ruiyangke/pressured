@@ -3,6 +3,7 @@
 #include "plugin.h"
 #include "plugin_manager.h"
 #include "pressured.h"
+#include "service_registry.h"
 #include <getopt.h>
 #include <signal.h>
 #include <stdio.h>
@@ -135,10 +136,24 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  // Load plugins from directory (if PRESSURED_PLUGIN_DIR is set)
-  plugin_manager_t *plugin_mgr = plugin_manager_new();
+  // Create service registry
+  service_registry_t *registry = service_registry_new();
+  if (!registry) {
+    log_error("failed to create service registry");
+    event_generator_free(event_gen);
+    if (cgroup_source)
+      cgroup_source_free(cgroup_source);
+    if (kubelet_source)
+      kubelet_source_free(kubelet_source);
+    pressured_config_free(config);
+    return 1;
+  }
+
+  // Create plugin manager with service registry
+  plugin_manager_t *plugin_mgr = plugin_manager_new(registry);
   if (!plugin_mgr) {
     log_error("failed to create plugin manager");
+    service_registry_free(registry);
     event_generator_free(event_gen);
     if (cgroup_source)
       cgroup_source_free(cgroup_source);
@@ -157,9 +172,10 @@ int main(int argc, char *argv[]) {
     plugin_manager_load_dir(plugin_mgr, plugin_dir, config_json);
   }
 
-  // Initialize global service lookup so plugins can access components at
-  // runtime
-  plugin_init(plugin_mgr);
+  // Initialize all singleton services (lock-free after this)
+  if (service_registry_init_all(registry) != 0) {
+    log_warn("some services failed to initialize");
+  }
 
   log_info("starting main loop poll_interval=%dms dry_run=%s mode=%s",
            config->poll_interval_ms, config->dry_run ? "true" : "false",
@@ -194,9 +210,25 @@ int main(int argc, char *argv[]) {
                        event->sample.usage_percent, event->sample.usage_bytes,
                        event->sample.limit_bytes);
 
-        // Dispatch to plugins
-        if (plugin_manager_count(plugin_mgr) > 0) {
-          plugin_manager_dispatch(plugin_mgr, event, config->dry_run);
+        // Dispatch to ALL action services
+        size_t action_count = service_registry_count(registry, "action");
+        if (action_count > 0) {
+          service_ref_t *refs = calloc(action_count, sizeof(service_ref_t));
+          if (refs) {
+            size_t acquired = service_registry_acquire_all(registry, "action",
+                                                           refs, action_count);
+
+            for (size_t j = 0; j < acquired; j++) {
+              if (service_ref_valid(&refs[j])) {
+                action_t *action = (action_t *)refs[j].instance;
+                if (action && action->on_event) {
+                  action->on_event(action, event, config->dry_run);
+                }
+                service_ref_release(&refs[j]);
+              }
+            }
+            free(refs);
+          }
         }
       }
 
@@ -217,7 +249,9 @@ int main(int argc, char *argv[]) {
 
   log_info("shutting down");
 
-  // Cleanup
+  // Cleanup - service registry must be freed before plugin manager
+  // (service destructors need to run while plugin code is still loaded)
+  service_registry_free(registry);
   plugin_manager_free(plugin_mgr);
   free(config_json);
   event_generator_free(event_gen);

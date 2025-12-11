@@ -13,6 +13,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 // Forward declare storage types (include storage.h for full definitions)
 typedef struct storage storage_t;
@@ -84,7 +85,16 @@ struct pprof_analyzer {
 /*
  * Free analysis results
  */
-void pprof_results_free(pprof_results_t *results);
+static inline void pprof_results_free(pprof_results_t *results) {
+  if (results) {
+    for (size_t i = 0; i < results->count; i++)
+      free(results->funcs[i].name);
+    free(results->funcs);
+    results->funcs = NULL;
+    results->count = 0;
+    results->total_inuse = 0;
+  }
+}
 
 // Helper - convert error code to string
 static inline const char *pprof_strerror(int err) {

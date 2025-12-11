@@ -50,6 +50,7 @@ add_library(pressured_core STATIC
     src/log.c
     src/plugin.c
     src/http.c
+    src/service_registry.c
 )
 
 # Enable Position Independent Code for static library (needed when linking into shared libs)
@@ -85,7 +86,7 @@ add_library(pressured_plugin_lua SHARED
 )
 
 set_target_properties(pressured_plugin_lua PROPERTIES
-    OUTPUT_NAME "pressured_plugin_lua"
+    OUTPUT_NAME "lua"
     PREFIX ""
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugins"
 )
@@ -119,7 +120,7 @@ add_library(storage_local SHARED
 )
 
 set_target_properties(storage_local PROPERTIES
-    OUTPUT_NAME "storage_local"
+    OUTPUT_NAME "local-storage"
     PREFIX ""
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugins"
 )
@@ -180,7 +181,7 @@ add_library(storage_s3 SHARED
 )
 
 set_target_properties(storage_s3 PROPERTIES
-    OUTPUT_NAME "storage_s3"
+    OUTPUT_NAME "s3-storage"
     PREFIX ""
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugins"
 )
@@ -217,6 +218,11 @@ target_include_directories(test_sigv4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/plugin
 target_link_libraries(test_sigv4 ${OPENSSL_LIBRARIES})
 add_test(NAME test_sigv4 COMMAND test_sigv4)
 
+# Service registry test
+add_executable(test_service_registry src/test_service_registry.c)
+target_link_libraries(test_service_registry pressured_core)
+add_test(NAME test_service_registry COMMAND test_service_registry)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # pprof parser plugin
 # ─────────────────────────────────────────────────────────────────────────────
@@ -228,7 +234,7 @@ add_library(pprof_plugin SHARED
 )
 
 set_target_properties(pprof_plugin PROPERTIES
-    OUTPUT_NAME "pprof_plugin"
+    OUTPUT_NAME "pprof"
     PREFIX ""
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugins"
 )
@@ -254,6 +260,8 @@ set_target_properties(test_pprof PROPERTIES ENABLE_EXPORTS ON)
 add_test(NAME test_pprof COMMAND test_pprof)
 
 # Install
+# Note: Plugin .so files will be named lua.so, local-storage.so, s3-storage.so, pprof.so
+# matching their metadata.name for consistent config: plugins.<name>.enabled
 install(TARGETS pressured DESTINATION bin)
 install(TARGETS pressured_plugin_lua DESTINATION lib/pressured/plugins)
 install(TARGETS storage_local DESTINATION lib/pressured/plugins)
