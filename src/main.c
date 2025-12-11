@@ -215,8 +215,8 @@ int main(int argc, char *argv[]) {
         if (action_count > 0) {
           service_ref_t *refs = calloc(action_count, sizeof(service_ref_t));
           if (refs) {
-            size_t acquired = service_registry_acquire_all(
-                registry, "action", refs, action_count);
+            size_t acquired = service_registry_acquire_all(registry, "action",
+                                                           refs, action_count);
 
             for (size_t j = 0; j < acquired; j++) {
               if (service_ref_valid(&refs[j])) {

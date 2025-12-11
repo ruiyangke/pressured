@@ -35,7 +35,8 @@
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Opaque Types
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 typedef struct service_registry service_registry_t;
 
@@ -46,11 +47,12 @@ typedef struct service_registry service_registry_t;
  * Consumer always calls service_ref_release() - behavior depends on scope:
  *   - SINGLETON: no-op (registry owns instance)
  *   - TRANSIENT: calls destructor, frees instance
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 typedef struct service_ref {
-  void *instance;   /* The service instance (cast to your interface type) */
-  void *_internal;  /* Internal tracking - DO NOT MODIFY */
+  void *instance;  /* The service instance (cast to your interface type) */
+  void *_internal; /* Internal tracking - DO NOT MODIFY */
 } service_ref_t;
 
 /* Check if reference is valid (instance acquired successfully) */
@@ -65,24 +67,25 @@ static inline int service_ref_valid(const service_ref_t *ref) {
  *   - Discovery: list all providers for a type
  *   - Selection: priority-based default, tag filtering, custom matchers
  *   - Introspection: version, description, dependencies
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 typedef struct service_metadata {
   /* Identity */
-  const char *type;         /* Service category: "storage", "analyzer" */
-  const char *provider;     /* Implementation name: "local", "s3", "pprof" */
-  const char *version;      /* Semver: "1.0.0" */
-  const char *description;  /* Human-readable description */
+  const char *type;        /* Service category: "storage", "analyzer" */
+  const char *provider;    /* Implementation name: "local", "s3", "pprof" */
+  const char *version;     /* Semver: "1.0.0" */
+  const char *description; /* Human-readable description */
 
   /* Selection */
-  int priority;             /* Higher = preferred for default selection */
-  const char **tags;        /* NULL-terminated: ["cloud", "aws", NULL] */
+  int priority;      /* Higher = preferred for default selection */
+  const char **tags; /* NULL-terminated: ["cloud", "aws", NULL] */
 
   /* Dependencies (declarative - factory must acquire manually) */
   const char **dependencies; /* Required types: ["storage", "config", NULL] */
 
   /* Compatibility */
-  int interface_version;    /* For breaking change detection */
+  int interface_version; /* For breaking change detection */
 } service_metadata_t;
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -91,7 +94,8 @@ typedef struct service_metadata {
  * Scope is a provider decision, not a consumer concern:
  *   - SINGLETON: One instance for app lifetime. release() = no-op.
  *   - TRANSIENT: New instance per acquire(). release() = destroy.
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 typedef enum {
   SERVICE_SCOPE_SINGLETON, /* One instance, app lifetime */
@@ -103,7 +107,8 @@ typedef enum {
  *
  * State machine for services with lifecycle hooks (start/stop).
  * Most services don't need this - just acquire() and use.
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 typedef enum {
   SERVICE_STATE_REGISTERED, /* Factory registered, not instantiated */
@@ -115,7 +120,8 @@ typedef enum {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Function Types
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 /*
  * Factory: Creates service instance
@@ -146,8 +152,8 @@ typedef int (*service_matcher_fn)(const service_metadata_t *meta, void *ctx);
  * Full lifecycle callbacks (optional, for advanced use)
  */
 typedef struct {
-  service_factory_fn create;    /* Required: create instance */
-  service_destructor_fn destroy; /* Optional: final cleanup */
+  service_factory_fn create;                     /* Required: create instance */
+  service_destructor_fn destroy;                 /* Optional: final cleanup */
   int (*start)(void *instance, void *userdata);  /* Optional: activate */
   void (*stop)(void *instance, void *userdata);  /* Optional: deactivate */
   int (*health)(void *instance, void *userdata); /* Optional: health check */
@@ -155,7 +161,8 @@ typedef struct {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Registry Lifecycle
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 /*
  * Create a new service registry
@@ -179,7 +186,8 @@ void service_registry_free(service_registry_t *sr);
  *
  * Call these BEFORE spawning threads. After init_all(), all singleton
  * acquire() calls are lock-free reads of cached pointers.
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 /*
  * Instantiate a specific singleton immediately
@@ -205,7 +213,8 @@ int service_registry_init_all(service_registry_t *sr);
  * Registration (Plugin Side)
  *
  * Register services during single-threaded initialization phase.
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 /*
  * Register a service factory with metadata
@@ -220,10 +229,8 @@ int service_registry_init_all(service_registry_t *sr);
  */
 int service_registry_register(service_registry_t *sr,
                               const service_metadata_t *metadata,
-                              service_scope_e scope,
-                              service_factory_fn factory,
-                              service_destructor_fn destructor,
-                              void *userdata);
+                              service_scope_e scope, service_factory_fn factory,
+                              service_destructor_fn destructor, void *userdata);
 
 /*
  * Register with full lifecycle callbacks
@@ -247,7 +254,8 @@ int service_registry_register_ex(service_registry_t *sr,
  * Acquisition (Consumer Side)
  *
  * Safe to call from multiple threads after init_all().
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 /*
  * Acquire a service reference
@@ -310,10 +318,8 @@ service_ref_t service_registry_acquire_match(service_registry_t *sr,
  * @param max_count  Maximum references to return
  * @return           Number of providers (may exceed max_count)
  */
-size_t service_registry_acquire_all(service_registry_t *sr,
-                                    const char *type,
-                                    service_ref_t *refs,
-                                    size_t max_count);
+size_t service_registry_acquire_all(service_registry_t *sr, const char *type,
+                                    service_ref_t *refs, size_t max_count);
 
 /*
  * Acquire all providers with tag
@@ -326,14 +332,14 @@ size_t service_registry_acquire_all(service_registry_t *sr,
  * @return           Number of providers with tag
  */
 size_t service_registry_acquire_all_tagged(service_registry_t *sr,
-                                           const char *type,
-                                           const char *tag,
+                                           const char *type, const char *tag,
                                            service_ref_t *refs,
                                            size_t max_count);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Query
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 /*
  * Check if type (or specific provider) is registered
@@ -377,7 +383,8 @@ service_state_t service_registry_state(service_registry_t *sr,
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Lifecycle Control (SINGLETON Only)
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 /*
  * Start a service (call start callback)
@@ -423,14 +430,14 @@ void service_registry_stop_all(service_registry_t *sr);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Iteration
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 /*
  * Callback for iterating over service types
  */
 typedef void (*service_type_callback_fn)(const char *type,
-                                         size_t provider_count,
-                                         void *userdata);
+                                         size_t provider_count, void *userdata);
 
 /*
  * Iterate over all registered service types
@@ -457,8 +464,7 @@ typedef void (*service_provider_callback_fn)(const service_metadata_t *metadata,
  * @param callback  Function to call for each provider
  * @param userdata  Context passed to callback
  */
-void service_registry_foreach_provider(service_registry_t *sr,
-                                       const char *type,
+void service_registry_foreach_provider(service_registry_t *sr, const char *type,
                                        service_provider_callback_fn callback,
                                        void *userdata);
 
@@ -467,8 +473,7 @@ void service_registry_foreach_provider(service_registry_t *sr,
  */
 typedef void (*service_instance_callback_fn)(const char *type,
                                              const char *provider,
-                                             void *instance,
-                                             void *userdata);
+                                             void *instance, void *userdata);
 
 /*
  * Iterate over all instantiated services

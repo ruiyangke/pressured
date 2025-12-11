@@ -59,8 +59,7 @@ static int run_lua_test(const char *name, const char *script) {
   }
 
   // Load lua plugin
-  if (plugin_manager_load(test_pm, "plugins/lua.so", NULL) !=
-      0) {
+  if (plugin_manager_load(test_pm, "plugins/lua.so", NULL) != 0) {
     printf("    Failed to load lua plugin\n");
     plugin_manager_free(test_pm);
     service_registry_free(sr);

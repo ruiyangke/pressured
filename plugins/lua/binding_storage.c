@@ -37,7 +37,8 @@ typedef struct {
 #define LUA_STORAGE_FILE_MT "storage_file"
 
 // Get storage from service registry stored in Lua registry
-// Acquires storage lazily at runtime (allows storage plugins to load after action plugins)
+// Acquires storage lazily at runtime (allows storage plugins to load after
+// action plugins)
 static storage_t *get_storage(lua_State *L) {
   // First check if we already have a cached storage pointer
   lua_getfield(L, LUA_REGISTRYINDEX, LUA_REG_STORAGE);
@@ -72,7 +73,8 @@ static storage_t *get_storage(lua_State *L) {
   storage_t *s = (storage_t *)ref.instance;
 
   // Cache the storage pointer in Lua registry for future calls
-  // Note: We don't release the ref since it's a singleton and we want to keep it
+  // Note: We don't release the ref since it's a singleton and we want to keep
+  // it
   lua_pushlightuserdata(L, s);
   lua_setfield(L, LUA_REGISTRYINDEX, LUA_REG_STORAGE);
 

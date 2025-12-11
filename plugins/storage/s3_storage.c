@@ -1885,9 +1885,9 @@ pressured_plugin_load(const char *config_json, service_registry_t *sr) {
   }
 
   /* Register storage service with the registry */
-  int rc = service_registry_register(sr, &storage_service_meta,
-                                     SERVICE_SCOPE_SINGLETON, s3_storage_factory,
-                                     s3_storage_destructor, ctx);
+  int rc = service_registry_register(
+      sr, &storage_service_meta, SERVICE_SCOPE_SINGLETON, s3_storage_factory,
+      s3_storage_destructor, ctx);
   if (rc != 0) {
     log_error("s3_storage: failed to register with service registry");
     curl_easy_cleanup(ctx->curl);

@@ -11,7 +11,8 @@
  * Plugins register their services with the service_registry during load().
  *
  * Load Policy: IMPLICIT (default: enabled)
- *   - Plugins load unless explicitly disabled via: plugins.<name>.enabled = false
+ *   - Plugins load unless explicitly disabled via: plugins.<name>.enabled =
+ * false
  *   - The "enabled" field is reserved in each plugin's config section
  *   - Plugin names use kebab-case (e.g., "local-storage", "s3-storage")
  *
@@ -41,7 +42,8 @@ typedef struct plugin_manager plugin_manager_t;
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Lifecycle
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 /*
  * Create plugin manager
@@ -60,7 +62,8 @@ void plugin_manager_free(plugin_manager_t *pm);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Loading
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 /*
  * Load a plugin from a shared library
@@ -86,14 +89,15 @@ int plugin_manager_load_dir(plugin_manager_t *pm, const char *dir,
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Inspection
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 /* Get number of loaded plugins */
 int plugin_manager_count(plugin_manager_t *pm);
 
 /* Get metadata for a loaded plugin by index */
-const pressured_plugin_metadata_t *plugin_manager_get_metadata(
-    plugin_manager_t *pm, int index);
+const pressured_plugin_metadata_t *
+plugin_manager_get_metadata(plugin_manager_t *pm, int index);
 
 /* Get the service registry */
 service_registry_t *plugin_manager_get_registry(plugin_manager_t *pm);

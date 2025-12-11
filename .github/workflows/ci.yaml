@@ -62,26 +62,10 @@ jobs:
           sudo apt-get install -y cppcheck clang-format
 
       - name: Run cppcheck
-        run: |
-          cppcheck --enable=warning,style,performance,portability \
-            --suppress=missingIncludeSystem \
-            --suppress=constParameterPointer \
-            --suppress=constVariablePointer \
-            --suppress=constParameter \
-            --suppress=constVariable \
-            --suppress=constParameterCallback \
-            --suppress=variableScope \
-            --suppress=unreadVariable \
-            --suppress=unusedStructMember \
-            --suppress=shadowVariable \
-            --suppress=normalCheckLevelMaxBranches \
-            --error-exitcode=1 \
-            src/ include/ plugins/
+        run: make lint
 
       - name: Check formatting
-        run: |
-          find src include plugins \( -name '*.c' -o -name '*.h' \) | \
-            xargs clang-format --dry-run --Werror
+        run: make format-check
 
   helm-lint:
     name: Helm Lint
