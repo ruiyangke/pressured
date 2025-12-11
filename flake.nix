@@ -26,6 +26,7 @@
             openssl
             json_c
             lua5_4
+            zlib
 
             # Development tools
             gdb
