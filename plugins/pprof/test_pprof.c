@@ -43,12 +43,12 @@ static int load_plugin(void) {
       plugin_handle, "pressured_plugin_get_metadata");
   plugin_load =
       (pressured_plugin_load_fn)dlsym(plugin_handle, "pressured_plugin_load");
-  plugin_unload =
-      (pressured_plugin_unload_fn)dlsym(plugin_handle, "pressured_plugin_unload");
-  plugin_create =
-      (pressured_plugin_create_fn)dlsym(plugin_handle, "pressured_plugin_create");
-  plugin_destroy =
-      (pressured_plugin_destroy_fn)dlsym(plugin_handle, "pressured_plugin_destroy");
+  plugin_unload = (pressured_plugin_unload_fn)dlsym(plugin_handle,
+                                                    "pressured_plugin_unload");
+  plugin_create = (pressured_plugin_create_fn)dlsym(plugin_handle,
+                                                    "pressured_plugin_create");
+  plugin_destroy = (pressured_plugin_destroy_fn)dlsym(
+      plugin_handle, "pressured_plugin_destroy");
 
   // Load pprof-specific function for freeing results
   results_free =
@@ -176,17 +176,22 @@ static void test_top_mem_functions(void) {
   }
 
   printf("\n\n  TOP %zu MEMORY FUNCTIONS\n", results.count);
-  printf("  ════════════════════════════════════════════════════════════════════════════════\n\n");
+  printf("  "
+         "═════════════════════════════════════════════════════════════════════"
+         "═══════════\n\n");
 
   for (size_t i = 0; i < results.count; i++) {
-    pprof_func_stat_t *f = &results.funcs[i];
+    const pprof_func_stat_t *f = &results.funcs[i];
     double mb = (double)f->inuse_bytes / (1024.0 * 1024.0);
     printf("  %zu. %s\n", i + 1, f->name);
     printf("     └─ %.2f MB (%ld objects)\n\n", mb, (long)f->inuse_objects);
   }
 
-  printf("  ════════════════════════════════════════════════════════════════════════════════\n");
-  printf("  Total in-use: %.2f MB\n\n", (double)results.total_inuse / (1024.0 * 1024.0));
+  printf("  "
+         "═════════════════════════════════════════════════════════════════════"
+         "═══════════\n");
+  printf("  Total in-use: %.2f MB\n\n",
+         (double)results.total_inuse / (1024.0 * 1024.0));
 
   // Basic assertions
   assert(results.count > 0);

@@ -89,7 +89,7 @@ static uint64_t pbuf_read_varint(pbuf_t *b) {
 
 static void pbuf_read_bytes(pbuf_t *b, const uint8_t **out, size_t *out_len) {
   size_t len = pbuf_read_varint(b);
-  size_t remaining = b->len - b->pos;  // Safe: pos <= len invariant
+  size_t remaining = b->len - b->pos; // Safe: pos <= len invariant
   if (len > remaining)
     len = remaining;
   *out = b->data + b->pos;
@@ -108,7 +108,7 @@ static void pbuf_skip(pbuf_t *b, int wire_type) {
     break;
   case WIRE_LENGTH_DELIMITED: {
     size_t len = pbuf_read_varint(b);
-    remaining = b->len - b->pos;  // Recalculate after varint read
+    remaining = b->len - b->pos; // Recalculate after varint read
     b->pos += (len <= remaining) ? len : remaining;
     break;
   }
@@ -128,10 +128,10 @@ static void pbuf_skip(pbuf_t *b, int wire_type) {
 typedef struct {
   z_stream strm;
   storage_t *storage;
-  const char *key;               // Storage key (not owned, must outlive this struct)
-  storage_file_t *file;          // Current open file handle
-  uint8_t input_buf[INPUT_BUF_SIZE];   // Compressed input buffer
-  uint8_t chunk[DECOMP_CHUNK_SIZE];    // Decompressed output buffer
+  const char *key;      // Storage key (not owned, must outlive this struct)
+  storage_file_t *file; // Current open file handle
+  uint8_t input_buf[INPUT_BUF_SIZE]; // Compressed input buffer
+  uint8_t chunk[DECOMP_CHUNK_SIZE];  // Decompressed output buffer
   size_t chunk_len;
   size_t chunk_pos;
   int finished;
@@ -604,7 +604,7 @@ static int resolve_strings(decomp_t *d, int64_t *indices, size_t num_indices,
                            char **names) {
   uint64_t tag;
   int64_t current_idx = 0;
-  int err = PPROF_ERR_PARSE;  // Default error
+  int err = PPROF_ERR_PARSE; // Default error
 
   // Find max index we need (to enable early exit)
   int64_t max_needed = 0;
@@ -625,7 +625,8 @@ static int resolve_strings(decomp_t *d, int64_t *indices, size_t num_indices,
       if (decomp_read_varint(d, &len) != 0)
         goto error;
 
-      // Check if we need this string (may match multiple indices if functions share names)
+      // Check if we need this string (may match multiple indices if functions
+      // share names)
       int needed = 0;
       for (size_t i = 0; i < num_indices; i++) {
         if (indices[i] == current_idx) {
@@ -655,7 +656,8 @@ static int resolve_strings(decomp_t *d, int64_t *indices, size_t num_indices,
           goto error;
         tmp_buf[len] = '\0';
 
-        // Populate ALL matching indices (multiple functions may share same name)
+        // Populate ALL matching indices (multiple functions may share same
+        // name)
         for (size_t i = 0; i < num_indices; i++) {
           if (indices[i] == current_idx) {
             names[i] = strdup((char *)tmp_buf);
@@ -813,7 +815,7 @@ static int build_results(analysis_ctx_t *ctx, decomp_t *d, size_t top_n,
       for (size_t j = 0; j < i; j++)
         free(out->funcs[j].name);
       for (size_t j = i; j < result_count; j++)
-        free(names[j]);  // Free names not yet transferred
+        free(names[j]); // Free names not yet transferred
       free(out->funcs);
       out->funcs = NULL;
       out->count = 0;
