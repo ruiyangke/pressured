@@ -5,7 +5,7 @@
  * in Go pprof heap profiles.
  *
  * Architecture:
- * - mmap compressed file (avoids malloc for file I/O)
+ * - Uses storage API for all I/O (works with local files, S3, etc.)
  * - Streaming gzip decompression (64KB chunks)
  * - Single-pass: build lookup tables + aggregate samples
  * - No string table storage during analysis
@@ -18,6 +18,7 @@
 #include "log.h"
 #include "plugin.h"
 #include "pprof.h"
+#include "storage.h"
 
 // Silence warnings from cwisstable
 #pragma GCC diagnostic push
@@ -25,13 +26,9 @@
 #include "cwisstable.h"
 #pragma GCC diagnostic pop
 
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 #include <zlib.h>
 
 #define PPROF_PLUGIN_TYPE (1 << 2)
@@ -64,7 +61,7 @@
 #define SAMPLE_VALUE 2
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Protobuf buffer reader
+// Protobuf buffer reader (for parsing embedded messages)
 // ─────────────────────────────────────────────────────────────────────────────
 
 typedef struct {
@@ -122,69 +119,119 @@ static void pbuf_skip(pbuf_t *b, int wire_type) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Streaming gzip decompression
+// Streaming gzip decompression (storage-based)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #define DECOMP_CHUNK_SIZE (64 * 1024)
+#define INPUT_BUF_SIZE (64 * 1024)
 
 typedef struct {
   z_stream strm;
-  const uint8_t *compressed;
-  size_t compressed_len;
-  uint8_t chunk[DECOMP_CHUNK_SIZE];
+  storage_t *storage;
+  const char *key;               // Storage key (not owned, must outlive this struct)
+  storage_file_t *file;          // Current open file handle
+  uint8_t input_buf[INPUT_BUF_SIZE];   // Compressed input buffer
+  uint8_t chunk[DECOMP_CHUNK_SIZE];    // Decompressed output buffer
   size_t chunk_len;
   size_t chunk_pos;
   int finished;
   int initialized;
-} streaming_decomp_t;
+} decomp_t;
 
-static int decomp_init(streaming_decomp_t *d, const uint8_t *data, size_t len) {
+static int decomp_init(decomp_t *d, storage_t *storage, const char *key) {
   memset(d, 0, sizeof(*d));
-  d->compressed = data;
-  d->compressed_len = len;
-  d->strm.next_in = (Bytef *)data;
-  d->strm.avail_in = len;
-  if (inflateInit2(&d->strm, 16 + MAX_WBITS) != Z_OK)
+  d->storage = storage;
+  d->key = key;
+
+  // Open file for reading
+  d->file = storage->open(storage, key, STORAGE_MODE_READ);
+  if (!d->file) {
+    log_error("pprof: failed to open storage key: %s", key);
     return -1;
+  }
+
+  // Initialize zlib for gzip
+  if (inflateInit2(&d->strm, 16 + MAX_WBITS) != Z_OK) {
+    storage->close(d->file);
+    d->file = NULL;
+    return -1;
+  }
+
   d->initialized = 1;
   return 0;
 }
 
-static void decomp_free(streaming_decomp_t *d) {
+static void decomp_free(decomp_t *d) {
   if (d->initialized) {
     inflateEnd(&d->strm);
     d->initialized = 0;
   }
+  if (d->file) {
+    d->storage->close(d->file);
+    d->file = NULL;
+  }
 }
 
-static int decomp_reset(streaming_decomp_t *d) {
+static int decomp_reset(decomp_t *d) {
   if (!d->initialized)
     return -1;
+
+  // Close current file and re-open from beginning
+  if (d->file) {
+    d->storage->close(d->file);
+    d->file = NULL;
+  }
+
+  d->file = d->storage->open(d->storage, d->key, STORAGE_MODE_READ);
+  if (!d->file) {
+    log_error("pprof: failed to re-open storage key: %s", d->key);
+    return -1;
+  }
+
+  // Reset zlib state
   inflateReset(&d->strm);
-  d->strm.next_in = (Bytef *)d->compressed;
-  d->strm.avail_in = d->compressed_len;
+  d->strm.avail_in = 0;
+  d->strm.next_in = NULL;
   d->chunk_len = 0;
   d->chunk_pos = 0;
   d->finished = 0;
   return 0;
 }
 
-static int decomp_fill(streaming_decomp_t *d) {
+static int decomp_fill(decomp_t *d) {
   if (d->finished)
     return 0;
+
+  // Refill input buffer if needed
+  if (d->strm.avail_in == 0) {
+    int64_t n = d->storage->read(d->file, d->input_buf, INPUT_BUF_SIZE);
+    if (n < 0) {
+      log_error("pprof: storage read error");
+      return -1;
+    }
+    d->strm.next_in = d->input_buf;
+    d->strm.avail_in = (uInt)n;
+  }
+
   d->strm.next_out = d->chunk;
   d->strm.avail_out = DECOMP_CHUNK_SIZE;
+
   int ret = inflate(&d->strm, Z_NO_FLUSH);
-  if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR)
+  if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) {
+    log_error("pprof: decompression error: %d", ret);
     return -1;
+  }
+
   d->chunk_len = DECOMP_CHUNK_SIZE - d->strm.avail_out;
   d->chunk_pos = 0;
+
   if (ret == Z_STREAM_END)
     d->finished = 1;
+
   return (int)d->chunk_len;
 }
 
-static int decomp_getc(streaming_decomp_t *d) {
+static int decomp_getc(decomp_t *d) {
   if (d->chunk_pos >= d->chunk_len) {
     if (decomp_fill(d) <= 0)
       return -1;
@@ -192,7 +239,7 @@ static int decomp_getc(streaming_decomp_t *d) {
   return d->chunk[d->chunk_pos++];
 }
 
-static int decomp_read_varint(streaming_decomp_t *d, uint64_t *out) {
+static int decomp_read_varint(decomp_t *d, uint64_t *out) {
   uint64_t result = 0;
   int shift = 0;
   int byte;
@@ -209,7 +256,7 @@ static int decomp_read_varint(streaming_decomp_t *d, uint64_t *out) {
   return -1;
 }
 
-static int decomp_skip_bytes(streaming_decomp_t *d, size_t n) {
+static int decomp_skip_bytes(decomp_t *d, size_t n) {
   while (n > 0) {
     size_t avail = d->chunk_len - d->chunk_pos;
     if (avail == 0) {
@@ -224,7 +271,7 @@ static int decomp_skip_bytes(streaming_decomp_t *d, size_t n) {
   return 0;
 }
 
-static int decomp_read_bytes(streaming_decomp_t *d, uint8_t *buf, size_t n) {
+static int decomp_read_bytes(decomp_t *d, uint8_t *buf, size_t n) {
   size_t total = 0;
   while (total < n) {
     size_t avail = d->chunk_len - d->chunk_pos;
@@ -241,7 +288,7 @@ static int decomp_read_bytes(streaming_decomp_t *d, uint8_t *buf, size_t n) {
   return 0;
 }
 
-static int decomp_skip_field(streaming_decomp_t *d, int wire_type) {
+static int decomp_skip_field(decomp_t *d, int wire_type) {
   switch (wire_type) {
   case WIRE_VARINT: {
     uint64_t dummy;
@@ -307,7 +354,7 @@ static void ctx_free(analysis_ctx_t *ctx) {
 // Skip string table entirely - just count entries
 // ─────────────────────────────────────────────────────────────────────────────
 
-static int analyze_pass(streaming_decomp_t *d, analysis_ctx_t *ctx) {
+static int analyze_pass(decomp_t *d, analysis_ctx_t *ctx) {
   uint64_t tag;
   uint8_t *tmp_buf = NULL;
   size_t tmp_cap = 0;
@@ -553,13 +600,13 @@ error:
 // Resolve specific string indices by re-scanning (targeted fetch)
 // ─────────────────────────────────────────────────────────────────────────────
 
-static int resolve_strings(streaming_decomp_t *d, int64_t *indices,
-                           size_t num_indices, char **names) {
+static int resolve_strings(decomp_t *d, int64_t *indices, size_t num_indices,
+                           char **names) {
   uint64_t tag;
   int64_t current_idx = 0;
   int err = PPROF_ERR_PARSE;  // Default error
 
-  // Sort indices we need (to enable early exit)
+  // Find max index we need (to enable early exit)
   int64_t max_needed = 0;
   for (size_t i = 0; i < num_indices; i++) {
     if (indices[i] > max_needed)
@@ -664,7 +711,7 @@ static int cmp_by_bytes_desc(const void *a, const void *b) {
   return 0;
 }
 
-static int build_results(analysis_ctx_t *ctx, streaming_decomp_t *d, size_t top_n,
+static int build_results(analysis_ctx_t *ctx, decomp_t *d, size_t top_n,
                          pprof_results_t *out) {
   // Extract all entries from FuncMap into sortable array
   size_t func_count = FuncMap_size(&ctx->funcs);
@@ -787,9 +834,9 @@ static int build_results(analysis_ctx_t *ctx, streaming_decomp_t *d, size_t top_
 // Main analysis function
 // ─────────────────────────────────────────────────────────────────────────────
 
-static int do_analyze(const uint8_t *compressed, size_t compressed_len,
-                      size_t top_n, pprof_results_t *out) {
-  streaming_decomp_t decomp;
+static int do_analyze(storage_t *storage, const char *key, size_t top_n,
+                      pprof_results_t *out) {
+  decomp_t decomp;
   analysis_ctx_t ctx;
   int rc;
 
@@ -799,8 +846,8 @@ static int do_analyze(const uint8_t *compressed, size_t compressed_len,
 
   memset(out, 0, sizeof(*out));
 
-  if (decomp_init(&decomp, compressed, compressed_len) != 0)
-    return PPROF_ERR_DECOMPRESS;
+  if (decomp_init(&decomp, storage, key) != 0)
+    return PPROF_ERR_IO;
 
   if (ctx_init(&ctx) != 0) {
     decomp_free(&decomp);
@@ -848,41 +895,14 @@ typedef struct {
   pprof_analyzer_t base;
 } pprof_handle_t;
 
-// Helper: mmap file and analyze
-static int analyze_file(const char *path, size_t top_n, pprof_results_t *out) {
-  int fd = open(path, O_RDONLY);
-  if (fd < 0) {
-    log_error("pprof: failed to open %s", path);
-    return PPROF_ERR_IO;
-  }
-
-  struct stat st;
-  if (fstat(fd, &st) != 0 || st.st_size <= 0) {
-    close(fd);
-    return PPROF_ERR_IO;
-  }
-
-  void *mapped = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-  close(fd);
-
-  if (mapped == MAP_FAILED) {
-    log_error("pprof: mmap failed for %s", path);
-    return PPROF_ERR_IO;
-  }
-
-  madvise(mapped, st.st_size, MADV_SEQUENTIAL);
-
-  int rc = do_analyze(mapped, st.st_size, top_n, out);
-
-  munmap(mapped, st.st_size);
-  return rc;
-}
-
 // vtable: top_mem_functions
-static int pprof_top_mem_functions(pprof_analyzer_t *a, const char *path,
-                                   size_t top_n, pprof_results_t *out) {
+static int pprof_top_mem_functions(pprof_analyzer_t *a, storage_t *storage,
+                                   const char *key, size_t top_n,
+                                   pprof_results_t *out) {
   (void)a;
-  return analyze_file(path, top_n, out);
+  if (!storage || !key)
+    return PPROF_ERR_INVALID;
+  return do_analyze(storage, key, top_n, out);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

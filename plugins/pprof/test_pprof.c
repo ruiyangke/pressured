@@ -1,14 +1,17 @@
 /*
  * pprof analyzer tests
  *
- * Tests the purpose-built pprof heap analyzer.
+ * Tests the purpose-built pprof heap analyzer using storage API.
  */
 
 #include "log.h"
 #include "plugin.h"
+#include "plugin_manager.h"
 #include "pprof.h"
+#include "storage.h"
 #include <assert.h>
 #include <dlfcn.h>
+#include <libgen.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -106,7 +109,7 @@ static void test_lifecycle(void) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Test: Top memory functions
+// Test: Top memory functions (using storage API)
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void test_top_mem_functions(void) {
@@ -118,6 +121,35 @@ static void test_top_mem_functions(void) {
     return;
   }
 
+  // Extract directory and filename from test_file path
+  // We'll set the storage root to the directory containing the file
+  char *test_file_copy = strdup(test_file);
+  char *test_file_copy2 = strdup(test_file);
+  char *dir = dirname(test_file_copy);
+  char *filename = basename(test_file_copy2);
+
+  // Set storage root to the directory containing the pprof file
+  setenv("PRESSURED_STORAGE_PATH", dir, 1);
+
+  // Load storage plugin
+  plugin_manager_t *pm = plugin_manager_new();
+  assert(pm != NULL);
+
+  int rc = plugin_manager_load(pm, "./plugins/storage_local.so", NULL);
+  if (rc != 0) {
+    printf("FAIL (failed to load storage plugin)\n");
+    free(test_file_copy);
+    free(test_file_copy2);
+    plugin_manager_free(pm);
+    return;
+  }
+
+  // Get storage interface
+  storage_t *storage =
+      (storage_t *)plugin_manager_get_handle(pm, PRESSURED_PLUGIN_TYPE_STORAGE);
+  assert(storage != NULL);
+
+  // Now load and test the pprof analyzer
   plugin_ctx = plugin_load(NULL);
   assert(plugin_ctx != NULL);
 
@@ -129,13 +161,17 @@ static void test_top_mem_functions(void) {
   pprof_analyzer_t *a = (pprof_analyzer_t *)handle;
 
   // Get top 5 memory-consuming functions (0 = use default)
+  // Use storage API - filename is the key since storage root is the directory
   pprof_results_t results = {0};
-  int rc = a->top_mem_functions(a, test_file, 0, &results);
+  rc = a->top_mem_functions(a, storage, filename, 0, &results);
 
   if (rc != 0) {
-    printf("FAIL (analyze error: %d)\n", rc);
+    printf("FAIL (analyze error: %d - %s)\n", rc, pprof_strerror(rc));
     plugin_destroy(plugin_ctx, PPROF_PLUGIN_TYPE, handle);
     plugin_unload(plugin_ctx);
+    plugin_manager_free(pm);
+    free(test_file_copy);
+    free(test_file_copy2);
     return;
   }
 
@@ -162,6 +198,10 @@ static void test_top_mem_functions(void) {
   plugin_destroy(plugin_ctx, PPROF_PLUGIN_TYPE, handle);
   plugin_unload(plugin_ctx);
   plugin_ctx = NULL;
+
+  plugin_manager_free(pm);
+  free(test_file_copy);
+  free(test_file_copy2);
 
   printf("  PASS\n");
 }

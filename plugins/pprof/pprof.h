@@ -3,6 +3,9 @@
  *
  * Purpose-built analyzer for Go pprof heap profiles.
  * Finds top memory-consuming functions efficiently.
+ *
+ * Uses the storage API for all I/O operations, enabling support for
+ * any storage backend (local filesystem, S3, etc.).
  */
 
 #ifndef PPROF_H
@@ -10,6 +13,10 @@
 
 #include <stddef.h>
 #include <stdint.h>
+
+// Forward declare storage types (include storage.h for full definitions)
+typedef struct storage storage_t;
+typedef struct storage_file storage_file_t;
 
 // Default number of results
 #define PPROF_DEFAULT_TOP_N 5
@@ -59,14 +66,18 @@ struct pprof_analyzer {
   /*
    * Get top N memory-consuming functions from a heap profile
    *
-   * @param a      Analyzer instance
-   * @param path   Path to gzipped pprof file
-   * @param top_n  Maximum number of results (0 = use PPROF_DEFAULT_TOP_N)
-   * @param out    Output results (caller must call pprof_results_free)
-   * @return       PPROF_OK on success, error code on failure
+   * Uses streaming I/O through storage interface. Works with any backend
+   * (local filesystem via storage_local, S3 via storage_s3, etc.).
+   *
+   * @param a       Analyzer instance
+   * @param storage Storage interface
+   * @param key     Storage key for the gzipped pprof file
+   * @param top_n   Maximum number of results (0 = use PPROF_DEFAULT_TOP_N)
+   * @param out     Output results (caller must call pprof_results_free)
+   * @return        PPROF_OK on success, error code on failure
    */
-  int (*top_mem_functions)(pprof_analyzer_t *a, const char *path, size_t top_n,
-                           pprof_results_t *out);
+  int (*top_mem_functions)(pprof_analyzer_t *a, storage_t *storage,
+                           const char *key, size_t top_n, pprof_results_t *out);
 };
 
 /*
