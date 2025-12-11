@@ -13,12 +13,13 @@
  * Load Policy: IMPLICIT (default: enabled)
  *   - Plugins load unless explicitly disabled via: plugins.<name>.enabled = false
  *   - The "enabled" field is reserved in each plugin's config section
+ *   - Plugin names use kebab-case (e.g., "local-storage", "s3-storage")
  *
  * Config example:
  *   {
  *     "plugins": {
  *       "lua": { "enabled": true, "script": "alert.lua" },
- *       "local_storage": { "enabled": false }
+ *       "local-storage": { "enabled": false }
  *     }
  *   }
  *

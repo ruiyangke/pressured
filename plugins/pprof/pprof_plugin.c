@@ -898,7 +898,8 @@ static int pprof_top_mem_functions(pprof_analyzer_t *a, storage_t *storage,
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct pressured_plugin_ctx {
-  int initialized;
+  /* Reserved for future use (e.g., global config) */
+  int _reserved;
 };
 
 static void *pprof_factory(void *userdata) {
@@ -968,7 +969,6 @@ pressured_plugin_load(const char *config_json, service_registry_t *sr) {
     return NULL;
   }
 
-  ctx->initialized = 1;
   log_info("pprof: heap analyzer v1.0 loaded");
   return ctx;
 }

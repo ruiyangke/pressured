@@ -210,15 +210,24 @@ int main(int argc, char *argv[]) {
                        event->sample.usage_percent, event->sample.usage_bytes,
                        event->sample.limit_bytes);
 
-        // Dispatch to action services
-        if (service_registry_has(registry, "action")) {
-          service_ref_t ref = service_registry_acquire(registry, "action");
-          if (service_ref_valid(&ref)) {
-            action_t *action = (action_t *)ref.instance;
-            if (action && action->on_event) {
-              action->on_event(action, event, config->dry_run);
+        // Dispatch to ALL action services
+        size_t action_count = service_registry_count(registry, "action");
+        if (action_count > 0) {
+          service_ref_t *refs = calloc(action_count, sizeof(service_ref_t));
+          if (refs) {
+            size_t acquired = service_registry_acquire_all(
+                registry, "action", refs, action_count);
+
+            for (size_t j = 0; j < acquired; j++) {
+              if (service_ref_valid(&refs[j])) {
+                action_t *action = (action_t *)refs[j].instance;
+                if (action && action->on_event) {
+                  action->on_event(action, event, config->dry_run);
+                }
+                service_ref_release(&refs[j]);
+              }
             }
-            service_ref_release(&ref);
+            free(refs);
           }
         }
       }

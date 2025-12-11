@@ -63,8 +63,8 @@ static void test_lifecycle(void) {
   int rc = plugin_manager_load(pm, PPROF_PLUGIN_PATH, NULL);
   if (rc != 0) {
     printf("FAIL (load returned %d)\n", rc);
-    plugin_manager_free(pm);
     service_registry_free(sr);
+    plugin_manager_free(pm);
     return;
   }
 
@@ -75,8 +75,8 @@ static void test_lifecycle(void) {
   service_ref_t ref = service_registry_acquire(sr, "analyzer");
   if (!service_ref_valid(&ref)) {
     printf("FAIL (no analyzer service registered)\n");
-    plugin_manager_free(pm);
     service_registry_free(sr);
+    plugin_manager_free(pm);
     return;
   }
 
@@ -126,8 +126,8 @@ static void test_top_mem_functions(void) {
     printf("FAIL (failed to load storage plugin)\n");
     free(test_file_copy);
     free(test_file_copy2);
-    plugin_manager_free(pm);
     service_registry_free(sr);
+    plugin_manager_free(pm);
     return;
   }
 
@@ -137,8 +137,8 @@ static void test_top_mem_functions(void) {
     printf("FAIL (failed to load pprof plugin)\n");
     free(test_file_copy);
     free(test_file_copy2);
-    plugin_manager_free(pm);
     service_registry_free(sr);
+    plugin_manager_free(pm);
     return;
   }
 
@@ -151,8 +151,8 @@ static void test_top_mem_functions(void) {
     printf("FAIL (no storage service)\n");
     free(test_file_copy);
     free(test_file_copy2);
-    plugin_manager_free(pm);
     service_registry_free(sr);
+    plugin_manager_free(pm);
     return;
   }
   storage_t *storage = (storage_t *)storage_ref.instance;
@@ -164,8 +164,8 @@ static void test_top_mem_functions(void) {
     service_ref_release(&storage_ref);
     free(test_file_copy);
     free(test_file_copy2);
-    plugin_manager_free(pm);
     service_registry_free(sr);
+    plugin_manager_free(pm);
     return;
   }
   pprof_analyzer_t *a = (pprof_analyzer_t *)analyzer_ref.instance;
@@ -180,8 +180,8 @@ static void test_top_mem_functions(void) {
     service_ref_release(&storage_ref);
     free(test_file_copy);
     free(test_file_copy2);
-    plugin_manager_free(pm);
     service_registry_free(sr);
+    plugin_manager_free(pm);
     return;
   }
 
