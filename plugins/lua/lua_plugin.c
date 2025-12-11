@@ -615,9 +615,9 @@ pressured_plugin_load(const char *config_json, service_registry_t *sr) {
   parse_plugin_config(ctx, config_json);
 
   /* Register action service with the registry */
-  int rc = service_registry_register(sr, &action_service_meta,
-                                     SERVICE_SCOPE_SINGLETON, lua_action_factory,
-                                     lua_action_destructor, ctx);
+  int rc = service_registry_register(
+      sr, &action_service_meta, SERVICE_SCOPE_SINGLETON, lua_action_factory,
+      lua_action_destructor, ctx);
   if (rc != 0) {
     log_error("lua: failed to register with service registry");
     free(ctx->config_json);

@@ -1,0 +1,11 @@
+# cppcheck suppression file
+# Format: id:filename or id:filename:line
+
+# Third-party library: cwisstable (Swiss Table hash map)
+# Suppress at both definition site and usage sites
+unknownMacro:plugins/pprof/cwisstable.h
+syntaxError:plugins/pprof/cwisstable.h
+unknownMacro:plugins/pprof/pprof_plugin.c
+
+# Too many #ifdef configurations in cwisstable
+toomanyconfigs

@@ -26,7 +26,8 @@ typedef struct service_registry service_registry_t;
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Plugin Metadata
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 typedef struct {
   char name[64];
@@ -37,7 +38,8 @@ typedef struct {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Plugin Context
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 /* Opaque plugin context (plugin-specific global state) */
 typedef struct pressured_plugin_ctx pressured_plugin_ctx_t;
@@ -46,7 +48,8 @@ typedef struct pressured_plugin_ctx pressured_plugin_ctx_t;
  * Plugin Exports
  *
  * Plugins must export these 3 symbols:
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 /* Returns plugin metadata (name, version, description) */
 typedef const pressured_plugin_metadata_t *(*pressured_plugin_get_metadata_fn)(
@@ -77,7 +80,8 @@ typedef void (*pressured_plugin_unload_fn)(pressured_plugin_ctx_t *ctx);
  * Action Interface
  *
  * Action services implement event handling. Register with type="action".
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 typedef struct action action_t;
 

@@ -5,8 +5,8 @@
  * Plugins register their services with the service_registry during load().
  */
 
-#include "plugin_manager.h"
 #include "log.h"
+#include "plugin_manager.h"
 #include <dirent.h>
 #include <dlfcn.h>
 #include <json-c/json.h>
@@ -18,7 +18,8 @@
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Internal Structures
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 typedef struct {
   void *dl_handle; /* dlopen handle */
@@ -42,7 +43,8 @@ struct plugin_manager {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Lifecycle
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 plugin_manager_t *plugin_manager_new(service_registry_t *sr) {
   if (!sr) {
@@ -68,7 +70,8 @@ void plugin_manager_free(plugin_manager_t *pm) {
     loaded_plugin_t *lp = &pm->plugins[i];
 
     if (lp->unload && lp->ctx) {
-      log_debug("unloading plugin: %s", lp->metadata ? lp->metadata->name : "?");
+      log_debug("unloading plugin: %s",
+                lp->metadata ? lp->metadata->name : "?");
       lp->unload(lp->ctx);
     }
 
@@ -98,9 +101,11 @@ void plugin_manager_free(plugin_manager_t *pm) {
  *       "local-storage": { "enabled": false }
  *     }
  *   }
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
-static int plugin_is_disabled(const char *plugin_name, const char *config_json) {
+static int plugin_is_disabled(const char *plugin_name,
+                              const char *config_json) {
   if (!plugin_name || !config_json)
     return 0; /* No config = enabled (implicit) */
 
@@ -127,7 +132,8 @@ static int plugin_is_disabled(const char *plugin_name, const char *config_json) 
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Loading
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 int plugin_manager_load(plugin_manager_t *pm, const char *path,
                         const char *config_json) {
@@ -157,7 +163,8 @@ int plugin_manager_load(plugin_manager_t *pm, const char *path,
       dlsym(handle, PRESSURED_PLUGIN_SYMBOL_UNLOAD);
 
   if (!get_metadata || !load_fn || !unload_fn) {
-    log_error("plugin %s missing required symbols (metadata/load/unload)", path);
+    log_error("plugin %s missing required symbols (metadata/load/unload)",
+              path);
     dlclose(handle);
     return -1;
   }
@@ -249,14 +256,13 @@ int plugin_manager_load_dir(plugin_manager_t *pm, const char *dir,
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Inspection
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
-int plugin_manager_count(plugin_manager_t *pm) {
-  return pm ? pm->count : 0;
-}
+int plugin_manager_count(plugin_manager_t *pm) { return pm ? pm->count : 0; }
 
-const pressured_plugin_metadata_t *plugin_manager_get_metadata(
-    plugin_manager_t *pm, int index) {
+const pressured_plugin_metadata_t *
+plugin_manager_get_metadata(plugin_manager_t *pm, int index) {
   if (!pm || index < 0 || index >= pm->count) {
     return NULL;
   }

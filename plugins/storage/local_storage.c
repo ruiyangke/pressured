@@ -28,7 +28,8 @@
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Plugin Context
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 struct pressured_plugin_ctx {
   char base_path[MAX_PATH_LEN];
@@ -36,7 +37,8 @@ struct pressured_plugin_ctx {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Storage Handle
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 typedef struct {
   storage_t base;                   /* MUST be first - vtable interface */
@@ -45,7 +47,8 @@ typedef struct {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * File Handle
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 struct storage_file {
   FILE *fp;
@@ -56,7 +59,8 @@ struct storage_file {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Helpers
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 static void build_path(const char *base, const char *key, char *out,
                        size_t out_len) {
@@ -104,7 +108,8 @@ static int mkdirs(const char *path) {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Storage Operations
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 static int local_exists(storage_t *s, const char *key) {
   const local_storage_t *ls = (const local_storage_t *)s;
@@ -237,7 +242,8 @@ static int local_close(storage_file_t *f) {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Service Factory
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 static void *local_storage_factory(void *userdata) {
   struct pressured_plugin_ctx *ctx = userdata;
@@ -270,7 +276,8 @@ static void local_storage_destructor(void *instance, void *userdata) {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Service Metadata
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 static const char *local_tags[] = {"local", "filesystem", NULL};
 
@@ -287,7 +294,8 @@ static const service_metadata_t storage_service_meta = {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Plugin Metadata
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 static const pressured_plugin_metadata_t plugin_metadata = {
     .name = "local-storage",
@@ -303,7 +311,8 @@ pressured_plugin_get_metadata(void) {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Plugin Lifecycle
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 PRESSURED_PLUGIN_EXPORT pressured_plugin_ctx_t *
 pressured_plugin_load(const char *config_json, service_registry_t *sr) {
@@ -351,10 +360,9 @@ pressured_plugin_load(const char *config_json, service_registry_t *sr) {
   }
 
   /* Register storage service with the registry */
-  int rc = service_registry_register(sr, &storage_service_meta,
-                                     SERVICE_SCOPE_SINGLETON,
-                                     local_storage_factory,
-                                     local_storage_destructor, ctx);
+  int rc = service_registry_register(
+      sr, &storage_service_meta, SERVICE_SCOPE_SINGLETON, local_storage_factory,
+      local_storage_destructor, ctx);
   if (rc != 0) {
     log_error("local_storage: failed to register with service registry");
     free(ctx);

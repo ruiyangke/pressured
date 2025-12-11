@@ -13,7 +13,8 @@
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Internal Structures
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 typedef struct service_entry {
   struct service_entry *next; /* Next provider for same type (linked list) */
@@ -49,7 +50,8 @@ struct service_registry {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Hash Function (FNV-1a)
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 static uint32_t hash_string(const char *str) {
   uint32_t hash = 2166136261u;
@@ -64,7 +66,8 @@ static uint32_t hash_string(const char *str) {
  * Type String Parsing
  *
  * Supports "type" and "type:provider" syntax
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 typedef struct {
   char type[128];
@@ -95,7 +98,8 @@ static void parse_type_string(const char *input, parsed_type_t *out) {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Tag Matching
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 static int entry_has_tag(const service_entry_t *e, const char *tag) {
   if (!e->metadata.tags)
@@ -109,7 +113,8 @@ static int entry_has_tag(const service_entry_t *e, const char *tag) {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Entry Management
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 static service_entry_t *entry_new(const service_metadata_t *metadata,
                                   service_scope_e scope,
@@ -158,7 +163,8 @@ static void entry_free(service_entry_t *e) {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Bucket Operations
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 /* Find highest-priority entry for type (optionally matching provider) */
 static service_entry_t *bucket_find_best(bucket_t *b, const char *type,
@@ -213,7 +219,8 @@ static void bucket_add(bucket_t *b, service_entry_t *e) {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Registry Resize
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 static int registry_resize(service_registry_t *sr, size_t new_count) {
   bucket_t *new_buckets = calloc(new_count, sizeof(bucket_t));
@@ -240,7 +247,8 @@ static int registry_resize(service_registry_t *sr, size_t new_count) {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Instance Creation (Internal)
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 static int entry_instantiate(service_entry_t *e) {
   if (e->instantiated)
@@ -282,7 +290,8 @@ static service_ref_t make_ref(service_entry_t *e) {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Public API: Registry Lifecycle
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 service_registry_t *service_registry_new(void) {
   service_registry_t *sr = calloc(1, sizeof(*sr));
@@ -319,7 +328,8 @@ void service_registry_free(service_registry_t *sr) {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Public API: Eager Initialization
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 int service_registry_init(service_registry_t *sr, const char *type) {
   if (!sr || !type)
@@ -367,7 +377,8 @@ int service_registry_init_all(service_registry_t *sr) {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Public API: Registration
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 int service_registry_register(service_registry_t *sr,
                               const service_metadata_t *metadata,
@@ -419,7 +430,8 @@ int service_registry_register_ex(service_registry_t *sr,
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Public API: Acquisition
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 service_ref_t service_registry_acquire(service_registry_t *sr,
                                        const char *type) {
@@ -677,7 +689,8 @@ size_t service_registry_acquire_all_tagged(service_registry_t *sr,
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Public API: Query
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 int service_registry_has(service_registry_t *sr, const char *type) {
   if (!sr || !type)
@@ -739,7 +752,8 @@ service_state_t service_registry_state(service_registry_t *sr,
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Public API: Lifecycle Control
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 int service_registry_start(service_registry_t *sr, const char *type) {
   if (!sr || !type)
@@ -844,7 +858,8 @@ void service_registry_stop_all(service_registry_t *sr) {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Public API: Iteration
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
 
 void service_registry_foreach_type(service_registry_t *sr,
                                    service_type_callback_fn callback,
