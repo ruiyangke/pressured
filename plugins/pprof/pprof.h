@@ -39,7 +39,7 @@ enum {
  * Function memory statistics
  */
 typedef struct {
-  char *name;            // function name (owned, caller frees via pprof_results_free)
+  char *name; // function name (owned, caller frees via pprof_results_free)
   int64_t inuse_bytes;   // bytes currently in use
   int64_t inuse_objects; // objects currently in use
 } pprof_func_stat_t;
@@ -48,9 +48,10 @@ typedef struct {
  * Analysis results
  */
 typedef struct {
-  pprof_func_stat_t *funcs; // array of function stats, sorted by inuse_bytes desc
-  size_t count;             // number of results
-  int64_t total_inuse;      // total bytes in use across all functions
+  pprof_func_stat_t
+      *funcs;          // array of function stats, sorted by inuse_bytes desc
+  size_t count;        // number of results
+  int64_t total_inuse; // total bytes in use across all functions
 } pprof_results_t;
 
 // ─────────────────────────────────────────────────────────────────────────────

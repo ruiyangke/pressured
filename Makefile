@@ -60,13 +60,21 @@ test-s3: build ## Run S3 storage tests (requires LocalStack)
 ##@ Code Quality
 
 lint: ## Run static analysis (cppcheck if available)
-	@which cppcheck > /dev/null && cppcheck --enable=all --suppress=missingIncludeSystem -I include -I src -I plugins/lua -I plugins/storage src/ include/ plugins/ || echo "cppcheck not installed, skipping"
+	@which cppcheck > /dev/null && cppcheck --enable=all \
+		--suppress=missingIncludeSystem \
+		--suppress=unusedFunction \
+		--suppress=constParameterCallback \
+		--suppress=unknownMacro \
+		--suppress=syntaxError:plugins/pprof/cwisstable.h \
+		--suppress=staticFunction:src/log.c \
+		-I include -I src -I plugins/lua -I plugins/storage \
+		src/ include/ plugins/ || echo "cppcheck not installed, skipping"
 
 format: ## Format code with clang-format
-	@which clang-format > /dev/null && find src include plugins \( -name '*.c' -o -name '*.h' \) | xargs clang-format -i || echo "clang-format not installed, skipping"
+	@which clang-format > /dev/null && find src include plugins \( -name '*.c' -o -name '*.h' \) ! -name 'cwisstable.h' | xargs clang-format -i || echo "clang-format not installed, skipping"
 
 format-check: ## Check code formatting
-	@which clang-format > /dev/null && find src include plugins \( -name '*.c' -o -name '*.h' \) | xargs clang-format --dry-run --Werror || echo "clang-format not installed, skipping"
+	@which clang-format > /dev/null && find src include plugins \( -name '*.c' -o -name '*.h' \) ! -name 'cwisstable.h' | xargs clang-format --dry-run --Werror || echo "clang-format not installed, skipping"
 
 ##@ Docker
 
