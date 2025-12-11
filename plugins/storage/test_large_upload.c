@@ -14,6 +14,7 @@
 
 #include "log.h"
 #include "plugin_manager.h"
+#include "service_registry.h"
 #include "storage.h"
 #include <assert.h>
 #include <stdio.h>
@@ -22,7 +23,7 @@
 #include <sys/time.h>
 #include <time.h>
 
-#define S3_PLUGIN_PATH "./plugins/storage_s3.so"
+#define S3_PLUGIN_PATH "./plugins/s3-storage.so"
 #define LOCALSTACK_ENDPOINT "http://localhost:4566"
 #define TEST_BUCKET "pressured-test"
 #define TEST_REGION "us-east-1"
@@ -90,10 +91,17 @@ int main(int argc, char *argv[]) {
   setenv("PRESSURED_S3_REGION", TEST_REGION, 1);
   setenv("PRESSURED_S3_ENDPOINT", LOCALSTACK_ENDPOINT, 1);
 
-  // Load plugin using plugin manager
-  plugin_manager_t *pm = plugin_manager_new();
+  // Create service registry and plugin manager
+  service_registry_t *sr = service_registry_new();
+  if (!sr) {
+    printf("  ERROR: failed to create service registry\n");
+    return 1;
+  }
+
+  plugin_manager_t *pm = plugin_manager_new(sr);
   if (!pm) {
     printf("  ERROR: failed to create plugin manager\n");
+    service_registry_free(sr);
     return 1;
   }
 
@@ -101,23 +109,30 @@ int main(int argc, char *argv[]) {
   if (rc != 0) {
     printf("  ERROR: failed to load S3 plugin\n");
     plugin_manager_free(pm);
+    service_registry_free(sr);
     return 1;
   }
 
-  // Get storage interface - handle embeds vtable
-  storage_t *s =
-      (storage_t *)plugin_manager_get_handle(pm, PRESSURED_PLUGIN_TYPE_STORAGE);
-  if (!s) {
-    printf("  ERROR: failed to get storage interface\n");
+  // Initialize all services
+  service_registry_init_all(sr);
+
+  // Get storage via service registry
+  service_ref_t ref = service_registry_acquire(sr, "storage");
+  if (!service_ref_valid(&ref)) {
+    printf("  ERROR: no storage service registered\n");
     plugin_manager_free(pm);
+    service_registry_free(sr);
     return 1;
   }
+  storage_t *s = (storage_t *)ref.instance;
 
   // Allocate chunk buffer (not the full file!)
   printf("  Allocating %zu MB chunk buffer...\n", CHUNK_SIZE / (1024 * 1024));
   char *chunk = malloc(CHUNK_SIZE);
   if (!chunk) {
     printf("  ERROR: failed to allocate chunk buffer\n");
+    service_ref_release(&ref);
+    service_registry_free(sr);
     plugin_manager_free(pm);
     return 1;
   }
@@ -136,6 +151,8 @@ int main(int argc, char *argv[]) {
   if (!f) {
     printf("  ERROR: failed to open for write\n");
     free(chunk);
+    service_ref_release(&ref);
+    service_registry_free(sr);
     plugin_manager_free(pm);
     return 1;
   }
@@ -156,7 +173,9 @@ int main(int argc, char *argv[]) {
       printf("  ERROR: write chunk %zu failed (returned %ld)\n", chunk_num, n);
       s->close(f);
       free(chunk);
+      service_ref_release(&ref);
       plugin_manager_free(pm);
+      service_registry_free(sr);
       return 1;
     }
 
@@ -173,6 +192,8 @@ int main(int argc, char *argv[]) {
   if (rc != STORAGE_OK) {
     printf("  ERROR: close failed with %d\n", rc);
     free(chunk);
+    service_ref_release(&ref);
+    service_registry_free(sr);
     plugin_manager_free(pm);
     return 1;
   }
@@ -194,6 +215,8 @@ int main(int argc, char *argv[]) {
   if (!f) {
     printf("  ERROR: failed to open for read\n");
     free(chunk);
+    service_ref_release(&ref);
+    service_registry_free(sr);
     plugin_manager_free(pm);
     return 1;
   }
@@ -208,7 +231,9 @@ int main(int argc, char *argv[]) {
       printf("  ERROR: read chunk %zu failed (returned %ld)\n", chunk_num, n);
       s->close(f);
       free(chunk);
+      service_ref_release(&ref);
       plugin_manager_free(pm);
+      service_registry_free(sr);
       return 1;
     }
 
@@ -217,7 +242,9 @@ int main(int argc, char *argv[]) {
       printf("  ERROR: data mismatch at offset %zu\n", read_total);
       s->close(f);
       free(chunk);
+      service_ref_release(&ref);
       plugin_manager_free(pm);
+      service_registry_free(sr);
       return 1;
     }
 
@@ -234,6 +261,8 @@ int main(int argc, char *argv[]) {
   if (rc != STORAGE_OK) {
     printf("  ERROR: close failed with %d\n", rc);
     free(chunk);
+    service_ref_release(&ref);
+    service_registry_free(sr);
     plugin_manager_free(pm);
     return 1;
   }
@@ -241,6 +270,8 @@ int main(int argc, char *argv[]) {
   if (read_total != total_size) {
     printf("  ERROR: read %zu bytes, expected %zu\n", read_total, total_size);
     free(chunk);
+    service_ref_release(&ref);
+    service_registry_free(sr);
     plugin_manager_free(pm);
     return 1;
   }
@@ -258,6 +289,8 @@ int main(int argc, char *argv[]) {
   s->remove(s, test_key);
 
   free(chunk);
+  service_ref_release(&ref);
+  service_registry_free(sr);
   plugin_manager_free(pm);
 
   printf("\ntest_large_upload: PASSED\n");

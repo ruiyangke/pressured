@@ -22,7 +22,7 @@
 
 #include "bindings.h"
 #include "log.h"
-#include "plugin_manager.h"
+#include "service_registry.h"
 #include <lauxlib.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,11 +36,47 @@ typedef struct {
 
 #define LUA_STORAGE_FILE_MT "storage_file"
 
-// Get storage from global service lookup (lazy lookup at runtime)
-// This allows storage plugins to be loaded after action plugins
+// Get storage from service registry stored in Lua registry
+// Acquires storage lazily at runtime (allows storage plugins to load after action plugins)
 static storage_t *get_storage(lua_State *L) {
-  (void)L; // Unused - we use global service lookup
-  return (storage_t *)plugin_get_service(PLUGIN_SERVICE_STORAGE);
+  // First check if we already have a cached storage pointer
+  lua_getfield(L, LUA_REGISTRYINDEX, LUA_REG_STORAGE);
+  if (!lua_isnil(L, -1)) {
+    storage_t *s = (storage_t *)lua_touserdata(L, -1);
+    lua_pop(L, 1);
+    return s;
+  }
+  lua_pop(L, 1);
+
+  // Get service registry from Lua registry
+  lua_getfield(L, LUA_REGISTRYINDEX, LUA_REG_SERVICE_REGISTRY);
+  if (lua_isnil(L, -1)) {
+    lua_pop(L, 1);
+    log_debug("lua_storage: no service registry available");
+    return NULL;
+  }
+  service_registry_t *sr = (service_registry_t *)lua_touserdata(L, -1);
+  lua_pop(L, 1);
+
+  if (!sr) {
+    return NULL;
+  }
+
+  // Acquire storage service
+  service_ref_t ref = service_registry_acquire(sr, "storage");
+  if (!service_ref_valid(&ref)) {
+    log_debug("lua_storage: no storage service registered");
+    return NULL;
+  }
+
+  storage_t *s = (storage_t *)ref.instance;
+
+  // Cache the storage pointer in Lua registry for future calls
+  // Note: We don't release the ref since it's a singleton and we want to keep it
+  lua_pushlightuserdata(L, s);
+  lua_setfield(L, LUA_REGISTRYINDEX, LUA_REG_STORAGE);
+
+  return s;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -390,7 +426,13 @@ static int lua_storage_open(lua_State *L) {
 // Registration
 // ─────────────────────────────────────────────────────────────────────────────
 
-void lua_register_storage(lua_State *L) {
+void lua_register_storage(lua_State *L, service_registry_t *sr) {
+  // Store service registry in Lua registry for lazy storage lookup
+  if (sr) {
+    lua_pushlightuserdata(L, sr);
+    lua_setfield(L, LUA_REGISTRYINDEX, LUA_REG_SERVICE_REGISTRY);
+  }
+
   // Create file handle metatable
   luaL_newmetatable(L, LUA_STORAGE_FILE_MT);
 

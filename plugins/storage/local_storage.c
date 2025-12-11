@@ -1,13 +1,18 @@
 /*
  * Local filesystem storage plugin
  *
- * Environment variables:
- *   PRESSURED_STORAGE_PATH - Base directory for storage (default:
- * /var/lib/pressured/storage)
+ * Registers as "storage:local" with the service registry.
+ * Plugin name: "local-storage" (used for config lookup)
+ *
+ * Configuration:
+ *   - PRESSURED_STORAGE_PATH env var
+ *   - storage.path in config JSON
+ *   - plugins.local-storage.enabled = false to disable
  */
 
 #include "log.h"
 #include "plugin.h"
+#include "service_registry.h"
 #include "storage.h"
 #include <errno.h>
 #include <json-c/json.h>
@@ -21,26 +26,26 @@
 #define DEFAULT_PATH "/var/lib/pressured/storage"
 #define MAX_PATH_LEN 4096
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Plugin context (global state, shared across all storage instances)
-// ─────────────────────────────────────────────────────────────────────────────
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Plugin Context
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 struct pressured_plugin_ctx {
   char base_path[MAX_PATH_LEN];
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Storage handle - embeds storage_t vtable as first field
-// ─────────────────────────────────────────────────────────────────────────────
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Storage Handle
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 typedef struct {
-  storage_t base;                   // MUST be first - embedded vtable
-  struct pressured_plugin_ctx *ctx; // back-pointer to plugin context
+  storage_t base;                   /* MUST be first - vtable interface */
+  struct pressured_plugin_ctx *ctx; /* Back-pointer to plugin context */
 } local_storage_t;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// File handle (for streaming)
-// ─────────────────────────────────────────────────────────────────────────────
+/* ═══════════════════════════════════════════════════════════════════════════
+ * File Handle
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 struct storage_file {
   FILE *fp;
@@ -49,9 +54,9 @@ struct storage_file {
   int mode;
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helper functions
-// ─────────────────────────────────────────────────────────────────────────────
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Helpers
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 static void build_path(const char *base, const char *key, char *out,
                        size_t out_len) {
@@ -97,22 +102,19 @@ static int mkdirs(const char *path) {
   return 0;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Storage operations - note: first param is storage_t* (the embedded vtable)
-// ─────────────────────────────────────────────────────────────────────────────
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Storage Operations
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 static int local_exists(storage_t *s, const char *key) {
   const local_storage_t *ls = (const local_storage_t *)s;
-
   char path[MAX_PATH_LEN];
   build_path(ls->ctx->base_path, key, path, sizeof(path));
-
   return access(path, F_OK) == 0 ? 1 : 0;
 }
 
 static int local_remove(storage_t *s, const char *key) {
   const local_storage_t *ls = (const local_storage_t *)s;
-
   char path[MAX_PATH_LEN];
   build_path(ls->ctx->base_path, key, path, sizeof(path));
 
@@ -129,13 +131,11 @@ static int local_remove(storage_t *s, const char *key) {
 static int local_rename(storage_t *s, const char *old_key,
                         const char *new_key) {
   const local_storage_t *ls = (const local_storage_t *)s;
-
   char old_path[MAX_PATH_LEN];
   char new_path[MAX_PATH_LEN];
   build_path(ls->ctx->base_path, old_key, old_path, sizeof(old_path));
   build_path(ls->ctx->base_path, new_key, new_path, sizeof(new_path));
 
-  // Create parent directories for new path if needed
   if (mkdirs(new_path) != 0) {
     log_error("local_storage: failed to create directories for %s", new_path);
     return STORAGE_ERR_IO;
@@ -205,7 +205,7 @@ static int64_t local_read(storage_file_t *f, void *buf, size_t len) {
     return STORAGE_ERR_IO;
   }
 
-  return (int64_t)n; // 0 = EOF
+  return (int64_t)n;
 }
 
 static int local_close(storage_file_t *f) {
@@ -235,61 +235,96 @@ static int local_close(storage_file_t *f) {
   return rc;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Plugin metadata
-// ─────────────────────────────────────────────────────────────────────────────
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Service Factory
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void *local_storage_factory(void *userdata) {
+  struct pressured_plugin_ctx *ctx = userdata;
+
+  local_storage_t *ls = calloc(1, sizeof(local_storage_t));
+  if (!ls)
+    return NULL;
+
+  /* Set up vtable */
+  ls->base.exists = local_exists;
+  ls->base.remove = local_remove;
+  ls->base.rename = local_rename;
+  ls->base.open = local_open;
+  ls->base.write = local_write;
+  ls->base.read = local_read;
+  ls->base.close = local_close;
+  ls->ctx = ctx;
+
+  log_debug("local_storage: created storage instance");
+  return ls;
+}
+
+static void local_storage_destructor(void *instance, void *userdata) {
+  (void)userdata;
+  if (instance) {
+    log_debug("local_storage: destroyed storage instance");
+    free(instance);
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Service Metadata
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static const char *local_tags[] = {"local", "filesystem", NULL};
+
+static const service_metadata_t storage_service_meta = {
+    .type = "storage",
+    .provider = "local",
+    .version = "2.0.0",
+    .description = "Local filesystem storage backend",
+    .priority = 50, /* Lower priority than cloud storage */
+    .tags = local_tags,
+    .dependencies = NULL,
+    .interface_version = 1,
+};
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Plugin Metadata
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 static const pressured_plugin_metadata_t plugin_metadata = {
-    .types = PRESSURED_PLUGIN_TYPE_STORAGE,
     .name = "local-storage",
     .major_version = 2,
     .minor_version = 0,
-    .description = "Local filesystem storage backend"};
+    .description = "Local filesystem storage backend",
+};
 
 PRESSURED_PLUGIN_EXPORT const pressured_plugin_metadata_t *
 pressured_plugin_get_metadata(void) {
   return &plugin_metadata;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Plugin lifecycle
-// ─────────────────────────────────────────────────────────────────────────────
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Plugin Lifecycle
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 PRESSURED_PLUGIN_EXPORT pressured_plugin_ctx_t *
-pressured_plugin_load(const char *config_json) {
-  // Check if plugin is disabled via config (look under
-  // plugins.storage_local.enabled)
-  if (config_json && config_json[0]) {
-    struct json_object *root = json_tokener_parse(config_json);
-    if (root) {
-      struct json_object *plugins_obj, *local_obj, *enabled_obj;
-      if (json_object_object_get_ex(root, "plugins", &plugins_obj) &&
-          json_object_object_get_ex(plugins_obj, "storage_local", &local_obj) &&
-          json_object_object_get_ex(local_obj, "enabled", &enabled_obj)) {
-        if (!json_object_get_boolean(enabled_obj)) {
-          log_info("local_storage: disabled via config");
-          json_object_put(root);
-          return NULL;
-        }
-      }
-      json_object_put(root);
-    }
-  }
+pressured_plugin_load(const char *config_json, service_registry_t *sr) {
+  /* Note: Disabled check is handled by plugin_manager before load() is called.
+   * Use config: plugins.local-storage.enabled = false to disable this plugin.
+   */
 
   pressured_plugin_ctx_t *ctx = calloc(1, sizeof(pressured_plugin_ctx_t));
   if (!ctx)
     return NULL;
 
-  // Default path
+  /* Default path */
   strncpy(ctx->base_path, DEFAULT_PATH, MAX_PATH_LEN - 1);
 
-  // Check environment variable
+  /* Check environment variable */
   const char *env_path = getenv("PRESSURED_STORAGE_PATH");
   if (env_path && env_path[0]) {
     strncpy(ctx->base_path, env_path, MAX_PATH_LEN - 1);
   }
 
-  // Parse JSON config if provided
+  /* Parse JSON config if provided */
   if (config_json && config_json[0]) {
     struct json_object *root = json_tokener_parse(config_json);
     if (root) {
@@ -307,10 +342,21 @@ pressured_plugin_load(const char *config_json) {
     }
   }
 
-  // Create base directory
+  /* Create base directory */
   if (mkdir(ctx->base_path, 0755) != 0 && errno != EEXIST) {
     log_error("local_storage: failed to create directory %s: %s",
               ctx->base_path, strerror(errno));
+    free(ctx);
+    return NULL;
+  }
+
+  /* Register storage service with the registry */
+  int rc = service_registry_register(sr, &storage_service_meta,
+                                     SERVICE_SCOPE_SINGLETON,
+                                     local_storage_factory,
+                                     local_storage_destructor, ctx);
+  if (rc != 0) {
+    log_error("local_storage: failed to register with service registry");
     free(ctx);
     return NULL;
   }
@@ -324,43 +370,5 @@ pressured_plugin_unload(pressured_plugin_ctx_t *ctx) {
   if (ctx) {
     log_debug("local_storage: unloaded");
     free(ctx);
-  }
-}
-
-PRESSURED_PLUGIN_EXPORT pressured_plugin_handle_t *
-pressured_plugin_create(pressured_plugin_ctx_t *ctx, uint32_t type) {
-  if (!ctx)
-    return NULL;
-  if (type != PRESSURED_PLUGIN_TYPE_STORAGE)
-    return NULL;
-
-  local_storage_t *ls = calloc(1, sizeof(local_storage_t));
-  if (!ls)
-    return NULL;
-
-  // Set up vtable
-  ls->base.exists = local_exists;
-  ls->base.remove = local_remove;
-  ls->base.rename = local_rename;
-  ls->base.open = local_open;
-  ls->base.write = local_write;
-  ls->base.read = local_read;
-  ls->base.close = local_close;
-
-  // Set back-pointer to context
-  ls->ctx = ctx;
-
-  log_debug("local_storage: created storage handle");
-  return (pressured_plugin_handle_t *)ls;
-}
-
-PRESSURED_PLUGIN_EXPORT void
-pressured_plugin_destroy(pressured_plugin_ctx_t *ctx, uint32_t type,
-                         pressured_plugin_handle_t *h) {
-  (void)ctx;
-  (void)type;
-  if (h) {
-    log_debug("local_storage: destroyed storage handle");
-    free(h);
   }
 }

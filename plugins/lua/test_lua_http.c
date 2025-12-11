@@ -9,6 +9,7 @@
 #include "plugin.h"
 #include "plugin_manager.h"
 #include "pressured.h"
+#include "service_registry.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,19 +36,29 @@ static int pass_count = 0;
 static int run_lua_test(const char *name, const char *script) {
   (void)name;
 
-  // Create fresh plugin manager for each test
-  plugin_manager_t *pm = plugin_manager_new();
-  if (!pm)
+  // Create service registry and plugin manager
+  service_registry_t *sr = service_registry_new();
+  if (!sr)
     return 0;
+
+  plugin_manager_t *pm = plugin_manager_new(sr);
+  if (!pm) {
+    service_registry_free(sr);
+    return 0;
+  }
 
   // Set the script
   setenv("PRESSURED_LUA_INLINE", script, 1);
 
-  // Load plugin (new API: config passed during load, handles created eagerly)
-  if (plugin_manager_load(pm, "plugins/pressured_plugin_lua.so", NULL) != 0) {
+  // Load plugin
+  if (plugin_manager_load(pm, "plugins/lua.so", NULL) != 0) {
     plugin_manager_free(pm);
+    service_registry_free(sr);
     return 0;
   }
+
+  // Initialize all services (creates the action instance)
+  service_registry_init_all(sr);
 
   // Create test event
   pressured_event_t event = {0};
@@ -60,10 +71,22 @@ static int run_lua_test(const char *name, const char *script) {
   event.severity = SEVERITY_CRITICAL;
   event.previous_severity = SEVERITY_WARN;
 
-  // Dispatch event - scripts return "pass" or "fail"
-  int handled = plugin_manager_dispatch(pm, &event, 0);
+  // Dispatch event via service registry - scripts return "pass" or "fail"
+  int handled = 0;
+  if (service_registry_has(sr, "action")) {
+    service_ref_t ref = service_registry_acquire(sr, "action");
+    if (service_ref_valid(&ref)) {
+      action_t *action = (action_t *)ref.instance;
+      if (action && action->on_event) {
+        action->on_event(action, &event, 0);
+        handled = 1;
+      }
+      service_ref_release(&ref);
+    }
+  }
 
   pressured_event_free(&event);
+  service_registry_free(sr);
   plugin_manager_free(pm);
 
   return handled == 1;
