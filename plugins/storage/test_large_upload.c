@@ -60,7 +60,7 @@ static double get_time(void) {
   return tv.tv_sec + tv.tv_usec / 1000000.0;
 }
 
-int main(int argc, char *argv[]) {
+int main(int argc, const char *argv[]) {
   log_init(LOG_INFO);
 
   // Parse optional size argument (in MB)

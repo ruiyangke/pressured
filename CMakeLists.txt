@@ -217,8 +217,45 @@ target_include_directories(test_sigv4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/plugin
 target_link_libraries(test_sigv4 ${OPENSSL_LIBRARIES})
 add_test(NAME test_sigv4 COMMAND test_sigv4)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# pprof parser plugin
+# ─────────────────────────────────────────────────────────────────────────────
+
+pkg_check_modules(ZLIB REQUIRED zlib)
+
+add_library(pprof_plugin SHARED
+    plugins/pprof/pprof_plugin.c
+)
+
+set_target_properties(pprof_plugin PROPERTIES
+    OUTPUT_NAME "pprof_plugin"
+    PREFIX ""
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/plugins"
+)
+
+target_include_directories(pprof_plugin PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/plugins/pprof
+    ${ZLIB_INCLUDE_DIRS}
+)
+
+target_link_libraries(pprof_plugin
+    pressured_core
+    ${ZLIB_LIBRARIES}
+)
+
+# pprof plugin test
+add_executable(test_pprof plugins/pprof/test_pprof.c)
+target_include_directories(test_pprof PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/plugins/pprof
+)
+target_link_libraries(test_pprof pressured_core)
+set_target_properties(test_pprof PROPERTIES ENABLE_EXPORTS ON)
+add_test(NAME test_pprof COMMAND test_pprof)
+
 # Install
 install(TARGETS pressured DESTINATION bin)
 install(TARGETS pressured_plugin_lua DESTINATION lib/pressured/plugins)
 install(TARGETS storage_local DESTINATION lib/pressured/plugins)
 install(TARGETS storage_s3 DESTINATION lib/pressured/plugins)
+install(TARGETS pprof_plugin DESTINATION lib/pressured/plugins)
