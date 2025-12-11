@@ -1,9 +1,13 @@
 /*
  * AWS S3 storage plugin using libcurl and AWS Signature V4
  *
+ * Registers as "storage:s3" with the service registry.
+ * Plugin name: "s3-storage" (used for config lookup)
+ *
  * Supports streaming uploads via multipart upload API.
  *
  * Configuration (via JSON config file):
+ *   plugins.s3-storage.enabled = false  - Disable this plugin
  *   storage.s3.bucket   - S3 bucket name (required)
  *   storage.s3.region   - AWS region (default: us-east-1)
  *   storage.s3.prefix   - Key prefix (default: "")
@@ -18,6 +22,7 @@
 
 #include "log.h"
 #include "plugin.h"
+#include "service_registry.h"
 #include "storage.h"
 #include <curl/curl.h>
 #include <json-c/json.h>
@@ -1737,15 +1742,32 @@ static const struct storage s3_storage_ops = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Service Metadata (for service registry)
+// ─────────────────────────────────────────────────────────────────────────────
+
+static const char *s3_tags[] = {"cloud", "aws", "s3", NULL};
+
+static const service_metadata_t storage_service_meta = {
+    .type = "storage",
+    .provider = "s3",
+    .version = "2.0.0",
+    .description = "AWS S3 storage backend",
+    .priority = 100, /* Higher priority than local storage */
+    .tags = s3_tags,
+    .dependencies = NULL,
+    .interface_version = 1,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Plugin metadata
 // ─────────────────────────────────────────────────────────────────────────────
 
 static const pressured_plugin_metadata_t plugin_metadata = {
-    .types = PRESSURED_PLUGIN_TYPE_STORAGE,
     .name = "s3-storage",
     .major_version = 2,
     .minor_version = 0,
-    .description = "AWS S3 storage backend"};
+    .description = "AWS S3 storage backend",
+};
 
 PRESSURED_PLUGIN_EXPORT const pressured_plugin_metadata_t *
 pressured_plugin_get_metadata(void) {
@@ -1753,11 +1775,39 @@ pressured_plugin_get_metadata(void) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Plugin lifecycle
+// Service Factory
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void *s3_storage_factory(void *userdata) {
+  pressured_plugin_ctx_t *ctx = userdata;
+
+  struct pressured_plugin_handle *h =
+      calloc(1, sizeof(struct pressured_plugin_handle));
+  if (!h)
+    return NULL;
+
+  /* Copy vtable into handle (embedded as first field) */
+  h->base = s3_storage_ops;
+  h->ctx = ctx;
+
+  log_debug("s3_storage: created storage instance");
+  return h;
+}
+
+static void s3_storage_destructor(void *instance, void *userdata) {
+  (void)userdata;
+  if (instance) {
+    log_debug("s3_storage: destroyed storage instance");
+    free(instance);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plugin Lifecycle
 // ─────────────────────────────────────────────────────────────────────────────
 
 PRESSURED_PLUGIN_EXPORT pressured_plugin_ctx_t *
-pressured_plugin_load(const char *config_json) {
+pressured_plugin_load(const char *config_json, service_registry_t *sr) {
   pressured_plugin_ctx_t *ctx = calloc(1, sizeof(pressured_plugin_ctx_t));
   if (!ctx)
     return NULL;
@@ -1834,6 +1884,17 @@ pressured_plugin_load(const char *config_json) {
     return NULL;
   }
 
+  /* Register storage service with the registry */
+  int rc = service_registry_register(sr, &storage_service_meta,
+                                     SERVICE_SCOPE_SINGLETON, s3_storage_factory,
+                                     s3_storage_destructor, ctx);
+  if (rc != 0) {
+    log_error("s3_storage: failed to register with service registry");
+    curl_easy_cleanup(ctx->curl);
+    free(ctx);
+    return NULL;
+  }
+
   log_info("s3_storage: initialized bucket=%s region=%s prefix=%s", ctx->bucket,
            ctx->region, ctx->prefix[0] ? ctx->prefix : "(none)");
   return ctx;
@@ -1849,42 +1910,3 @@ pressured_plugin_unload(pressured_plugin_ctx_t *ctx) {
     log_debug("s3_storage: unloaded");
   }
 }
-
-PRESSURED_PLUGIN_EXPORT pressured_plugin_handle_t *
-pressured_plugin_create(pressured_plugin_ctx_t *ctx, uint32_t type) {
-  log_debug("s3_storage: pressured_plugin_create called ctx=%p type=%u",
-            (void *)ctx, type);
-  if (!ctx || type != PRESSURED_PLUGIN_TYPE_STORAGE) {
-    log_error("s3_storage: pressured_plugin_create - invalid ctx or type "
-              "(ctx=%p, type=%u)",
-              (void *)ctx, type);
-    return NULL;
-  }
-
-  pressured_plugin_handle_t *h = calloc(1, sizeof(pressured_plugin_handle_t));
-  if (!h) {
-    log_error(
-        "s3_storage: pressured_plugin_create - failed to allocate handle");
-    return NULL;
-  }
-
-  // Copy vtable into handle (embedded as first field)
-  h->base = s3_storage_ops;
-  h->ctx = ctx;
-  log_info(
-      "s3_storage: created storage handle h=%p vtable.open=%p ctx=%p bucket=%s",
-      (void *)h, (void *)h->base.open, (void *)ctx, ctx->bucket);
-  return h;
-}
-
-PRESSURED_PLUGIN_EXPORT void
-pressured_plugin_destroy(pressured_plugin_ctx_t *ctx, uint32_t type,
-                         pressured_plugin_handle_t *h) {
-  (void)ctx;
-  (void)type;
-  free(h);
-}
-
-// Export storage vtable
-PRESSURED_PLUGIN_EXPORT const struct storage *pressured_storage =
-    &s3_storage_ops;

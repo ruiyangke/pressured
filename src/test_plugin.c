@@ -2,6 +2,7 @@
 #include "plugin.h"
 #include "plugin_manager.h"
 #include "pressured.h"
+#include "service_registry.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,14 +42,19 @@ int main(void) {
                                  "  }\n"
                                  "}\n";
 
-  // Create plugin manager
-  plugin_manager_t *pm = plugin_manager_new();
+  // Create service registry
+  service_registry_t *sr = service_registry_new();
+  assert(sr != NULL);
+  printf("  service registry creation: OK\n");
+
+  // Create plugin manager with service registry
+  plugin_manager_t *pm = plugin_manager_new(sr);
   assert(pm != NULL);
   printf("  plugin manager creation: OK\n");
 
   // Try to load the lua plugin
   // The plugin .so should be in build/plugins/
-  const char *plugin_path = "plugins/pressured_plugin_lua.so";
+  const char *plugin_path = "plugins/lua.so";
 
   // Set environment for the plugin - test config access
   setenv("PRESSURED_LUA_INLINE",
@@ -76,6 +82,7 @@ int main(void) {
     printf("  plugin loading: SKIPPED (plugin not found at %s)\n", plugin_path);
     printf("  (This is OK if running from a different directory)\n");
     plugin_manager_free(pm);
+    service_registry_free(sr);
     printf("test_plugin: PASSED (with skipped tests)\n");
     return 0;
   }
@@ -83,6 +90,10 @@ int main(void) {
 
   assert(plugin_manager_count(pm) == 1);
   printf("  plugin count: OK\n");
+
+  // Initialize all services
+  service_registry_init_all(sr);
+  printf("  service init: OK\n");
 
   // Create test event
   pressured_event_t event = {0};
@@ -95,13 +106,26 @@ int main(void) {
   event.severity = SEVERITY_CRITICAL;
   event.previous_severity = SEVERITY_WARN;
 
-  // Dispatch event
-  int handled = plugin_manager_dispatch(pm, &event, 0);
+  // Dispatch event via service registry
+  int handled = 0;
+  if (service_registry_has(sr, "action")) {
+    service_ref_t ref = service_registry_acquire(sr, "action");
+    if (service_ref_valid(&ref)) {
+      action_t *action = (action_t *)ref.instance;
+      if (action && action->on_event) {
+        action->on_event(action, &event, 0);
+        handled = 1;
+      }
+      service_ref_release(&ref);
+    }
+  }
   assert(handled == 1);
   printf("  event dispatch: OK\n");
 
-  // Cleanup
+  // Cleanup - service registry must be freed before plugin manager
+  // (destructors need to run while plugin code is still loaded)
   pressured_event_free(&event);
+  service_registry_free(sr);
   plugin_manager_free(pm);
   printf("  cleanup: OK\n");
 

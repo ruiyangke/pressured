@@ -11,6 +11,7 @@
 
 #include "log.h"
 #include "plugin_manager.h"
+#include "service_registry.h"
 #include "storage.h"
 #include <assert.h>
 #include <stdio.h>
@@ -19,7 +20,7 @@
 #include <unistd.h>
 
 // Path to built plugin
-#define S3_PLUGIN_PATH "./plugins/storage_s3.so"
+#define S3_PLUGIN_PATH "./plugins/s3-storage.so"
 
 // LocalStack configuration
 #define LOCALSTACK_ENDPOINT "http://localhost:4566"
@@ -258,8 +259,11 @@ int main(void) {
   setenv("AWS_SECRET_ACCESS_KEY", TEST_SECRET_KEY, 1);
   setenv("AWS_DEFAULT_REGION", TEST_REGION, 1);
 
-  // Load plugin using plugin manager with JSON config
-  plugin_manager_t *pm = plugin_manager_new();
+  // Create service registry and plugin manager
+  service_registry_t *sr = service_registry_new();
+  assert(sr != NULL);
+
+  plugin_manager_t *pm = plugin_manager_new(sr);
   assert(pm != NULL);
 
   int rc = plugin_manager_load(pm, S3_PLUGIN_PATH, S3_CONFIG_JSON);
@@ -267,17 +271,22 @@ int main(void) {
     printf("  ERROR: failed to load plugin from %s\n", S3_PLUGIN_PATH);
     printf("  Make sure to run from build directory\n");
     plugin_manager_free(pm);
+    service_registry_free(sr);
     return 1;
   }
 
-  // Get storage interface - handle embeds vtable
-  storage_t *s =
-      (storage_t *)plugin_manager_get_handle(pm, PRESSURED_PLUGIN_TYPE_STORAGE);
-  if (!s) {
-    printf("  ERROR: failed to get storage interface\n");
+  // Initialize all services
+  service_registry_init_all(sr);
+
+  // Get storage via service registry
+  service_ref_t ref = service_registry_acquire(sr, "storage");
+  if (!service_ref_valid(&ref)) {
+    printf("  ERROR: no storage service registered\n");
     plugin_manager_free(pm);
+    service_registry_free(sr);
     return 1;
   }
+  storage_t *s = (storage_t *)ref.instance;
 
   // Run tests
   test_streaming_write_read(s);
@@ -285,7 +294,11 @@ int main(void) {
   test_large_streaming(s);
   test_not_found(s);
 
-  // Cleanup
+  // Release storage reference
+  service_ref_release(&ref);
+
+  // Cleanup - service registry must be freed before plugin manager
+  service_registry_free(sr);
   plugin_manager_free(pm);
 
   printf("test_s3_storage: PASSED\n");

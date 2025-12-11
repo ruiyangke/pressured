@@ -8,6 +8,7 @@
 #include "log.h"
 #include "plugin_manager.h"
 #include "pressured.h"
+#include "service_registry.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,7 +16,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define LUA_PLUGIN_PATH "./plugins/pressured_plugin_lua.so"
+#define LUA_PLUGIN_PATH "./plugins/lua.so"
 #define TEST_DIR "/tmp/lua_multi_test"
 
 // Create test directory with multiple Lua scripts
@@ -83,8 +84,11 @@ int main(void) {
                             "  }"
                             "}";
 
-  // Load plugin
-  plugin_manager_t *pm = plugin_manager_new();
+  // Create service registry and plugin manager
+  service_registry_t *sr = service_registry_new();
+  assert(sr != NULL);
+
+  plugin_manager_t *pm = plugin_manager_new(sr);
   assert(pm != NULL);
 
   int rc = plugin_manager_load(pm, LUA_PLUGIN_PATH, config_json);
@@ -92,18 +96,32 @@ int main(void) {
     printf("  FAILED: Could not load lua plugin\n");
     cleanup_test_scripts();
     plugin_manager_free(pm);
+    service_registry_free(sr);
     return 1;
   }
 
-  // Get action handle
-  action_t *action =
-      (action_t *)plugin_manager_get_handle(pm, PRESSURED_PLUGIN_TYPE_ACTION);
-  if (!action) {
-    printf("  FAILED: Could not get action handle\n");
+  // Initialize all services
+  service_registry_init_all(sr);
+
+  // Get action via service registry
+  if (!service_registry_has(sr, "action")) {
+    printf("  FAILED: No action service registered\n");
     cleanup_test_scripts();
     plugin_manager_free(pm);
+    service_registry_free(sr);
     return 1;
   }
+
+  service_ref_t ref = service_registry_acquire(sr, "action");
+  if (!service_ref_valid(&ref)) {
+    printf("  FAILED: Could not acquire action service\n");
+    cleanup_test_scripts();
+    plugin_manager_free(pm);
+    service_registry_free(sr);
+    return 1;
+  }
+
+  action_t *action = (action_t *)ref.instance;
 
   // Create test event
   pressured_event_t event = {
@@ -126,12 +144,16 @@ int main(void) {
   rc = action->on_event(action, &event, 0);
   if (rc != 0) {
     printf("  FAILED: on_event returned %d\n", rc);
+    service_ref_release(&ref);
     cleanup_test_scripts();
+    service_registry_free(sr);
     plugin_manager_free(pm);
     return 1;
   }
 
   // Cleanup
+  service_ref_release(&ref);
+  service_registry_free(sr);
   plugin_manager_free(pm);
   cleanup_test_scripts();
 
