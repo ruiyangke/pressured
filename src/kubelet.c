@@ -827,22 +827,27 @@ static int collect_oom_events(kubelet_source_t *source,
     pod_limit_t *pod_info =
         lookup_pod_info(source, ns, pod_name, container_name);
 
+    // Skip if pod info not found - pod may have been deleted already
+    // This prevents 0/0B notifications
+    if (!pod_info) {
+      log_debug("OOM event but pod info not found, skipping: ns=%s pod=%s "
+                "container=%s",
+                ns, pod_name, container_name);
+      continue;
+    }
+
     // Create OOM killed sample
     pressured_memory_sample_t *sample = &samples[*count];
     sample->namespace = strdup(ns);
     sample->pod_name = strdup(pod_name);
     sample->container_name = strdup(container_name);
     sample->node_name = NULL; // Could parse from event source
-    sample->pod_ip =
-        (pod_info && pod_info->pod_ip[0]) ? strdup(pod_info->pod_ip) : NULL;
-    sample->annotations = pod_info
-                              ? copy_annotations(pod_info->annotations,
-                                                 pod_info->annotations_count)
-                              : NULL;
-    sample->annotations_count = pod_info ? pod_info->annotations_count : 0;
-    sample->usage_bytes =
-        pod_info ? pod_info->limit_bytes : 0; // At OOM, usage was at limit
-    sample->limit_bytes = pod_info ? pod_info->limit_bytes : 0;
+    sample->pod_ip = pod_info->pod_ip[0] ? strdup(pod_info->pod_ip) : NULL;
+    sample->annotations =
+        copy_annotations(pod_info->annotations, pod_info->annotations_count);
+    sample->annotations_count = pod_info->annotations_count;
+    sample->usage_bytes = pod_info->limit_bytes; // At OOM, usage was at limit
+    sample->limit_bytes = pod_info->limit_bytes;
     sample->usage_percent = 1.0; // 100% at OOM kill
     sample->oom_kill_count =
         1; // This triggers OOM_KILLED event in event_generator
@@ -920,13 +925,7 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
     const char *ns = json_object_get_string(ns_obj);
     const char *pod_name = json_object_get_string(name_obj);
     const char *pod_uid = json_object_get_string(uid_obj);
-
-    // Get podIP
-    const char *pod_ip = NULL;
-    struct json_object *pod_ip_obj;
-    if (json_object_object_get_ex(status, "podIP", &pod_ip_obj)) {
-      pod_ip = json_object_get_string(pod_ip_obj);
-    }
+    (void)pod_uid; // May be used for deduplication in future
 
     // Get node name
     const char *node_name = NULL;
@@ -998,20 +997,27 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
       pod_limit_t *pod_info =
           lookup_pod_info(source, ns, pod_name, container_name);
 
+      // Skip if pod info not found - pod may have been deleted already
+      // This prevents 0/0B notifications
+      if (!pod_info) {
+        log_debug("OOM killed but pod info not found, skipping: ns=%s pod=%s "
+                  "container=%s",
+                  ns, pod_name, container_name);
+        continue;
+      }
+
       // Create OOM killed sample
       pressured_memory_sample_t *sample = &samples[*count];
       sample->namespace = strdup(ns);
       sample->pod_name = strdup(pod_name);
       sample->container_name = strdup(container_name);
       sample->node_name = node_name ? strdup(node_name) : NULL;
-      sample->pod_ip = pod_ip ? strdup(pod_ip) : NULL;
-      sample->annotations = pod_info
-                                ? copy_annotations(pod_info->annotations,
-                                                   pod_info->annotations_count)
-                                : NULL;
-      sample->annotations_count = pod_info ? pod_info->annotations_count : 0;
-      sample->usage_bytes = pod_info ? pod_info->limit_bytes : 0;
-      sample->limit_bytes = pod_info ? pod_info->limit_bytes : 0;
+      sample->pod_ip = pod_info->pod_ip[0] ? strdup(pod_info->pod_ip) : NULL;
+      sample->annotations =
+          copy_annotations(pod_info->annotations, pod_info->annotations_count);
+      sample->annotations_count = pod_info->annotations_count;
+      sample->usage_bytes = pod_info->limit_bytes; // At OOM, usage ~= limit
+      sample->limit_bytes = pod_info->limit_bytes;
       sample->usage_percent = 1.0; // 100% at OOM kill
       sample->oom_kill_count =
           1; // This triggers OOM_KILLED event in event_generator

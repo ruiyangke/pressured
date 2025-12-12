@@ -14,6 +14,7 @@ typedef struct {
   pressured_severity_t severity;
   time_t last_event_time;
   uint64_t last_oom_kill_count; // Track OOM kill counter to detect new kills
+  uint64_t last_seen_cycle;     // Cycle number when container was last seen
 } container_state_t;
 
 struct event_generator {
@@ -25,6 +26,7 @@ struct event_generator {
   container_state_t *states;
   int state_count;
   int state_capacity;
+  uint64_t current_cycle; // Incremented each process() call for pruning
 };
 
 event_generator_t *event_generator_new(double warn_percent,
@@ -42,6 +44,7 @@ event_generator_t *event_generator_new(double warn_percent,
 
   gen->state_capacity = 64;
   gen->state_count = 0;
+  gen->current_cycle = 0;
   gen->states = calloc(gen->state_capacity, sizeof(container_state_t));
   if (!gen->states) {
     free(gen);
@@ -78,9 +81,18 @@ static container_state_t *find_or_create_state(event_generator_t *gen,
     }
   }
 
-  // Create new
+  // Create new - grow array if needed, but cap at MAX_TRACKED_CONTAINERS
   if (gen->state_count >= gen->state_capacity) {
+    if (gen->state_capacity >= MAX_TRACKED_CONTAINERS) {
+      log_warn("event_generator: max container states reached (%d), cannot "
+               "track new container %s",
+               MAX_TRACKED_CONTAINERS, key);
+      return NULL;
+    }
     int new_cap = gen->state_capacity * 2;
+    if (new_cap > MAX_TRACKED_CONTAINERS) {
+      new_cap = MAX_TRACKED_CONTAINERS;
+    }
     container_state_t *new_states =
         realloc(gen->states, new_cap * sizeof(container_state_t));
     if (!new_states)
@@ -94,8 +106,34 @@ static container_state_t *find_or_create_state(event_generator_t *gen,
   state->severity = SEVERITY_OK;
   state->last_event_time = 0;
   state->last_oom_kill_count = 0; // Will be initialized on first sample
+  state->last_seen_cycle = gen->current_cycle;
 
   return state;
+}
+
+// Remove states not seen in the current cycle (stale containers)
+static void prune_stale_states(event_generator_t *gen) {
+  int write_idx = 0;
+  int pruned = 0;
+
+  for (int read_idx = 0; read_idx < gen->state_count; read_idx++) {
+    if (gen->states[read_idx].last_seen_cycle == gen->current_cycle) {
+      // Keep this state - copy if needed
+      if (write_idx != read_idx) {
+        gen->states[write_idx] = gen->states[read_idx];
+      }
+      write_idx++;
+    } else {
+      pruned++;
+    }
+  }
+
+  if (pruned > 0) {
+    log_debug("event_generator: pruned %d stale container states (%d -> %d)",
+              pruned, gen->state_count, write_idx);
+  }
+
+  gen->state_count = write_idx;
 }
 
 static pressured_severity_t calculate_severity(const event_generator_t *gen,
@@ -168,6 +206,9 @@ pressured_event_t *event_generator_process(event_generator_t *gen,
     return NULL;
   }
 
+  // Increment cycle counter for state tracking
+  gen->current_cycle++;
+
   // Allocate max possible events (2x for both pressure and OOM kill events)
   pressured_event_t *events =
       calloc(sample_count * 2, sizeof(pressured_event_t));
@@ -185,6 +226,9 @@ pressured_event_t *event_generator_process(event_generator_t *gen,
         gen, sample->namespace, sample->pod_name, sample->container_name);
     if (!state)
       continue;
+
+    // Mark this state as seen in current cycle
+    state->last_seen_cycle = gen->current_cycle;
 
     // Check for OOM kill events first (highest priority)
     // An increase in oom_kill_count means a new OOM kill occurred
@@ -241,6 +285,9 @@ pressured_event_t *event_generator_process(event_generator_t *gen,
 
     state->severity = new_severity;
   }
+
+  // Prune states for containers not seen in this cycle
+  prune_stale_states(gen);
 
   return events;
 }
