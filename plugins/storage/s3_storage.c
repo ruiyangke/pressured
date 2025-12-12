@@ -4,8 +4,6 @@
  * Registers as "storage:s3" with the service registry.
  * Plugin name: "s3-storage" (used for config lookup)
  *
- * Supports streaming uploads via multipart upload API.
- *
  * Configuration (via JSON config file):
  *   plugins.s3-storage.enabled = false  - Disable this plugin
  *   storage.s3.bucket   - S3 bucket name (required)
@@ -18,10 +16,44 @@
  *   2. IRSA (IAM Roles for Service Accounts) - EKS with OIDC
  *   3. EKS Pod Identity / ECS Container Credentials
  *   4. EC2 Instance Metadata Service (IMDS v2)
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * COMPILE-TIME UPLOAD MODE SELECTION
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * Define ONE of these before including this file or via compiler flags:
+ *
+ *   S3_UPLOAD_STREAMING (default)
+ *     - Uses single PutObject with UNSIGNED-PAYLOAD
+ *     - Single HTTP request with chunked transfer encoding
+ *     - Memory: ~64KB buffer (bounded via backpressure)
+ *     - Uses curl_multi for non-blocking upload during write() calls
+ *     - Max size: 5GB (S3 PutObject limit)
+ *     - Best for: Any file size with minimal memory footprint
+ *
+ *   S3_UPLOAD_MULTIPART
+ *     - Uses S3 Multipart Upload API
+ *     - Multiple HTTP requests (init + parts + complete)
+ *     - Memory: ~5MB buffer per part (uploads during write, not on close)
+ *     - Max size: Unlimited (up to 10,000 parts × 5GB each)
+ *     - Best for: Files > 5GB, resumable uploads
+ *
+ * Example: cmake -DS3_UPLOAD_MODE=MULTIPART ..
  */
+
+// Default to streaming if neither is defined
+#if !defined(S3_UPLOAD_MULTIPART) && !defined(S3_UPLOAD_STREAMING)
+#define S3_UPLOAD_STREAMING
+#endif
+
+// Ensure only one is defined
+#if defined(S3_UPLOAD_MULTIPART) && defined(S3_UPLOAD_STREAMING)
+#error "Cannot define both S3_UPLOAD_MULTIPART and S3_UPLOAD_STREAMING"
+#endif
 
 #include "log.h"
 #include "plugin.h"
+#include "s3_storage.h"
 #include "service_registry.h"
 #include "storage.h"
 #include <curl/curl.h>
@@ -38,6 +70,9 @@
 #define MAX_HEADER_LEN 512
 #define MULTIPART_PART_SIZE (64 * 1024 * 1024) // 64MB per part
 #define MAX_PARTS 10000
+#define STREAMING_CHUNK_SIZE (64 * 1024)    // 64KB chunks for streaming PutObject
+#define MAX_STREAMING_BUFFER (256 * 1024)   // Cap buffer at 256KB to bound memory
+#define RING_BUFFER_SIZE (64 * 1024)        // 64KB ring buffer for true streaming
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -78,12 +113,23 @@ struct pressured_plugin_handle {
 // All parts except the last must be at least this size
 #define S3_MIN_PART_SIZE (5 * 1024 * 1024)
 
+#ifdef S3_UPLOAD_STREAMING
+// Simple buffer for curl_multi streaming
+typedef struct {
+  char *data;
+  size_t size;     // Current data in buffer
+  size_t capacity;
+  size_t pos;      // Read position for curl callback
+} stream_buffer_t;
+#endif
+
 // File handle for streaming
 typedef struct {
   pressured_plugin_ctx_t *ctx;
   char key[1024];
   int mode;
 
+#ifdef S3_UPLOAD_MULTIPART
   // For writes: multipart upload state
   char *upload_id;
   int part_number;
@@ -94,11 +140,34 @@ typedef struct {
   char *write_buffer;
   size_t write_buffer_size;
   size_t write_buffer_capacity;
+#endif
 
-  // For reads: buffer state
+#ifdef S3_UPLOAD_STREAMING
+  // For writes: curl_multi streaming
+  CURLM *multi;
+  CURL *upload_curl;
+  struct curl_slist *headers;
+  stream_buffer_t buf;
+  int upload_started;
+  int upload_finished;
+  int64_t expected_size;  // Set via s3_set_upload_size() before first write
+#endif
+
+  // For reads: buffer state (non-streaming fallback)
   char *read_buffer;
   size_t read_size;
   size_t read_pos;
+
+#ifdef S3_UPLOAD_STREAMING
+  // For reads: curl_multi streaming (reuses upload structures naming for simplicity)
+  // When reading, multi/download_curl handle the GET request
+  // buf receives data from curl write callback
+  CURL *download_curl;        // Separate handle for downloads
+  int download_started;
+  int download_finished;
+  int64_t content_length;     // Total size from Content-Length header (-1 if unknown)
+  int64_t bytes_received;     // Total bytes received so far
+#endif
 } s3_file_t;
 
 // Response buffer
@@ -1312,6 +1381,407 @@ static void s3_abort_multipart_upload(pressured_plugin_ctx_t *ctx,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Streaming PutObject (single request, chunked upload)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#ifdef S3_UPLOAD_STREAMING
+// Curl read callback for streaming - reads from s3_file_t buffer
+static size_t stream_read_callback(char *buffer, size_t size, size_t nitems,
+                                   void *userdata) {
+  s3_file_t *sf = (s3_file_t *)userdata;
+  size_t max_bytes = size * nitems;
+
+  // Check if we have data to send
+  size_t available = sf->buf.size - sf->buf.pos;
+  if (available == 0) {
+    // No data available - pause until write() adds more
+    return CURL_READFUNC_PAUSE;
+  }
+
+  size_t to_copy = available < max_bytes ? available : max_bytes;
+  memcpy(buffer, sf->buf.data + sf->buf.pos, to_copy);
+  sf->buf.pos += to_copy;
+
+  // If we've consumed all data, reset buffer for reuse
+  if (sf->buf.pos == sf->buf.size) {
+    sf->buf.pos = 0;
+    sf->buf.size = 0;
+  }
+
+  return to_copy;
+}
+
+// Start the streaming upload (called on first write)
+static int start_streaming_upload(s3_file_t *sf) {
+  // Build URL
+  char url[MAX_URL_LEN];
+  build_url(sf->ctx, sf->key, url, sizeof(url));
+
+  // Use UNSIGNED-PAYLOAD for streaming
+  const char *payload_hash = "UNSIGNED-PAYLOAD";
+  sf->headers = sign_request(sf->ctx, "PUT", url, payload_hash,
+                             sf->expected_size >= 0 ? (size_t)sf->expected_size : 0);
+  if (!sf->headers) {
+    return -1;
+  }
+  struct curl_slist *tmp = curl_slist_append(sf->headers, "Content-Type: application/octet-stream");
+  if (!tmp) {
+    curl_slist_free_all(sf->headers);
+    sf->headers = NULL;
+    return -1;
+  }
+  sf->headers = tmp;
+
+  // Create curl handles
+  sf->upload_curl = curl_easy_init();
+  if (!sf->upload_curl) {
+    curl_slist_free_all(sf->headers);
+    sf->headers = NULL;
+    return -1;
+  }
+
+  sf->multi = curl_multi_init();
+  if (!sf->multi) {
+    curl_easy_cleanup(sf->upload_curl);
+    curl_slist_free_all(sf->headers);
+    sf->upload_curl = NULL;
+    sf->headers = NULL;
+    return -1;
+  }
+
+  // Configure curl
+  curl_easy_setopt(sf->upload_curl, CURLOPT_URL, url);
+  curl_easy_setopt(sf->upload_curl, CURLOPT_UPLOAD, 1L);
+  curl_easy_setopt(sf->upload_curl, CURLOPT_READFUNCTION, stream_read_callback);
+  curl_easy_setopt(sf->upload_curl, CURLOPT_READDATA, sf);
+  curl_easy_setopt(sf->upload_curl, CURLOPT_HTTPHEADER, sf->headers);
+
+  if (sf->expected_size >= 0) {
+    curl_easy_setopt(sf->upload_curl, CURLOPT_INFILESIZE_LARGE,
+                     (curl_off_t)sf->expected_size);
+  }
+
+  // Add to multi handle
+  CURLMcode mc = curl_multi_add_handle(sf->multi, sf->upload_curl);
+  if (mc != CURLM_OK) {
+    log_error("s3_storage: curl_multi_add_handle failed for upload: %d", mc);
+    curl_easy_cleanup(sf->upload_curl);
+    curl_multi_cleanup(sf->multi);
+    curl_slist_free_all(sf->headers);
+    sf->upload_curl = NULL;
+    sf->multi = NULL;
+    sf->headers = NULL;
+    return -1;
+  }
+
+  sf->upload_started = 1;
+  log_info("s3_storage: streaming upload started for %s (size=%lld)",
+           sf->key, (long long)sf->expected_size);
+  return 0;
+}
+
+// Drive curl_multi forward (non-blocking)
+static int drive_upload(s3_file_t *sf) {
+  int still_running;
+  CURLMcode mc = curl_multi_perform(sf->multi, &still_running);
+  if (mc != CURLM_OK) {
+    log_error("s3_storage: curl_multi_perform failed: %d", mc);
+    return -1;
+  }
+  if (still_running == 0) {
+    sf->upload_finished = 1;
+  }
+  return 0;
+}
+
+// Set expected upload size (optional, for Content-Length header)
+int s3_set_upload_size(storage_file_t *f, int64_t size) {
+  s3_file_t *sf = (s3_file_t *)f;
+  if (!sf || sf->mode != STORAGE_MODE_WRITE)
+    return STORAGE_ERR_INVALID;
+
+  if (sf->upload_started) {
+    log_error("s3_storage: s3_set_upload_size called after write started");
+    return STORAGE_ERR_INVALID;
+  }
+
+  sf->expected_size = size;
+  log_debug("s3_storage: upload size set to %lld for %s",
+            (long long)size, sf->key);
+  return STORAGE_OK;
+}
+// Streaming download: curl write callback receives data into our buffer
+static size_t stream_write_callback(char *ptr, size_t size, size_t nmemb,
+                                    void *userdata) {
+  s3_file_t *sf = (s3_file_t *)userdata;
+  size_t bytes = size * nmemb;
+
+  if (bytes == 0)
+    return 0;  // Nothing to do
+
+  // Resize buffer if needed (cap at MAX_STREAMING_BUFFER)
+  while (sf->buf.size + bytes > sf->buf.capacity) {
+    if (sf->buf.capacity >= MAX_STREAMING_BUFFER) {
+      // Buffer at max capacity
+      if (sf->buf.size == 0) {
+        // Buffer is empty but chunk is larger than max - accept partial
+        // This handles the edge case of oversized chunks from curl
+        // IMPORTANT: must not copy more than 'bytes' (what curl gave us)
+        size_t to_accept = bytes < sf->buf.capacity ? bytes : sf->buf.capacity;
+        memcpy(sf->buf.data, ptr, to_accept);
+        sf->buf.size = to_accept;
+        sf->bytes_received += to_accept;
+        // Return partial acceptance - curl will call us again with remainder
+        return to_accept;
+      }
+      // Buffer has data, pause transfer until app consumes it
+      return CURL_WRITEFUNC_PAUSE;
+    }
+    size_t new_cap = sf->buf.capacity * 2;
+    if (new_cap > MAX_STREAMING_BUFFER)
+      new_cap = MAX_STREAMING_BUFFER;
+    char *new_data = realloc(sf->buf.data, new_cap);
+    if (!new_data)
+      return 0; // Error - curl will abort
+    sf->buf.data = new_data;
+    sf->buf.capacity = new_cap;
+  }
+
+  // Copy data to buffer
+  memcpy(sf->buf.data + sf->buf.size, ptr, bytes);
+  sf->buf.size += bytes;
+  sf->bytes_received += bytes;
+
+  return bytes;
+}
+
+// Start streaming download (called on first s3_read)
+static int start_streaming_download(s3_file_t *sf) {
+  if (sf->download_started)
+    return 0;
+
+  pressured_plugin_ctx_t *ctx = sf->ctx;
+
+  // Build URL and sign request
+  char url[MAX_URL_LEN];
+  build_url(ctx, sf->key, url, sizeof(url));
+
+  const char *empty_hash =
+      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+  sf->headers = sign_request(ctx, "GET", url, empty_hash, 0);
+  if (!sf->headers) {
+    log_error("s3_storage: failed to sign streaming download request");
+    return -1;
+  }
+
+  // Create curl_multi handle (reuse the multi from uploads if not set)
+  if (!sf->multi) {
+    sf->multi = curl_multi_init();
+    if (!sf->multi) {
+      log_error("s3_storage: failed to init curl_multi for download");
+      curl_slist_free_all(sf->headers);
+      sf->headers = NULL;
+      return -1;
+    }
+  }
+
+  // Create curl easy handle for download
+  sf->download_curl = curl_easy_init();
+  if (!sf->download_curl) {
+    log_error("s3_storage: failed to init curl for streaming download");
+    curl_multi_cleanup(sf->multi);
+    sf->multi = NULL;
+    curl_slist_free_all(sf->headers);
+    sf->headers = NULL;
+    return -1;
+  }
+
+  curl_easy_setopt(sf->download_curl, CURLOPT_URL, url);
+  curl_easy_setopt(sf->download_curl, CURLOPT_HTTPGET, 1L);
+  curl_easy_setopt(sf->download_curl, CURLOPT_HTTPHEADER, sf->headers);
+  curl_easy_setopt(sf->download_curl, CURLOPT_WRITEFUNCTION, stream_write_callback);
+  curl_easy_setopt(sf->download_curl, CURLOPT_WRITEDATA, sf);
+
+  // Add to multi handle
+  CURLMcode mc = curl_multi_add_handle(sf->multi, sf->download_curl);
+  if (mc != CURLM_OK) {
+    log_error("s3_storage: curl_multi_add_handle failed for download: %d", mc);
+    curl_easy_cleanup(sf->download_curl);
+    sf->download_curl = NULL;
+    curl_multi_cleanup(sf->multi);
+    sf->multi = NULL;
+    curl_slist_free_all(sf->headers);
+    sf->headers = NULL;
+    return -1;
+  }
+
+  sf->download_started = 1;
+  log_info("s3_storage: streaming download started for %s", sf->key);
+  return 0;
+}
+
+// Drive download forward (non-blocking)
+static int drive_download(s3_file_t *sf) {
+  if (!sf->multi || sf->download_finished)
+    return 0;
+
+  int still_running;
+  CURLMcode mc = curl_multi_perform(sf->multi, &still_running);
+  if (mc != CURLM_OK) {
+    log_error("s3_storage: curl_multi_perform failed for download: %d", mc);
+    return -1;
+  }
+  if (still_running == 0) {
+    sf->download_finished = 1;
+  }
+  return 0;
+}
+#endif
+
+// Context for curl read callback wrapper
+typedef struct {
+  s3_read_callback_t user_callback;
+  void *user_data;
+  int64_t total_read;
+  int error;
+} streaming_read_ctx_t;
+
+// Curl read callback that wraps user callback
+static size_t streaming_read_callback(char *buffer, size_t size, size_t nitems,
+                                      void *userdata) {
+  streaming_read_ctx_t *ctx = (streaming_read_ctx_t *)userdata;
+  size_t max_bytes = size * nitems;
+
+  if (ctx->error) {
+    return CURL_READFUNC_ABORT;
+  }
+
+  ssize_t n = ctx->user_callback(buffer, max_bytes, ctx->user_data);
+
+  if (n < 0) {
+    ctx->error = 1;
+    return CURL_READFUNC_ABORT;
+  }
+
+  ctx->total_read += n;
+  return (size_t)n; // 0 signals EOF to curl
+}
+
+/*
+ * Upload data to S3 using streaming PutObject with a single HTTP request.
+ *
+ * This function uses UNSIGNED-PAYLOAD signing, which allows streaming without
+ * needing to hash the entire payload upfront. Data is pulled from the provided
+ * callback in chunks and sent over a single HTTP connection.
+ *
+ * @param s             Storage handle (must be S3 storage)
+ * @param key           Object key to upload to
+ * @param read_cb       Callback that provides data chunks (return 0 for EOF, -1 for error)
+ * @param userdata      User context passed to read_cb
+ * @param content_length Total size if known, or -1 for chunked transfer encoding
+ * @return STORAGE_OK on success, error code on failure
+ *
+ * Diagram:
+ *   ┌──────────┐        ┌─────────┐        ┌─────┐
+ *   │ read_cb  │──64KB─►│  curl   │──64KB─►│ S3  │
+ *   │ (user)   │──64KB─►│ (HTTP)  │──64KB─►│ PUT │
+ *   └──────────┘        └─────────┘        └─────┘
+ *                    Single HTTP Request
+ */
+int s3_put_streaming(storage_t *s, const char *key, s3_read_callback_t read_cb,
+                     void *userdata, int64_t content_length) {
+  struct pressured_plugin_handle *h = (struct pressured_plugin_handle *)s;
+  if (!h || !h->ctx || !key || !read_cb) {
+    return STORAGE_ERR_INVALID;
+  }
+  pressured_plugin_ctx_t *ctx = h->ctx;
+
+  if (ensure_credentials(ctx) != 0) {
+    return STORAGE_ERR_PERM;
+  }
+
+  // Build URL
+  char url[MAX_URL_LEN];
+  build_url(ctx, key, url, sizeof(url));
+
+  log_info("s3_storage: streaming PUT to %s (size=%s)", url,
+           content_length >= 0 ? "known" : "chunked");
+
+  // Use UNSIGNED-PAYLOAD - this allows streaming without pre-hashing
+  const char *payload_hash = "UNSIGNED-PAYLOAD";
+  struct curl_slist *headers =
+      sign_request(ctx, "PUT", url, payload_hash,
+                   content_length >= 0 ? (size_t)content_length : 0);
+  headers =
+      curl_slist_append(headers, "Content-Type: application/octet-stream");
+
+  // For chunked encoding when size is unknown
+  if (content_length < 0) {
+    headers = curl_slist_append(headers, "Transfer-Encoding: chunked");
+  }
+
+  // Setup streaming read context
+  streaming_read_ctx_t read_ctx = {
+      .user_callback = read_cb,
+      .user_data = userdata,
+      .total_read = 0,
+      .error = 0,
+  };
+
+  // Configure curl for streaming upload
+  curl_easy_reset(ctx->curl);
+  curl_easy_setopt(ctx->curl, CURLOPT_URL, url);
+  curl_easy_setopt(ctx->curl, CURLOPT_UPLOAD, 1L);
+  curl_easy_setopt(ctx->curl, CURLOPT_READFUNCTION, streaming_read_callback);
+  curl_easy_setopt(ctx->curl, CURLOPT_READDATA, &read_ctx);
+  curl_easy_setopt(ctx->curl, CURLOPT_HTTPHEADER, headers);
+
+  if (content_length >= 0) {
+    curl_easy_setopt(ctx->curl, CURLOPT_INFILESIZE_LARGE,
+                     (curl_off_t)content_length);
+  }
+
+  // Response buffer for error messages
+  response_buffer_t resp = {0};
+  resp.data = malloc(4096);
+  if (!resp.data) {
+    curl_slist_free_all(headers);
+    return STORAGE_ERR_IO;
+  }
+  resp.capacity = 4096;
+  curl_easy_setopt(ctx->curl, CURLOPT_WRITEFUNCTION, write_callback);
+  curl_easy_setopt(ctx->curl, CURLOPT_WRITEDATA, &resp);
+
+  // Execute the streaming upload
+  CURLcode res = curl_easy_perform(ctx->curl);
+  long http_code = 0;
+  curl_easy_getinfo(ctx->curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+  curl_slist_free_all(headers);
+
+  int result = STORAGE_OK;
+
+  if (res != CURLE_OK) {
+    log_error("s3_storage: streaming PUT failed: curl=%d (%s)", res,
+              curl_easy_strerror(res));
+    result = STORAGE_ERR_IO;
+  } else if (read_ctx.error) {
+    log_error("s3_storage: streaming PUT failed: read callback error");
+    result = STORAGE_ERR_IO;
+  } else if (http_code != 200) {
+    log_error("s3_storage: streaming PUT failed: http=%ld response=%s",
+              http_code, resp.data ? resp.data : "(null)");
+    result = STORAGE_ERR_IO;
+  } else {
+    log_info("s3_storage: streaming PUT completed: %lld bytes uploaded",
+             (long long)read_ctx.total_read);
+  }
+
+  free(resp.data);
+  return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Storage operations
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1509,6 +1979,7 @@ static storage_file_t *s3_open(storage_t *s, const char *key, int mode) {
   strncpy(sf->key, key, sizeof(sf->key) - 1);
 
   if (mode == STORAGE_MODE_WRITE) {
+#ifdef S3_UPLOAD_MULTIPART
     // Start multipart upload
     log_info("s3_storage: s3_open - starting multipart upload for key=%s", key);
     sf->upload_id = s3_create_multipart_upload(ctx, key);
@@ -1540,9 +2011,50 @@ static storage_file_t *s3_open(storage_t *s, const char *key, int mode) {
       return NULL;
     }
     sf->write_buffer_size = 0;
+#endif
+
+#ifdef S3_UPLOAD_STREAMING
+    // Initialize buffer for curl_multi streaming
+    log_info("s3_storage: s3_open - streaming mode for key=%s", key);
+    sf->buf.capacity = STREAMING_CHUNK_SIZE;
+    sf->buf.data = malloc(sf->buf.capacity);
+    if (!sf->buf.data) {
+      free(sf);
+      return NULL;
+    }
+    sf->buf.size = 0;
+    sf->buf.pos = 0;
+    sf->multi = NULL;
+    sf->upload_curl = NULL;
+    sf->headers = NULL;
+    sf->upload_started = 0;
+    sf->upload_finished = 0;
+    sf->expected_size = -1; // Unknown size; set via s3_set_upload_size()
+#endif
   } else {
-    // For reads, fetch entire object (S3 doesn't support true streaming reads
-    // easily)
+#ifdef S3_UPLOAD_STREAMING
+    // Streaming reads: initialize buffer and curl_multi, defer actual download
+    log_info("s3_storage: s3_open - streaming read mode for key=%s", key);
+    sf->buf.capacity = STREAMING_CHUNK_SIZE;
+    sf->buf.data = malloc(sf->buf.capacity);
+    if (!sf->buf.data) {
+      free(sf);
+      return NULL;
+    }
+    sf->buf.size = 0;
+    sf->buf.pos = 0;  // Used as read position for streaming reads
+    sf->multi = NULL;
+    sf->download_curl = NULL;
+    sf->headers = NULL;
+    sf->download_started = 0;
+    sf->download_finished = 0;
+    sf->content_length = -1;
+    sf->bytes_received = 0;
+    sf->read_buffer = NULL;  // Not used in streaming mode
+    sf->read_size = 0;
+    sf->read_pos = 0;
+#else
+    // Non-streaming: fetch entire object synchronously
     char url[MAX_URL_LEN];
     build_url(ctx, key, url, sizeof(url));
 
@@ -1557,6 +2069,11 @@ static storage_file_t *s3_open(storage_t *s, const char *key, int mode) {
 
     response_buffer_t resp = {0};
     resp.data = malloc(16384);
+    if (!resp.data) {
+      curl_slist_free_all(headers);
+      free(sf);
+      return NULL;
+    }
     resp.capacity = 16384;
     curl_easy_setopt(ctx->curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(ctx->curl, CURLOPT_WRITEDATA, &resp);
@@ -1576,6 +2093,7 @@ static storage_file_t *s3_open(storage_t *s, const char *key, int mode) {
     sf->read_buffer = resp.data;
     sf->read_size = resp.size;
     sf->read_pos = 0;
+#endif
   }
 
   return (storage_file_t *)sf;
@@ -1586,6 +2104,7 @@ static int64_t s3_write(storage_file_t *f, const void *data, size_t len) {
   if (!sf || !sf->ctx || sf->mode != STORAGE_MODE_WRITE)
     return STORAGE_ERR_INVALID;
 
+#ifdef S3_UPLOAD_MULTIPART
   // Buffer data until we have at least S3_MIN_PART_SIZE
   const char *src = (const char *)data;
   size_t remaining = len;
@@ -1629,6 +2148,86 @@ static int64_t s3_write(storage_file_t *f, const void *data, size_t len) {
       sf->write_buffer_size = 0; // Reset buffer
     }
   }
+#endif
+
+#ifdef S3_UPLOAD_STREAMING
+  // Start upload on first write
+  if (!sf->upload_started) {
+    if (start_streaming_upload(sf) != 0) {
+      log_error("s3_storage: failed to start streaming upload");
+      return STORAGE_ERR_IO;
+    }
+  }
+
+  if (sf->upload_finished) {
+    log_error("s3_storage: upload already finished, cannot write more data");
+    return STORAGE_ERR_IO;
+  }
+
+  // Process write in chunks to bound memory usage
+  const char *src = (const char *)data;
+  size_t remaining = len;
+
+  while (remaining > 0) {
+    // Backpressure: if buffer is getting full, drain it first
+    while (sf->buf.size >= STREAMING_CHUNK_SIZE / 2) {
+      curl_easy_pause(sf->upload_curl, CURLPAUSE_CONT);
+
+      int still_running;
+      CURLMcode mc = curl_multi_perform(sf->multi, &still_running);
+      if (mc != CURLM_OK) {
+        log_error("s3_storage: curl_multi_perform failed in backpressure: %d", mc);
+        return STORAGE_ERR_IO;
+      }
+
+      if (still_running == 0) {
+        sf->upload_finished = 1;
+        log_error("s3_storage: upload finished unexpectedly");
+        return STORAGE_ERR_IO;
+      }
+
+      // If buffer didn't drain, wait briefly for network
+      if (sf->buf.size >= STREAMING_CHUNK_SIZE / 2) {
+        int numfds;
+        curl_multi_wait(sf->multi, NULL, 0, 10, &numfds);
+      }
+    }
+
+    // Calculate how much we can copy
+    size_t space = sf->buf.capacity - sf->buf.size;
+    size_t to_copy = remaining < space ? remaining : space;
+
+    // Resize buffer if needed, but cap at MAX_STREAMING_BUFFER
+    if (to_copy == 0 && sf->buf.capacity < MAX_STREAMING_BUFFER) {
+      size_t new_cap = sf->buf.capacity * 2;
+      if (new_cap > MAX_STREAMING_BUFFER)
+        new_cap = MAX_STREAMING_BUFFER;
+      char *new_data = realloc(sf->buf.data, new_cap);
+      if (!new_data)
+        return STORAGE_ERR_IO;
+      sf->buf.data = new_data;
+      sf->buf.capacity = new_cap;
+      space = sf->buf.capacity - sf->buf.size;
+      to_copy = remaining < space ? remaining : space;
+    }
+
+    // If still no space (buffer at max cap and full), loop will drain via backpressure
+    if (to_copy == 0)
+      continue;
+
+    // Copy data to buffer
+    memcpy(sf->buf.data + sf->buf.size, src, to_copy);
+    sf->buf.size += to_copy;
+    src += to_copy;
+    remaining -= to_copy;
+
+    // Unpause and drive curl forward after each chunk
+    curl_easy_pause(sf->upload_curl, CURLPAUSE_CONT);
+    if (drive_upload(sf) != 0) {
+      return STORAGE_ERR_IO;
+    }
+  }
+#endif
 
   return (int64_t)len;
 }
@@ -1638,6 +2237,71 @@ static int64_t s3_read(storage_file_t *f, void *buf, size_t len) {
   if (!sf || sf->mode != STORAGE_MODE_READ)
     return STORAGE_ERR_INVALID;
 
+#ifdef S3_UPLOAD_STREAMING
+  // Streaming read mode
+  if (!sf->download_started) {
+    if (start_streaming_download(sf) != 0) {
+      log_error("s3_storage: failed to start streaming download");
+      return STORAGE_ERR_IO;
+    }
+  }
+
+  char *dst = (char *)buf;
+  size_t total_read = 0;
+
+  while (total_read < len) {
+    // Check if we have data in buffer
+    size_t available = sf->buf.size - sf->buf.pos;
+
+    if (available > 0) {
+      // Copy from buffer
+      size_t to_copy = (len - total_read) < available ? (len - total_read) : available;
+      memcpy(dst + total_read, sf->buf.data + sf->buf.pos, to_copy);
+      sf->buf.pos += to_copy;
+      total_read += to_copy;
+
+      // Compact buffer if we've consumed most of it
+      if (sf->buf.pos > sf->buf.capacity / 2) {
+        size_t remaining = sf->buf.size - sf->buf.pos;
+        if (remaining > 0) {
+          memmove(sf->buf.data, sf->buf.data + sf->buf.pos, remaining);
+        }
+        sf->buf.size = remaining;
+        sf->buf.pos = 0;
+      }
+    } else if (sf->download_finished) {
+      // No more data and download is done
+      break;
+    } else {
+      // Buffer empty, need more data from network
+      // Reset buffer position
+      sf->buf.size = 0;
+      sf->buf.pos = 0;
+
+      // Unpause curl if it was paused due to full buffer
+      if (sf->download_curl) {
+        curl_easy_pause(sf->download_curl, CURLPAUSE_CONT);
+      }
+
+      // Drive download forward
+      if (drive_download(sf) != 0) {
+        return STORAGE_ERR_IO;
+      }
+
+      // Wait for data if none arrived
+      if (sf->buf.size == 0 && !sf->download_finished) {
+        int numfds;
+        curl_multi_wait(sf->multi, NULL, 0, 100, &numfds);
+        if (drive_download(sf) != 0) {
+          return STORAGE_ERR_IO;
+        }
+      }
+    }
+  }
+
+  return (int64_t)total_read;
+#else
+  // Non-streaming: read from pre-fetched buffer
   if (sf->read_pos >= sf->read_size) {
     return 0; // EOF
   }
@@ -1649,7 +2313,28 @@ static int64_t s3_read(storage_file_t *f, void *buf, size_t len) {
   sf->read_pos += to_read;
 
   return (int64_t)to_read;
+#endif
 }
+
+// Helper for S3_UPLOAD_STREAMING: read callback for buffered data
+#ifdef S3_UPLOAD_STREAMING
+typedef struct {
+  const char *data;
+  size_t size;
+  size_t pos;
+} buffer_read_ctx_t;
+
+static ssize_t buffer_read_callback(void *buf, size_t len, void *userdata) {
+  buffer_read_ctx_t *ctx = (buffer_read_ctx_t *)userdata;
+  size_t remaining = ctx->size - ctx->pos;
+  if (remaining == 0)
+    return 0; // EOF
+  size_t to_copy = len < remaining ? len : remaining;
+  memcpy(buf, ctx->data + ctx->pos, to_copy);
+  ctx->pos += to_copy;
+  return (ssize_t)to_copy;
+}
+#endif
 
 static int s3_close(storage_file_t *f) {
   s3_file_t *sf = (s3_file_t *)f;
@@ -1659,6 +2344,7 @@ static int s3_close(storage_file_t *f) {
   int rc = STORAGE_OK;
 
   if (sf->mode == STORAGE_MODE_WRITE) {
+#ifdef S3_UPLOAD_MULTIPART
     // Flush any remaining data in write buffer as the final part
     // The last part can be smaller than S3_MIN_PART_SIZE
     if (sf->write_buffer_size > 0) {
@@ -1670,7 +2356,7 @@ static int s3_close(storage_file_t *f) {
           log_error("s3_storage: failed to expand etags array for final part");
           s3_abort_multipart_upload(sf->ctx, sf->key, sf->upload_id);
           rc = STORAGE_ERR_IO;
-          goto cleanup_write;
+          goto cleanup_multipart;
         }
         // Zero-initialize new slots to prevent freeing garbage on error
         for (int i = sf->etags_capacity; i < new_cap; i++) {
@@ -1689,7 +2375,7 @@ static int s3_close(storage_file_t *f) {
         log_error("s3_storage: failed to upload final part");
         s3_abort_multipart_upload(sf->ctx, sf->key, sf->upload_id);
         rc = STORAGE_ERR_IO;
-        goto cleanup_write;
+        goto cleanup_multipart;
       }
       // Only increment part_number AFTER successful upload
       sf->etags[sf->part_number] = etag;
@@ -1711,16 +2397,122 @@ static int s3_close(storage_file_t *f) {
       s3_abort_multipart_upload(sf->ctx, sf->key, sf->upload_id);
     }
 
-  cleanup_write:
-    // Cleanup write resources
+  cleanup_multipart:
+    // Cleanup multipart write resources
     for (int i = 0; i < sf->part_number; i++) {
       free(sf->etags[i]);
     }
     free(sf->etags);
     free(sf->upload_id);
     free(sf->write_buffer);
+#endif
+
+#ifdef S3_UPLOAD_STREAMING
+    if (sf->upload_started) {
+      // Finish sending any remaining data and complete upload
+      log_info("s3_storage: finishing upload for %s", sf->key);
+
+      // Keep driving curl until upload completes
+      while (!sf->upload_finished) {
+        // Unpause in case curl is waiting
+        curl_easy_pause(sf->upload_curl, CURLPAUSE_CONT);
+
+        int still_running;
+        CURLMcode mc = curl_multi_perform(sf->multi, &still_running);
+        if (mc != CURLM_OK) {
+          log_error("s3_storage: curl_multi_perform failed in close: %d", mc);
+          rc = STORAGE_ERR_IO;
+          break;
+        }
+
+        if (still_running == 0) {
+          sf->upload_finished = 1;
+          break;
+        }
+
+        // Wait for activity (with timeout)
+        int numfds;
+        curl_multi_wait(sf->multi, NULL, 0, 100, &numfds);
+      }
+
+      // Check result
+      CURLMsg *msg;
+      int msgs_left;
+      while ((msg = curl_multi_info_read(sf->multi, &msgs_left))) {
+        if (msg->msg == CURLMSG_DONE) {
+          long http_code = 0;
+          curl_easy_getinfo(sf->upload_curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+          if (msg->data.result != CURLE_OK || http_code < 200 || http_code >= 300) {
+            log_error("s3_storage: streaming PUT failed: curl=%d http=%ld",
+                      msg->data.result, http_code);
+            rc = STORAGE_ERR_IO;
+          } else {
+            log_info("s3_storage: wrote %s (streaming PUT, http=%ld)",
+                     sf->key, http_code);
+          }
+        }
+      }
+
+      // Cleanup curl handles
+      curl_multi_remove_handle(sf->multi, sf->upload_curl);
+      curl_easy_cleanup(sf->upload_curl);
+      curl_multi_cleanup(sf->multi);
+      curl_slist_free_all(sf->headers);
+    } else {
+      log_debug("s3_storage: no data written, skipping upload");
+    }
+
+    // Cleanup buffer
+    free(sf->buf.data);
+#endif
   } else {
+#ifdef S3_UPLOAD_STREAMING
+    // Cleanup streaming download resources
+    if (sf->download_started) {
+      // Finish any in-progress download
+      while (!sf->download_finished && sf->download_curl) {
+        curl_easy_pause(sf->download_curl, CURLPAUSE_CONT);
+        int still_running;
+        CURLMcode mc = curl_multi_perform(sf->multi, &still_running);
+        if (mc != CURLM_OK) {
+          log_error("s3_storage: curl_multi_perform failed in download close: %d", mc);
+          rc = STORAGE_ERR_IO;
+          break;
+        }
+        if (still_running == 0)
+          break;
+        int numfds;
+        curl_multi_wait(sf->multi, NULL, 0, 100, &numfds);
+      }
+
+      // Check for errors
+      if (sf->download_curl) {
+        long http_code = 0;
+        curl_easy_getinfo(sf->download_curl, CURLINFO_RESPONSE_CODE, &http_code);
+        if (http_code != 200) {
+          log_error("s3_storage: streaming download failed: http=%ld", http_code);
+          rc = STORAGE_ERR_IO;
+        }
+      }
+
+      // Cleanup curl handles
+      if (sf->download_curl) {
+        curl_multi_remove_handle(sf->multi, sf->download_curl);
+        curl_easy_cleanup(sf->download_curl);
+      }
+      if (sf->multi) {
+        curl_multi_cleanup(sf->multi);
+      }
+      if (sf->headers) {
+        curl_slist_free_all(sf->headers);
+      }
+    }
+    // Cleanup buffer
+    free(sf->buf.data);
+#else
     free(sf->read_buffer);
+#endif
   }
 
   free(sf);
