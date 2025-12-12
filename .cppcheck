@@ -9,3 +9,6 @@ unknownMacro:plugins/pprof/pprof_plugin.c
 
 # Too many #ifdef configurations in cwisstable
 toomanyconfigs
+
+# False positive: sf->buf.data is stored in returned struct and freed in s3_close
+memleak:plugins/storage/s3_storage.c

@@ -2,14 +2,16 @@
  * Test streaming upload with small chunks (64KB) to verify minimal memory usage
  *
  * This test uses 64KB chunks (vs 5MB in test_large_upload.c) to demonstrate
- * that the S3 streaming implementation itself uses minimal memory (~256KB buffer).
+ * that the S3 streaming implementation itself uses minimal memory (~256KB
+ * buffer).
  *
  * Usage: ./test_streaming_upload [size_mb]
  *   size_mb: File size in MB (default: 100)
  *
  * Prerequisites:
- *   docker run -d --name localstack -p 4566:4566 -e SERVICES=s3 localstack/localstack
- *   AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test aws --endpoint-url=http://localhost:4566 s3 mb s3://pressured-test
+ *   docker run -d --name localstack -p 4566:4566 -e SERVICES=s3
+ * localstack/localstack AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test aws
+ * --endpoint-url=http://localhost:4566 s3 mb s3://pressured-test
  */
 
 #include "log.h"
@@ -28,7 +30,7 @@
 #define TEST_REGION "us-east-1"
 
 // Small chunk size to minimize memory footprint
-#define CHUNK_SIZE (64 * 1024)  // 64KB chunks
+#define CHUNK_SIZE (64 * 1024) // 64KB chunks
 
 static int check_localstack_available(void) {
   int rc = system(
@@ -50,7 +52,7 @@ static double get_time(void) {
   return tv.tv_sec + tv.tv_usec / 1000000.0;
 }
 
-int main(int argc, char *argv[]) {
+int main(int argc, char *const argv[]) {
   log_init(LOG_INFO);
 
   // Parse optional size argument (in MB)
@@ -63,9 +65,11 @@ int main(int argc, char *argv[]) {
 
   size_t total_size = size_mb * 1024 * 1024;
 
-  printf("test_streaming_upload: %zu MB with %zu KB chunks\n", size_mb, CHUNK_SIZE / 1024);
-  printf("  Expected memory: ~%zu KB (S3 buffer) + %zu KB (app buffer) = ~%zu KB\n",
-         256, CHUNK_SIZE / 1024, 256 + CHUNK_SIZE / 1024);
+  printf("test_streaming_upload: %zu MB with %d KB chunks\n", size_mb,
+         CHUNK_SIZE / 1024);
+  printf(
+      "  Expected memory: ~%d KB (S3 buffer) + %d KB (app buffer) = ~%d KB\n",
+      256, CHUNK_SIZE / 1024, 256 + CHUNK_SIZE / 1024);
 
   if (!check_localstack_available()) {
     printf("  SKIP: LocalStack not available\n");
@@ -94,16 +98,15 @@ int main(int argc, char *argv[]) {
   }
 
   // Build config JSON for LocalStack
-  const char *config_json =
-    "{"
-    "  \"storage\": {"
-    "    \"s3\": {"
-    "      \"bucket\": \"" TEST_BUCKET "\","
-    "      \"region\": \"" TEST_REGION "\","
-    "      \"endpoint\": \"" LOCALSTACK_ENDPOINT "\""
-    "    }"
-    "  }"
-    "}";
+  const char *config_json = "{"
+                            "  \"storage\": {"
+                            "    \"s3\": {"
+                            "      \"bucket\": \"" TEST_BUCKET "\","
+                            "      \"region\": \"" TEST_REGION "\","
+                            "      \"endpoint\": \"" LOCALSTACK_ENDPOINT "\""
+                            "    }"
+                            "  }"
+                            "}";
 
   int rc = plugin_manager_load(pm, S3_PLUGIN_PATH, config_json);
   if (rc != 0) {
@@ -127,7 +130,7 @@ int main(int argc, char *argv[]) {
   storage_t *s = (storage_t *)ref.instance;
 
   // Allocate small chunk buffer
-  printf("  Allocating %zu KB chunk buffer...\n", CHUNK_SIZE / 1024);
+  printf("  Allocating %d KB chunk buffer...\n", CHUNK_SIZE / 1024);
   char *chunk = malloc(CHUNK_SIZE);
   if (!chunk) {
     printf("  ERROR: failed to allocate chunk buffer\n");
@@ -138,7 +141,8 @@ int main(int argc, char *argv[]) {
   }
 
   char test_key[256];
-  snprintf(test_key, sizeof(test_key), "test/streaming_%zuMB_64KB.bin", size_mb);
+  snprintf(test_key, sizeof(test_key), "test/streaming_%zuMB_64KB.bin",
+           size_mb);
 
   // =========================================================================
   // Upload using streaming with small chunks
@@ -186,7 +190,8 @@ int main(int argc, char *argv[]) {
 
     int64_t n = s->write(f, chunk, to_write);
     if (n != (int64_t)to_write) {
-      printf("  ERROR: write failed at %zu bytes (returned %ld)\n", written_total, n);
+      printf("  ERROR: write failed at %zu bytes (returned %ld)\n",
+             written_total, n);
       s->close(f);
       free(chunk);
       service_ref_release(&ref);
@@ -243,7 +248,8 @@ int main(int argc, char *argv[]) {
 
   while (1) {
     int64_t n = s->read(f, chunk, CHUNK_SIZE);
-    if (n == 0) break; // EOF
+    if (n == 0)
+      break; // EOF
     if (n < 0) {
       printf("  ERROR: read failed at %zu bytes\n", read_total);
       verify_ok = 0;
@@ -258,7 +264,8 @@ int main(int argc, char *argv[]) {
         break;
       }
     }
-    if (!verify_ok) break;
+    if (!verify_ok)
+      break;
 
     read_total += n;
 
@@ -275,10 +282,12 @@ int main(int argc, char *argv[]) {
   double download_speed = (double)size_mb / download_time;
 
   if (verify_ok && read_total == total_size) {
-    printf("  Download: OK (%.1f seconds, %.1f MB/s)\n", download_time, download_speed);
+    printf("  Download: OK (%.1f seconds, %.1f MB/s)\n", download_time,
+           download_speed);
     printf("  Verification: OK (data matches)\n");
   } else {
-    printf("  Download: FAILED (read %zu of %zu bytes)\n", read_total, total_size);
+    printf("  Download: FAILED (read %zu of %zu bytes)\n", read_total,
+           total_size);
     verify_ok = 0;
   }
 
@@ -294,10 +303,13 @@ int main(int argc, char *argv[]) {
   if (verify_ok) {
     printf("\ntest_streaming_upload: PASSED\n");
     printf("  Total size:   %zu MB\n", size_mb);
-    printf("  Chunk size:   %zu KB\n", CHUNK_SIZE / 1024);
-    printf("  Upload:       %.1f seconds (%.1f MB/s)\n", upload_time, upload_speed);
-    printf("  Download:     %.1f seconds (%.1f MB/s)\n", download_time, download_speed);
-    printf("  Peak memory:  ~%zu KB (estimated)\n", 256 + CHUNK_SIZE / 1024 + 200);
+    printf("  Chunk size:   %d KB\n", CHUNK_SIZE / 1024);
+    printf("  Upload:       %.1f seconds (%.1f MB/s)\n", upload_time,
+           upload_speed);
+    printf("  Download:     %.1f seconds (%.1f MB/s)\n", download_time,
+           download_speed);
+    printf("  Peak memory:  ~%d KB (estimated)\n",
+           256 + CHUNK_SIZE / 1024 + 200);
     return 0;
   } else {
     printf("\ntest_streaming_upload: FAILED\n");

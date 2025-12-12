@@ -107,16 +107,15 @@ int main(int argc, const char *argv[]) {
   }
 
   // Build config JSON for LocalStack
-  const char *config_json =
-    "{"
-    "  \"storage\": {"
-    "    \"s3\": {"
-    "      \"bucket\": \"" TEST_BUCKET "\","
-    "      \"region\": \"" TEST_REGION "\","
-    "      \"endpoint\": \"" LOCALSTACK_ENDPOINT "\""
-    "    }"
-    "  }"
-    "}";
+  const char *config_json = "{"
+                            "  \"storage\": {"
+                            "    \"s3\": {"
+                            "      \"bucket\": \"" TEST_BUCKET "\","
+                            "      \"region\": \"" TEST_REGION "\","
+                            "      \"endpoint\": \"" LOCALSTACK_ENDPOINT "\""
+                            "    }"
+                            "  }"
+                            "}";
 
   int rc = plugin_manager_load(pm, S3_PLUGIN_PATH, config_json);
   if (rc != 0) {
@@ -187,7 +186,8 @@ int main(int argc, const char *argv[]) {
     set_size(f, (int64_t)total_size);
     printf("  Set upload size to %zu bytes\n", total_size);
   } else {
-    printf("  WARNING: s3_set_upload_size not found, upload may fail without Content-Length\n");
+    printf("  WARNING: s3_set_upload_size not found, upload may fail without "
+           "Content-Length\n");
   }
 
   size_t written_total = 0;

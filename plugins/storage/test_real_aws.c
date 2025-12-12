@@ -21,7 +21,7 @@
 #include <sys/time.h>
 
 #define S3_PLUGIN_PATH "./plugins/s3-storage.so"
-#define CHUNK_SIZE (64 * 1024)  // 64KB chunks
+#define CHUNK_SIZE (64 * 1024) // 64KB chunks
 
 static void fill_pattern(char *buf, size_t len, size_t offset) {
   for (size_t i = 0; i < len; i++) {
@@ -44,11 +44,12 @@ static double get_time(void) {
   return tv.tv_sec + tv.tv_usec / 1000000.0;
 }
 
-int main(int argc, char *argv[]) {
+int main(int argc, char *const argv[]) {
   if (argc < 3) {
     fprintf(stderr, "Usage: %s <bucket> <region> [size_mb]\n", argv[0]);
     fprintf(stderr, "\nExample:\n");
-    fprintf(stderr, "  eval \"$(aws configure export-credentials --profile workload-dev --format env)\"\n");
+    fprintf(stderr, "  eval \"$(aws configure export-credentials --profile "
+                    "workload-dev --format env)\"\n");
     fprintf(stderr, "  %s my-bucket us-west-2 10\n", argv[0]);
     return 1;
   }
@@ -70,7 +71,8 @@ int main(int argc, char *argv[]) {
   const char *secret_key = getenv("AWS_SECRET_ACCESS_KEY");
   if (!access_key || !secret_key) {
     printf("\nERROR: AWS credentials not set in environment\n");
-    printf("Run: eval \"$(aws configure export-credentials --profile <profile> --format env)\"\n");
+    printf("Run: eval \"$(aws configure export-credentials --profile <profile> "
+           "--format env)\"\n");
     return 1;
   }
   printf("  Key:    %.12s...\n", access_key);
@@ -95,14 +97,15 @@ int main(int argc, char *argv[]) {
   // Build config JSON (no endpoint = real AWS)
   char config_json[1024];
   snprintf(config_json, sizeof(config_json),
-    "{"
-    "  \"storage\": {"
-    "    \"s3\": {"
-    "      \"bucket\": \"%s\","
-    "      \"region\": \"%s\""
-    "    }"
-    "  }"
-    "}", bucket, region);
+           "{"
+           "  \"storage\": {"
+           "    \"s3\": {"
+           "      \"bucket\": \"%s\","
+           "      \"region\": \"%s\""
+           "    }"
+           "  }"
+           "}",
+           bucket, region);
 
   int rc = plugin_manager_load(pm, S3_PLUGIN_PATH, config_json);
   if (rc != 0) {
@@ -124,7 +127,7 @@ int main(int argc, char *argv[]) {
   storage_t *s = (storage_t *)ref.instance;
 
   // Allocate chunk buffer
-  printf("  Chunk:  %zu KB\n", CHUNK_SIZE / 1024);
+  printf("  Chunk:  %d KB\n", CHUNK_SIZE / 1024);
   char *chunk = malloc(CHUNK_SIZE);
   if (!chunk) {
     printf("ERROR: failed to allocate chunk buffer\n");
@@ -135,7 +138,8 @@ int main(int argc, char *argv[]) {
   }
 
   char test_key[256];
-  snprintf(test_key, sizeof(test_key), "test/pressured_streaming_%zuMB.bin", size_mb);
+  snprintf(test_key, sizeof(test_key), "test/pressured_streaming_%zuMB.bin",
+           size_mb);
 
   // =========================================================================
   // Upload
@@ -157,7 +161,8 @@ int main(int argc, char *argv[]) {
 
   // Set expected size
   void *plugin_handle = dlopen(S3_PLUGIN_PATH, RTLD_NOW | RTLD_NOLOAD);
-  if (!plugin_handle) plugin_handle = dlopen(S3_PLUGIN_PATH, RTLD_NOW);
+  if (!plugin_handle)
+    plugin_handle = dlopen(S3_PLUGIN_PATH, RTLD_NOW);
   typedef int (*set_upload_size_fn)(storage_file_t *, int64_t);
   set_upload_size_fn set_size = NULL;
   if (plugin_handle) {
@@ -181,7 +186,8 @@ int main(int argc, char *argv[]) {
 
     int64_t n = s->write(f, chunk, to_write);
     if (n != (int64_t)to_write) {
-      printf("\nERROR: write failed at %zu bytes (returned %ld)\n", written_total, n);
+      printf("\nERROR: write failed at %zu bytes (returned %ld)\n",
+             written_total, n);
       s->close(f);
       free(chunk);
       service_ref_release(&ref);
@@ -193,7 +199,8 @@ int main(int argc, char *argv[]) {
     written_total += n;
 
     if (written_total - last_progress >= 1024 * 1024) {
-      printf("  Progress: %zu MB / %zu MB\r", written_total / (1024 * 1024), size_mb);
+      printf("  Progress: %zu MB / %zu MB\r", written_total / (1024 * 1024),
+             size_mb);
       fflush(stdout);
       last_progress = written_total;
     }
@@ -210,7 +217,8 @@ int main(int argc, char *argv[]) {
   }
 
   double upload_time = get_time() - start_time;
-  printf("\n  Upload: OK (%.1f seconds, %.1f MB/s)\n", upload_time, (double)size_mb / upload_time);
+  printf("\n  Upload: OK (%.1f seconds, %.1f MB/s)\n", upload_time,
+         (double)size_mb / upload_time);
 
   // =========================================================================
   // Download and verify
@@ -235,7 +243,8 @@ int main(int argc, char *argv[]) {
 
   while (1) {
     int64_t n = s->read(f, chunk, CHUNK_SIZE);
-    if (n == 0) break;
+    if (n == 0)
+      break;
     if (n < 0) {
       printf("\nERROR: read failed at %zu bytes\n", read_total);
       verify_ok = 0;
@@ -251,7 +260,8 @@ int main(int argc, char *argv[]) {
     read_total += n;
 
     if (read_total - last_progress >= 1024 * 1024) {
-      printf("  Progress: %zu MB / %zu MB\r", read_total / (1024 * 1024), size_mb);
+      printf("  Progress: %zu MB / %zu MB\r", read_total / (1024 * 1024),
+             size_mb);
       fflush(stdout);
       last_progress = read_total;
     }
@@ -262,10 +272,12 @@ int main(int argc, char *argv[]) {
   double download_time = get_time() - start_time;
 
   if (verify_ok && read_total == total_size) {
-    printf("\n  Download: OK (%.1f seconds, %.1f MB/s)\n", download_time, (double)size_mb / download_time);
+    printf("\n  Download: OK (%.1f seconds, %.1f MB/s)\n", download_time,
+           (double)size_mb / download_time);
     printf("  Verification: OK (all data matches)\n");
   } else {
-    printf("\n  Download: FAILED (read %zu of %zu bytes)\n", read_total, total_size);
+    printf("\n  Download: FAILED (read %zu of %zu bytes)\n", read_total,
+           total_size);
     verify_ok = 0;
   }
 
@@ -289,9 +301,11 @@ int main(int argc, char *argv[]) {
   if (verify_ok) {
     printf("=== TEST PASSED ===\n");
     printf("  Total size:   %zu MB\n", size_mb);
-    printf("  Chunk size:   %zu KB\n", CHUNK_SIZE / 1024);
-    printf("  Upload:       %.1f seconds (%.1f MB/s)\n", upload_time, (double)size_mb / upload_time);
-    printf("  Download:     %.1f seconds (%.1f MB/s)\n", download_time, (double)size_mb / download_time);
+    printf("  Chunk size:   %d KB\n", CHUNK_SIZE / 1024);
+    printf("  Upload:       %.1f seconds (%.1f MB/s)\n", upload_time,
+           (double)size_mb / upload_time);
+    printf("  Download:     %.1f seconds (%.1f MB/s)\n", download_time,
+           (double)size_mb / download_time);
     return 0;
   } else {
     printf("=== TEST FAILED ===\n");

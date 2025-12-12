@@ -41,7 +41,8 @@ typedef ssize_t (*s3_read_callback_t)(void *buf, size_t len, void *userdata);
  * @param key            Object key to upload to
  * @param read_cb        Callback that provides data chunks
  * @param userdata       User context passed to read_cb
- * @param content_length Total size if known, or -1 for chunked transfer encoding
+ * @param content_length Total size if known, or -1 for chunked transfer
+ * encoding
  * @return STORAGE_OK on success, error code on failure
  *
  * Example (streaming from file):
