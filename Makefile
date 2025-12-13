@@ -67,6 +67,7 @@ lint: ## Run static analysis (cppcheck if available)
 			--suppress=unusedFunction \
 			--suppress=constParameterCallback \
 			--suppress=constParameterPointer \
+			--suppress=constParameter \
 			--suppress=constVariablePointer \
 			--suppress=normalCheckLevelMaxBranches \
 			--error-exitcode=1 \

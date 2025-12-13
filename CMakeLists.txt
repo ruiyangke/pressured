@@ -176,9 +176,25 @@ set_target_properties(test_http_stream_storage PROPERTIES ENABLE_EXPORTS ON)
 # Run manually: python3 tests/e2e_server.py 8765 & ./test_http_stream_storage
 
 # S3 storage plugin shared library
+#
+# Upload mode selection (compile-time):
+#   -DS3_UPLOAD_MODE=STREAMING  - Single PUT request (default, max 5GB, lower latency)
+#   -DS3_UPLOAD_MODE=MULTIPART  - Multi-part upload (unlimited size)
+set(S3_UPLOAD_MODE "STREAMING" CACHE STRING "S3 upload mode: STREAMING or MULTIPART")
+set_property(CACHE S3_UPLOAD_MODE PROPERTY STRINGS "MULTIPART" "STREAMING")
+
 add_library(storage_s3 SHARED
     plugins/storage/s3_storage.c
 )
+
+# Apply upload mode compile definition
+if(S3_UPLOAD_MODE STREQUAL "STREAMING")
+    target_compile_definitions(storage_s3 PRIVATE S3_UPLOAD_STREAMING)
+    message(STATUS "S3 storage: using STREAMING mode (single PUT, max 5GB)")
+else()
+    target_compile_definitions(storage_s3 PRIVATE S3_UPLOAD_MULTIPART)
+    message(STATUS "S3 storage: using MULTIPART mode (unlimited size)")
+endif()
 
 set_target_properties(storage_s3 PROPERTIES
     OUTPUT_NAME "s3-storage"
@@ -188,6 +204,7 @@ set_target_properties(storage_s3 PROPERTIES
 
 target_include_directories(storage_s3 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/plugins/storage
     ${JSON_C_INCLUDE_DIRS}
     ${CURL_INCLUDE_DIRS}
     ${OPENSSL_INCLUDE_DIRS}
@@ -211,6 +228,18 @@ add_executable(test_large_upload plugins/storage/test_large_upload.c)
 target_link_libraries(test_large_upload pressured_core)
 set_target_properties(test_large_upload PROPERTIES ENABLE_EXPORTS ON)
 # Run manually: ./test_large_upload
+
+# Streaming upload test (requires LocalStack)
+add_executable(test_streaming_upload plugins/storage/test_streaming_upload.c)
+target_link_libraries(test_streaming_upload pressured_core)
+set_target_properties(test_streaming_upload PROPERTIES ENABLE_EXPORTS ON)
+# Run manually: ./test_streaming_upload [size_mb]
+
+# Real AWS S3 test (uses env credentials)
+add_executable(test_real_aws plugins/storage/test_real_aws.c)
+target_link_libraries(test_real_aws pressured_core)
+set_target_properties(test_real_aws PROPERTIES ENABLE_EXPORTS ON)
+# Run: eval "$(aws configure export-credentials --profile <profile> --format env)" && ./test_real_aws <bucket> <region> [size_mb]
 
 # AWS SigV4 signing unit tests (sigv4 is part of S3 storage plugin)
 add_executable(test_sigv4 plugins/storage/test_sigv4.c plugins/storage/sigv4.c)
