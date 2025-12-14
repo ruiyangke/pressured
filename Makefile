@@ -1,7 +1,7 @@
 .PHONY: configure configure-release build build-release \
-        test test-valgrind test-valgrind-full test-cgroup test-plugin test-storage test-s3 \
+        test test-valgrind test-cgroup test-plugin test-storage test-s3 \
         lint format format-check \
-        docker docker-amd64 docker-amd64-push docker-push docker-valgrind \
+        docker docker-push \
         helm-lint helm-template helm-package \
         clean install run ci help
 
@@ -39,10 +39,7 @@ build-release: configure-release ## Build release version
 test: build ## Run unit tests
 	cd $(BUILD_DIR) && ctest --output-on-failure
 
-test-valgrind: ## Run tests under valgrind (Docker-based)
-	./scripts/valgrind-test.sh quick
-
-test-valgrind-full: ## Run all tests under valgrind (Docker-based)
+test-valgrind: ## Run valgrind memory tests
 	./scripts/valgrind-test.sh full
 
 test-cgroup: build ## Run cgroup tests only
@@ -59,7 +56,7 @@ test-s3: build ## Run S3 storage tests (requires LocalStack)
 
 ##@ Code Quality
 
-lint: ## Run static analysis (cppcheck if available)
+lint: ## Run static analysis (cppcheck)
 	@if command -v cppcheck > /dev/null 2>&1; then \
 		cppcheck --enable=warning,style,performance,portability \
 			--suppressions-list=.cppcheck \
@@ -93,23 +90,13 @@ format-check: ## Check code formatting
 
 ##@ Docker
 
-docker: ## Build Docker image (native arch)
+docker: ## Build Docker image
 	docker build -t $(DOCKER_REPO):$(DOCKER_TAG) .
 	docker tag $(DOCKER_REPO):$(DOCKER_TAG) $(DOCKER_REPO):latest
-
-docker-amd64: ## Build Docker image for linux/amd64 (uses Debian for QEMU compatibility)
-	docker buildx build --platform linux/amd64 -f Dockerfile.debian -t $(DOCKER_REPO):$(DOCKER_TAG) --load .
-	docker tag $(DOCKER_REPO):$(DOCKER_TAG) $(DOCKER_REPO):latest
-
-docker-amd64-push: ## Build and push Docker image for linux/amd64
-	docker buildx build --platform linux/amd64 -f Dockerfile.debian -t $(DOCKER_REPO):$(DOCKER_TAG) --push .
 
 docker-push: ## Push Docker image to registry
 	docker push $(DOCKER_REPO):$(DOCKER_TAG)
 	docker push $(DOCKER_REPO):latest
-
-docker-valgrind: ## Build valgrind test Docker image
-	docker build -f Dockerfile.valgrind -t $(PROJECT_NAME)-valgrind .
 
 ##@ Helm
 

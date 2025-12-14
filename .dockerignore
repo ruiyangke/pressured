@@ -1,5 +1,42 @@
+# Build artifacts
 build/
 *.o
 *.a
+*.so
+
+# IDE and editor files
 .cache/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# Development files
+.direnv/
+.envrc
+.claude/
 compile_commands.json
+
+# Documentation (not needed in build)
+docs/
+*.md
+LICENSE
+
+# Test files
+test_*.c
+tests/
+
+# Docker files (avoid recursion)
+Dockerfile*
+.dockerignore
+
+# CI/CD
+.github/
+
+# Examples (not needed in production image)
+examples/
