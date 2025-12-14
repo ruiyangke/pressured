@@ -166,7 +166,9 @@ set_target_properties(test_storage PROPERTIES ENABLE_EXPORTS ON)
 add_test(NAME test_storage COMMAND test_storage)
 
 # S3 storage plugin shared library
-set(S3_UPLOAD_MODE "STREAMING" CACHE STRING "S3 upload mode: STREAMING or MULTIPART")
+# MULTIPART is the default because S3 doesn't support Transfer-Encoding: chunked
+# for unknown-size uploads. STREAMING mode will fallback to MULTIPART when size is unknown.
+set(S3_UPLOAD_MODE "MULTIPART" CACHE STRING "S3 upload mode: STREAMING or MULTIPART")
 set_property(CACHE S3_UPLOAD_MODE PROPERTY STRINGS "STREAMING" "MULTIPART")
 
 add_library(storage_s3 SHARED
