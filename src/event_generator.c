@@ -325,9 +325,9 @@ pressured_event_t *event_generator_process(event_generator_t *gen,
                            sample->annotations, sample->annotations_count);
 
     // Get cooldown from annotation or use global default
-    int cooldown = get_annotation_int(sample->annotations,
-                                      sample->annotations_count,
-                                      ANN_COOLDOWN_SECONDS, gen->cooldown_seconds);
+    int cooldown =
+        get_annotation_int(sample->annotations, sample->annotations_count,
+                           ANN_COOLDOWN_SECONDS, gen->cooldown_seconds);
 
     bool severity_changed = (new_severity != state->severity);
     bool in_cooldown = (now - state->last_event_time) < cooldown;
