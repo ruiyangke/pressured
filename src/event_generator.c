@@ -8,6 +8,11 @@
 #define MAX_TRACKED_CONTAINERS 1024
 #define KEY_MAX_LEN 512
 
+// Annotation keys for per-pod threshold overrides
+#define ANN_WARN_PERCENT "pressured.io/warn-percent"
+#define ANN_CRITICAL_PERCENT "pressured.io/critical-percent"
+#define ANN_COOLDOWN_SECONDS "pressured.io/cooldown-seconds"
+
 // State for a single container
 typedef struct {
   char key[KEY_MAX_LEN];
@@ -103,12 +108,63 @@ static container_state_t *find_or_create_state(event_generator_t *gen,
 
   container_state_t *state = &gen->states[gen->state_count++];
   strncpy(state->key, key, KEY_MAX_LEN - 1);
+  state->key[KEY_MAX_LEN - 1] = '\0';
   state->severity = SEVERITY_OK;
   state->last_event_time = 0;
   state->last_oom_kill_count = 0; // Will be initialized on first sample
   state->last_seen_cycle = gen->current_cycle;
 
   return state;
+}
+
+// Helper to get annotation value by key, returns NULL if not found
+static const char *get_annotation(const pressured_annotation_t *annotations,
+                                  int count, const char *key) {
+  if (!annotations || count == 0 || !key)
+    return NULL;
+
+  for (int i = 0; i < count; i++) {
+    if (annotations[i].key && strcmp(annotations[i].key, key) == 0) {
+      return annotations[i].value;
+    }
+  }
+  return NULL;
+}
+
+// Helper to get annotation as double (percent), returns default if not found
+// Annotation values are expected to be percentages (e.g., "85" means 85%)
+static double get_annotation_percent(const pressured_annotation_t *annotations,
+                                     int count, const char *key,
+                                     double default_val) {
+  const char *val = get_annotation(annotations, count, key);
+  if (!val || val[0] == '\0')
+    return default_val;
+
+  char *endptr;
+  double parsed = strtod(val, &endptr);
+  // If no valid conversion or negative, return default
+  if (endptr == val || parsed < 0.0) {
+    return default_val;
+  }
+  // Convert from percentage to ratio (e.g., "85" -> 0.85)
+  return parsed / 100.0;
+}
+
+// Helper to get annotation as int, returns default if not found
+// Returns default for invalid or non-positive values
+static int get_annotation_int(const pressured_annotation_t *annotations,
+                              int count, const char *key, int default_val) {
+  const char *val = get_annotation(annotations, count, key);
+  if (!val || val[0] == '\0')
+    return default_val;
+
+  char *endptr;
+  long parsed = strtol(val, &endptr, 10);
+  // If no valid conversion or non-positive, return default
+  if (endptr == val || parsed <= 0) {
+    return default_val;
+  }
+  return (int)parsed;
 }
 
 // Remove states not seen in the current cycle (stale containers)
@@ -136,11 +192,17 @@ static void prune_stale_states(event_generator_t *gen) {
   gen->state_count = write_idx;
 }
 
-static pressured_severity_t calculate_severity(const event_generator_t *gen,
-                                               double usage_percent,
-                                               pressured_severity_t current) {
-  double warn = gen->warn_percent;
-  double critical = gen->critical_percent;
+static pressured_severity_t
+calculate_severity(const event_generator_t *gen, double usage_percent,
+                   pressured_severity_t current,
+                   const pressured_annotation_t *annotations,
+                   int annotations_count) {
+  // Use per-pod annotation overrides if present, otherwise use global defaults
+  double warn = get_annotation_percent(annotations, annotations_count,
+                                       ANN_WARN_PERCENT, gen->warn_percent);
+  double critical =
+      get_annotation_percent(annotations, annotations_count,
+                             ANN_CRITICAL_PERCENT, gen->critical_percent);
   double hysteresis = gen->hysteresis_percent;
 
   // Apply hysteresis based on current severity
@@ -257,11 +319,18 @@ pressured_event_t *event_generator_process(event_generator_t *gen,
     state->last_oom_kill_count = sample->oom_kill_count;
 
     // Check memory pressure events (threshold-based)
+    // Pass annotations for per-pod threshold overrides
     pressured_severity_t new_severity =
-        calculate_severity(gen, sample->usage_percent, state->severity);
+        calculate_severity(gen, sample->usage_percent, state->severity,
+                           sample->annotations, sample->annotations_count);
+
+    // Get cooldown from annotation or use global default
+    int cooldown =
+        get_annotation_int(sample->annotations, sample->annotations_count,
+                           ANN_COOLDOWN_SECONDS, gen->cooldown_seconds);
 
     bool severity_changed = (new_severity != state->severity);
-    bool in_cooldown = (now - state->last_event_time) < gen->cooldown_seconds;
+    bool in_cooldown = (now - state->last_event_time) < cooldown;
 
     if (new_severity > SEVERITY_OK && (severity_changed || !in_cooldown)) {
       // Emit memory pressure event
