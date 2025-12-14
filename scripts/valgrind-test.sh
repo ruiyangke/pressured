@@ -2,13 +2,17 @@
 # Valgrind memory leak testing script for pressured
 #
 # Usage:
-#   ./scripts/valgrind-test.sh           # Run all tests
-#   ./scripts/valgrind-test.sh quick     # Run only unit tests
-#   ./scripts/valgrind-test.sh full      # Run all tests including stress test
+#   ./scripts/valgrind-test.sh [mode]
+#
+# Modes:
+#   full    - Run all tests including stress test (default)
+#   unit    - Run unit tests only
+#   main    - Run main executable test
+#   lua     - Run Lua plugin test
+#   stress  - Run stress test
 #
 # Prerequisites:
 #   - Docker installed and running
-#   - Build context in the c/ directory
 
 set -e
 
@@ -43,37 +47,31 @@ build_image() {
 
     cd "$PROJECT_DIR"
 
-    if [ ! -f Dockerfile.valgrind ]; then
-        echo "Creating Dockerfile.valgrind..."
-        cat > Dockerfile.valgrind << 'EOF'
-# Build and test with valgrind
-FROM alpine:3.19
+    echo "Creating Dockerfile.valgrind..."
+    cat > Dockerfile.valgrind << 'EOF'
+# Build and test with valgrind (Debian for stable GCC)
+FROM debian:bookworm-slim
 
-RUN apk add --no-cache \
-    build-base \
-    cmake \
-    ninja \
-    pkgconfig \
-    curl-dev \
-    json-c-dev \
-    lua5.4-dev \
-    openssl-dev \
-    valgrind \
-    bash
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build pkg-config \
+    libcurl4-openssl-dev libjson-c-dev liblua5.4-dev libssl-dev zlib1g-dev \
+    valgrind ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY . .
 
-# Build with debug symbols
-RUN mkdir -p build && cd build && \
-    cmake -GNinja -DCMAKE_BUILD_TYPE=Debug .. && \
-    ninja
+RUN cmake -B build -GNinja -DCMAKE_BUILD_TYPE=Debug && ninja -C build
 
 WORKDIR /app/build
 EOF
-    fi
 
-    docker build -f Dockerfile.valgrind -t "$IMAGE_NAME" . 2>&1 | tail -20
+    if ! docker build -f Dockerfile.valgrind -t "$IMAGE_NAME" .; then
+        print_error "Image build failed"
+        rm -f Dockerfile.valgrind
+        exit 1
+    fi
+    rm -f Dockerfile.valgrind
     print_success "Image built successfully"
 }
 
@@ -81,7 +79,6 @@ EOF
 run_valgrind_test() {
     local test_name="$1"
     local test_cmd="$2"
-    local expected_exit="${3:-0}"
 
     echo ""
     echo "Running: $test_name"
@@ -235,7 +232,7 @@ print_summary() {
 
 # Main
 main() {
-    local mode="${1:-quick}"
+    local mode="${1:-full}"
     local failed=0
 
     print_header "Pressured Valgrind Memory Leak Testing"
@@ -247,9 +244,6 @@ main() {
 
     # Run tests based on mode
     case "$mode" in
-        quick)
-            run_unit_tests || ((failed+=$?))
-            ;;
         full)
             run_unit_tests || ((failed+=$?))
             run_main_test
@@ -269,11 +263,10 @@ main() {
             run_stress_test
             ;;
         *)
-            echo "Usage: $0 [quick|full|unit|main|lua|stress]"
+            echo "Usage: $0 [full|unit|main|lua|stress]"
             echo ""
             echo "Modes:"
-            echo "  quick   - Run unit tests only (default)"
-            echo "  full    - Run all tests including stress test"
+            echo "  full    - Run all tests including stress test (default)"
             echo "  unit    - Run unit tests (test_cgroup, test_plugin, test_storage)"
             echo "  main    - Run main executable test"
             echo "  lua     - Run Lua plugin test"
