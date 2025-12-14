@@ -1,3 +1,4 @@
+#define _GNU_SOURCE // for strptime and timegm
 #include "internal.h"
 #include "log.h"
 #include <curl/curl.h>
@@ -5,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define MAX_NODES 128
 #define MAX_PODS 4096
@@ -590,6 +592,22 @@ static pod_limit_t *lookup_pod_info(kubelet_source_t *source, const char *ns,
   return NULL;
 }
 
+// Find an existing sample in the samples array by container key
+// Returns pointer to sample if found, NULL otherwise
+static pressured_memory_sample_t *
+find_existing_sample(pressured_memory_sample_t *samples, int count,
+                     const char *ns, const char *pod, const char *container) {
+  for (int i = 0; i < count; i++) {
+    if (samples[i].namespace && samples[i].pod_name &&
+        samples[i].container_name && strcmp(samples[i].namespace, ns) == 0 &&
+        strcmp(samples[i].pod_name, pod) == 0 &&
+        strcmp(samples[i].container_name, container) == 0) {
+      return &samples[i];
+    }
+  }
+  return NULL;
+}
+
 static int collect_from_node(kubelet_source_t *source, const char *node_name,
                              pressured_memory_sample_t *samples, int *count,
                              int max_count) {
@@ -823,12 +841,26 @@ static int collect_oom_events(kubelet_source_t *source,
     // Mark as seen before creating sample
     mark_event_seen(source, uid);
 
-    // Look up pod info for node_name and pod_ip
+    // Try to find existing sample from kubelet stats (preferred - has real
+    // usage)
+    pressured_memory_sample_t *existing =
+        find_existing_sample(samples, *count, ns, pod_name, container_name);
+    if (existing) {
+      // Just mark existing sample as OOM killed, keep real usage data
+      existing->oom_kill_count = 1;
+      new_events++;
+      log_info("OOM killed event: ns=%s pod=%s container=%s (updated existing "
+               "sample)",
+               ns, pod_name, container_name);
+      continue;
+    }
+
+    // No existing sample - pod may have been deleted or not yet collected
+    // Look up pod info for metadata
     pod_limit_t *pod_info =
         lookup_pod_info(source, ns, pod_name, container_name);
 
     // Skip if pod info not found - pod may have been deleted already
-    // This prevents 0/0B notifications
     if (!pod_info) {
       log_debug("OOM event but pod info not found, skipping: ns=%s pod=%s "
                 "container=%s",
@@ -836,28 +868,31 @@ static int collect_oom_events(kubelet_source_t *source,
       continue;
     }
 
-    // Create OOM killed sample
+    // Create OOM-only sample with zero usage to avoid false memory_pressure
+    // events The oom_kill_count field will trigger OOM_KILLED event in
+    // event_generator
     pressured_memory_sample_t *sample = &samples[*count];
     sample->namespace = strdup(ns);
     sample->pod_name = strdup(pod_name);
     sample->container_name = strdup(container_name);
-    sample->node_name = NULL; // Could parse from event source
+    sample->node_name = NULL;
     sample->pod_ip = pod_info->pod_ip[0] ? strdup(pod_info->pod_ip) : NULL;
     sample->annotations =
         copy_annotations(pod_info->annotations, pod_info->annotations_count);
     sample->annotations_count = pod_info->annotations_count;
-    sample->usage_bytes = pod_info->limit_bytes; // At OOM, usage was at limit
+    // Use zero usage to avoid triggering memory_pressure events
+    // The OOM_KILLED event only checks oom_kill_count, not usage values
+    sample->usage_bytes = 0;
     sample->limit_bytes = pod_info->limit_bytes;
-    sample->usage_percent = 1.0; // 100% at OOM kill
-    sample->oom_kill_count =
-        1; // This triggers OOM_KILLED event in event_generator
+    sample->usage_percent = 0.0;
+    sample->oom_kill_count = 1;
     sample->timestamp = time(NULL);
 
     (*count)++;
     new_events++;
 
-    log_info("OOM killed event: ns=%s pod=%s container=%s", ns, pod_name,
-             container_name);
+    log_info("OOM killed event: ns=%s pod=%s container=%s (no current sample)",
+             ns, pod_name, container_name);
   }
 
   json_object_put(root);
@@ -967,11 +1002,31 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
       if (strcmp(reason, "OOMKilled") != 0)
         continue;
 
-      // Get finishedAt timestamp for deduplication
+      // Get finishedAt timestamp - skip old OOM events on startup
       const char *finished_at = NULL;
       if (json_object_object_get_ex(terminated, "finishedAt",
                                     &finished_at_obj)) {
         finished_at = json_object_get_string(finished_at_obj);
+      }
+
+      // Skip OOM events older than 5 minutes to avoid false positives on
+      // restart The lastState persists until the next container termination, so
+      // without this check, every pressured restart would re-report all
+      // historical OOMs
+      if (finished_at) {
+        struct tm tm = {0};
+        // Parse ISO8601 format: "2025-12-12T21:08:37Z"
+        if (strptime(finished_at, "%Y-%m-%dT%H:%M:%S", &tm)) {
+          time_t event_time = timegm(&tm);
+          time_t now = time(NULL);
+          int age_seconds = (int)(now - event_time);
+          if (age_seconds > 300) { // 5 minutes
+            log_debug("skipping old OOM event: ns=%s pod=%s container=%s "
+                      "finished=%s age=%ds",
+                      ns, pod_name, container_name, finished_at, age_seconds);
+            continue;
+          }
+        }
       }
 
       // Get restart count
@@ -993,12 +1048,26 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
       // Mark as seen
       mark_event_seen(source, unique_id);
 
-      // Look up container limits
+      // Try to find existing sample from kubelet stats (preferred - has real
+      // usage)
+      pressured_memory_sample_t *existing =
+          find_existing_sample(samples, *count, ns, pod_name, container_name);
+      if (existing) {
+        // Just mark existing sample as OOM killed, keep real usage data
+        existing->oom_kill_count = 1;
+        new_events++;
+        log_info("OOM killed (from pod status): ns=%s pod=%s container=%s "
+                 "restarts=%d finished=%s (updated existing sample)",
+                 ns, pod_name, container_name, restart_count,
+                 finished_at ? finished_at : "unknown");
+        continue;
+      }
+
+      // No existing sample - look up pod info for metadata
       pod_limit_t *pod_info =
           lookup_pod_info(source, ns, pod_name, container_name);
 
       // Skip if pod info not found - pod may have been deleted already
-      // This prevents 0/0B notifications
       if (!pod_info) {
         log_debug("OOM killed but pod info not found, skipping: ns=%s pod=%s "
                   "container=%s",
@@ -1006,7 +1075,8 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
         continue;
       }
 
-      // Create OOM killed sample
+      // Create OOM-only sample with zero usage to avoid false memory_pressure
+      // events
       pressured_memory_sample_t *sample = &samples[*count];
       sample->namespace = strdup(ns);
       sample->pod_name = strdup(pod_name);
@@ -1016,18 +1086,18 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
       sample->annotations =
           copy_annotations(pod_info->annotations, pod_info->annotations_count);
       sample->annotations_count = pod_info->annotations_count;
-      sample->usage_bytes = pod_info->limit_bytes; // At OOM, usage ~= limit
+      // Use zero usage to avoid triggering memory_pressure events
+      sample->usage_bytes = 0;
       sample->limit_bytes = pod_info->limit_bytes;
-      sample->usage_percent = 1.0; // 100% at OOM kill
-      sample->oom_kill_count =
-          1; // This triggers OOM_KILLED event in event_generator
+      sample->usage_percent = 0.0;
+      sample->oom_kill_count = 1;
       sample->timestamp = time(NULL);
 
       (*count)++;
       new_events++;
 
       log_info("OOM killed (from pod status): ns=%s pod=%s container=%s "
-               "restarts=%d finished=%s",
+               "restarts=%d finished=%s (no current sample)",
                ns, pod_name, container_name, restart_count,
                finished_at ? finished_at : "unknown");
     }
