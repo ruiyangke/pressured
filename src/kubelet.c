@@ -1111,6 +1111,11 @@ pressured_memory_sample_t *kubelet_collect(kubelet_source_t *source,
                                            int *count) {
   *count = 0;
 
+  // Refresh node list each cycle to handle dynamic cluster changes
+  if (kubelet_refresh_nodes(source) != 0) {
+    log_warn("failed to refresh nodes, using cached list");
+  }
+
   pressured_memory_sample_t *samples =
       calloc(MAX_PODS, sizeof(pressured_memory_sample_t));
   if (!samples) {
