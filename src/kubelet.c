@@ -1116,6 +1116,11 @@ pressured_memory_sample_t *kubelet_collect(kubelet_source_t *source,
     log_warn("failed to refresh nodes, using cached list");
   }
 
+  // Refresh pod limits each cycle to handle pod replacements (e.g., after OOM kills)
+  if (kubelet_refresh_pod_limits(source) != 0) {
+    log_warn("failed to refresh pod limits, using cached list");
+  }
+
   pressured_memory_sample_t *samples =
       calloc(MAX_PODS, sizeof(pressured_memory_sample_t));
   if (!samples) {
