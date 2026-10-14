@@ -54,11 +54,11 @@
 #include "s3_storage.h"
 #include "crypto.h"
 #include "log.h"
+#include "pjson.h"
 #include "plugin.h"
 #include "service_registry.h"
 #include "storage.h"
 #include <curl/curl.h>
-#include <json-c/json.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -849,6 +849,46 @@ static int refresh_irsa_credentials(pressured_plugin_ctx_t *ctx) {
 // EKS Pod Identity - uses container credentials endpoint
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Parse an AWS credential JSON document (Pod Identity or IMDS). Returns 0 and
+// fills ctx on success, -1 on failure. A missing or non-string Token clears the
+// stored token so a stale one is never reused.
+static int parse_credentials(pressured_plugin_ctx_t *ctx,
+                             const char *response) {
+  yyjson_doc *doc =
+      pj_parse(response, strlen(response), PJ_READ_API, "credentials response");
+  if (!doc)
+    return -1;
+
+  yyjson_val *root = yyjson_doc_get_root(doc);
+  const char *access_key = yyjson_get_str(yyjson_obj_get(root, "AccessKeyId"));
+  const char *secret_key =
+      yyjson_get_str(yyjson_obj_get(root, "SecretAccessKey"));
+  if (!access_key || !secret_key) {
+    yyjson_doc_free(doc);
+    return -1;
+  }
+
+  strncpy(ctx->access_key, access_key, sizeof(ctx->access_key) - 1);
+  strncpy(ctx->secret_key, secret_key, sizeof(ctx->secret_key) - 1);
+
+  const char *token = yyjson_get_str(yyjson_obj_get(root, "Token"));
+  if (token) {
+    strncpy(ctx->session_token, token, sizeof(ctx->session_token) - 1);
+  } else {
+    ctx->session_token[0] = '\0';
+  }
+
+  const char *expiration = yyjson_get_str(yyjson_obj_get(root, "Expiration"));
+  ctx->cred_expiration =
+      expiration ? parse_iso8601(expiration) : time(NULL) + 3600;
+  if (ctx->cred_expiration > 300) {
+    ctx->cred_expiration -= 300;
+  }
+
+  yyjson_doc_free(doc);
+  return 0;
+}
+
 static int refresh_pod_identity_credentials(pressured_plugin_ctx_t *ctx) {
   const char *creds_uri = getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI");
   const char *auth_token_file =
@@ -885,44 +925,11 @@ static int refresh_pod_identity_credentials(pressured_plugin_ctx_t *ctx) {
     return -1;
   }
 
-  // Parse JSON response
-  struct json_object *root = json_tokener_parse(response);
-  if (!root) {
+  if (parse_credentials(ctx, response) != 0) {
     log_debug("s3_storage: Pod Identity: failed to parse response");
     return -1;
   }
 
-  struct json_object *obj;
-  const char *access_key = NULL, *secret_key = NULL, *session_token = NULL,
-             *expiration = NULL;
-
-  if (json_object_object_get_ex(root, "AccessKeyId", &obj))
-    access_key = json_object_get_string(obj);
-  if (json_object_object_get_ex(root, "SecretAccessKey", &obj))
-    secret_key = json_object_get_string(obj);
-  if (json_object_object_get_ex(root, "Token", &obj))
-    session_token = json_object_get_string(obj);
-  if (json_object_object_get_ex(root, "Expiration", &obj))
-    expiration = json_object_get_string(obj);
-
-  if (!access_key || !secret_key) {
-    json_object_put(root);
-    return -1;
-  }
-
-  strncpy(ctx->access_key, access_key, sizeof(ctx->access_key) - 1);
-  strncpy(ctx->secret_key, secret_key, sizeof(ctx->secret_key) - 1);
-  if (session_token) {
-    strncpy(ctx->session_token, session_token, sizeof(ctx->session_token) - 1);
-  }
-
-  ctx->cred_expiration =
-      expiration ? parse_iso8601(expiration) : time(NULL) + 3600;
-  if (ctx->cred_expiration > 300) {
-    ctx->cred_expiration -= 300;
-  }
-
-  json_object_put(root);
   ctx->cred_source = CRED_POD_IDENTITY;
   log_info("s3_storage: Pod Identity credentials obtained");
 
@@ -1015,43 +1022,10 @@ static int refresh_imds_credentials(pressured_plugin_ctx_t *ctx) {
     return -1;
   }
 
-  // Parse JSON response
-  struct json_object *root = json_tokener_parse(response);
-  if (!root) {
+  if (parse_credentials(ctx, response) != 0) {
     return -1;
   }
 
-  struct json_object *obj;
-  const char *access_key = NULL, *secret_key = NULL, *session_token = NULL,
-             *expiration = NULL;
-
-  if (json_object_object_get_ex(root, "AccessKeyId", &obj))
-    access_key = json_object_get_string(obj);
-  if (json_object_object_get_ex(root, "SecretAccessKey", &obj))
-    secret_key = json_object_get_string(obj);
-  if (json_object_object_get_ex(root, "Token", &obj))
-    session_token = json_object_get_string(obj);
-  if (json_object_object_get_ex(root, "Expiration", &obj))
-    expiration = json_object_get_string(obj);
-
-  if (!access_key || !secret_key) {
-    json_object_put(root);
-    return -1;
-  }
-
-  strncpy(ctx->access_key, access_key, sizeof(ctx->access_key) - 1);
-  strncpy(ctx->secret_key, secret_key, sizeof(ctx->secret_key) - 1);
-  if (session_token) {
-    strncpy(ctx->session_token, session_token, sizeof(ctx->session_token) - 1);
-  }
-
-  ctx->cred_expiration =
-      expiration ? parse_iso8601(expiration) : time(NULL) + 3600;
-  if (ctx->cred_expiration > 300) {
-    ctx->cred_expiration -= 300;
-  }
-
-  json_object_put(root);
   ctx->cred_source = CRED_IMDS;
   log_info("s3_storage: IMDS credentials obtained for role %s", role_name);
 
@@ -2632,6 +2606,38 @@ static void s3_storage_destructor(void *instance, void *userdata) {
 // Plugin Lifecycle
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Read the storage.s3 section, falling back to the flat root object used by
+// direct plugin tests. Non-string values keep the current setting.
+static void parse_s3_config(pressured_plugin_ctx_t *ctx,
+                            const char *config_json) {
+  yyjson_doc *doc = pj_parse(config_json, strlen(config_json), PJ_READ_CONFIG,
+                             "s3 storage config");
+  if (!doc)
+    return;
+
+  yyjson_val *root = yyjson_doc_get_root(doc);
+  yyjson_val *s3 = yyjson_obj_get(yyjson_obj_get(root, "storage"), "s3");
+  yyjson_val *section = yyjson_is_obj(s3) ? s3 : root;
+
+  const char *bucket = yyjson_get_str(yyjson_obj_get(section, "bucket"));
+  if (bucket)
+    strncpy(ctx->bucket, bucket, sizeof(ctx->bucket) - 1);
+
+  const char *region = yyjson_get_str(yyjson_obj_get(section, "region"));
+  if (region)
+    strncpy(ctx->region, region, sizeof(ctx->region) - 1);
+
+  const char *prefix = yyjson_get_str(yyjson_obj_get(section, "prefix"));
+  if (prefix)
+    strncpy(ctx->prefix, prefix, sizeof(ctx->prefix) - 1);
+
+  const char *endpoint = yyjson_get_str(yyjson_obj_get(section, "endpoint"));
+  if (endpoint)
+    strncpy(ctx->endpoint, endpoint, sizeof(ctx->endpoint) - 1);
+
+  yyjson_doc_free(doc);
+}
+
 PRESSURED_PLUGIN_EXPORT pressured_plugin_ctx_t *
 pressured_plugin_load(const char *config_json, service_registry_t *sr) {
   pressured_plugin_ctx_t *ctx = calloc(1, sizeof(pressured_plugin_ctx_t));
@@ -2641,44 +2647,8 @@ pressured_plugin_load(const char *config_json, service_registry_t *sr) {
   // Default region
   strncpy(ctx->region, "us-east-1", sizeof(ctx->region) - 1);
 
-  // Parse JSON config - look for storage.s3 section
   if (config_json && config_json[0]) {
-    struct json_object *root = json_tokener_parse(config_json);
-    if (root) {
-      struct json_object *storage_obj, *s3_obj, *obj;
-
-      // Try storage.s3 path first (full config structure)
-      if (json_object_object_get_ex(root, "storage", &storage_obj) &&
-          json_object_object_get_ex(storage_obj, "s3", &s3_obj)) {
-        if (json_object_object_get_ex(s3_obj, "bucket", &obj))
-          strncpy(ctx->bucket, json_object_get_string(obj),
-                  sizeof(ctx->bucket) - 1);
-        if (json_object_object_get_ex(s3_obj, "region", &obj))
-          strncpy(ctx->region, json_object_get_string(obj),
-                  sizeof(ctx->region) - 1);
-        if (json_object_object_get_ex(s3_obj, "prefix", &obj))
-          strncpy(ctx->prefix, json_object_get_string(obj),
-                  sizeof(ctx->prefix) - 1);
-        if (json_object_object_get_ex(s3_obj, "endpoint", &obj))
-          strncpy(ctx->endpoint, json_object_get_string(obj),
-                  sizeof(ctx->endpoint) - 1);
-      } else {
-        // Fallback: try flat config (for direct plugin tests)
-        if (json_object_object_get_ex(root, "bucket", &obj))
-          strncpy(ctx->bucket, json_object_get_string(obj),
-                  sizeof(ctx->bucket) - 1);
-        if (json_object_object_get_ex(root, "region", &obj))
-          strncpy(ctx->region, json_object_get_string(obj),
-                  sizeof(ctx->region) - 1);
-        if (json_object_object_get_ex(root, "prefix", &obj))
-          strncpy(ctx->prefix, json_object_get_string(obj),
-                  sizeof(ctx->prefix) - 1);
-        if (json_object_object_get_ex(root, "endpoint", &obj))
-          strncpy(ctx->endpoint, json_object_get_string(obj),
-                  sizeof(ctx->endpoint) - 1);
-      }
-      json_object_put(root);
-    }
+    parse_s3_config(ctx, config_json);
   }
 
   // Region can also come from environment (for AWS SDK compatibility)

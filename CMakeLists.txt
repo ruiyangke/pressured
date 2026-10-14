@@ -267,6 +267,31 @@ target_include_directories(test_sigv4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/plugin
 target_link_libraries(test_sigv4 ${CRYPTO_LIBRARIES})
 add_test(NAME test_sigv4 COMMAND test_sigv4)
 
+# S3 credential and config parsing unit tests (include s3_storage.c directly)
+add_executable(test_s3_credentials plugins/storage/test_s3_credentials.c ${CRYPTO_SOURCE})
+if(S3_UPLOAD_MODE STREQUAL "STREAMING")
+    target_compile_definitions(test_s3_credentials PRIVATE S3_UPLOAD_STREAMING)
+else()
+    target_compile_definitions(test_s3_credentials PRIVATE S3_UPLOAD_MULTIPART)
+endif()
+target_include_directories(test_s3_credentials PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/plugins/storage
+    ${JSON_C_INCLUDE_DIRS}
+    ${CURL_INCLUDE_DIRS}
+    ${CRYPTO_INCLUDE_DIRS}
+)
+target_link_libraries(test_s3_credentials
+    pressured_core
+    ${JSON_C_LIBRARIES}
+    ${CURL_LIBRARIES}
+    ${CRYPTO_LIBRARIES}
+    yyjson
+)
+set_target_properties(test_s3_credentials PROPERTIES ENABLE_EXPORTS ON)
+add_test(NAME test_s3_credentials COMMAND test_s3_credentials)
+
 # pprof parser plugin
 add_library(pprof_plugin SHARED
     plugins/pprof/pprof_plugin.c
