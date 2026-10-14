@@ -358,6 +358,13 @@ static void test_token(kubelet_source_t *source) {
   write_token(path, token);
   reload_token(source);
   assert(strcmp(source->token, token) == 0);
+  // An exact-fit token followed by a line ending still fits
+  token[0] = 'y';
+  char with_newline[MAX_TOKEN + 2];
+  snprintf(with_newline, sizeof(with_newline), "%s\r\n", token);
+  write_token(path, with_newline);
+  reload_token(source);
+  assert(strcmp(source->token, token) == 0);
   write_token(path, "rotated");
   source->token_loaded_at = monotonic_seconds() + 1;
   char *response = api_request(source, "/api/v1/pods");
@@ -395,7 +402,7 @@ static void test_token(kubelet_source_t *source) {
     if (strstr(message, "WARN") && strstr(message, "too long"))
       oversized++;
   }
-  assert(reloads == 3);
+  assert(reloads == 4);
   assert(oversized == 1);
   result = fclose(messages);
   assert(result == 0);

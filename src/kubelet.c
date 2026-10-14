@@ -103,10 +103,18 @@ static int read_token(const char *path, char *buffer, size_t size) {
   if (!file)
     return -1;
   size_t length = fread(buffer, 1, size - 1, file);
-  int extra = fgetc(file);
+  // Anything left over must be the trailing line ending trimmed below
+  int extra;
+  int too_long = 0;
+  while ((extra = fgetc(file)) != EOF) {
+    if (extra != '\n' && extra != '\r') {
+      too_long = 1;
+      break;
+    }
+  }
   int failed = ferror(file);
   fclose(file);
-  if (extra != EOF) {
+  if (too_long) {
     log_warn("service account token file too long (buffer size %zu)", size);
     return -1;
   }
