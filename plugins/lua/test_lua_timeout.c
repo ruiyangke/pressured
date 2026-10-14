@@ -41,55 +41,65 @@ static void send_all(int fd, const void *data, size_t len) {
 
 static void *serve(void *arg) {
   server_t *s = arg;
-  int fd = accept(s->listener, NULL, NULL);
-  assert(fd >= 0);
-  char request[4096] = {0};
-  size_t used = 0;
-  char *body = NULL;
-  while (!body) {
-    ssize_t n = recv(fd, request + used, sizeof(request) - used - 1, 0);
-    assert(n > 0);
-    used += n;
-    body = strstr(request, "\r\n\r\n");
-  }
-  body += 4;
-  if (strcmp(s->mode, "binary") == 0) {
-    const char expected[] = {'a', '\0', 'b', '\0', 'c'};
-    char *length = strstr(request, "Content-Length:");
-    assert(length);
-    unsigned long content_length =
-        strtoul(length + strlen("Content-Length:"), NULL, 10);
-    assert(content_length == sizeof(expected));
-    size_t header_len = (size_t)(body - request);
-    while (used - header_len < sizeof(expected)) {
-      ssize_t n = recv(fd, request + used, sizeof(request) - used, 0);
+  int timeout_ms = -1; // Block for the first connection.
+  while (1) {
+    struct pollfd lfd = {.fd = s->listener, .events = POLLIN};
+    if (poll(&lfd, 1, timeout_ms) <= 0)
+      break;
+    int fd = accept(s->listener, NULL, NULL);
+    assert(fd >= 0);
+    char request[4096] = {0};
+    size_t used = 0;
+    char *body = NULL;
+    while (!body) {
+      ssize_t n = recv(fd, request + used, sizeof(request) - used - 1, 0);
       assert(n > 0);
       used += n;
+      body = strstr(request, "\r\n\r\n");
     }
-    assert(used - header_len == sizeof(expected));
-    assert(memcmp(body, expected, sizeof(expected)) == 0);
-    const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
-                            "Connection: close\r\n\r\n";
-    send_all(fd, response, sizeof(response) - 1);
-    send_all(fd, expected, sizeof(expected));
-  } else if (strcmp(s->mode, "headers") == 0) {
-    const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
-                            "Connection: close\r\n\r\nok";
-    send_all(fd, response, sizeof(response) - 1);
-  } else {
-    if (strcmp(s->mode, "stream") == 0) {
-      const char response[] =
-          "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
-          "\r\n4\r\ndata\r\n";
+    body += 4;
+    if (strcmp(s->mode, "binary") == 0) {
+      const char expected[] = {'a', '\0', 'b', '\0', 'c'};
+      char *length = strstr(request, "Content-Length:");
+      assert(length);
+      unsigned long content_length =
+          strtoul(length + strlen("Content-Length:"), NULL, 10);
+      assert(content_length == sizeof(expected));
+      size_t header_len = (size_t)(body - request);
+      while (used - header_len < sizeof(expected)) {
+        ssize_t n = recv(fd, request + used, sizeof(request) - used, 0);
+        assert(n > 0);
+        used += n;
+      }
+      assert(used - header_len == sizeof(expected));
+      assert(memcmp(body, expected, sizeof(expected)) == 0);
+      const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
+                              "Connection: close\r\n\r\n";
       send_all(fd, response, sizeof(response) - 1);
+      send_all(fd, expected, sizeof(expected));
+    } else if (strcmp(s->mode, "headers") == 0) {
+      const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                              "Connection: close\r\n\r\nok";
+      send_all(fd, response, sizeof(response) - 1);
+    } else {
+      if (strcmp(s->mode, "stream") == 0) {
+        const char response[] =
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+            "\r\n4\r\ndata\r\n";
+        send_all(fd, response, sizeof(response) - 1);
+      }
+      // Keep the connection open until the client aborts its request.
+      struct pollfd pfd = {.fd = fd, .events = POLLIN};
+      assert(poll(&pfd, 1, 2000) > 0);
+      char byte;
+      assert(recv(fd, &byte, 1, 0) <= 0);
     }
-    // Keep the connection open until the client aborts its request.
-    struct pollfd pfd = {.fd = fd, .events = POLLIN};
-    assert(poll(&pfd, 1, 2000) > 0);
-    char byte;
-    assert(recv(fd, &byte, 1, 0) <= 0);
+    close(fd);
+    // The "headers" case opens several connections; the rest open one.
+    if (strcmp(s->mode, "headers") != 0)
+      break;
+    timeout_ms = 100; // Briefly wait for the next connection.
   }
-  close(fd);
   return NULL;
 }
 
@@ -251,6 +261,14 @@ int main(int argc, char **argv) {
                "local many={} for i=1,65 do many[i]='X-H'..i..': v' end; "
                "local r=http.fetch('GET',url,{headers=many}); "
                "assert(r.error and r.error:find('too many headers')); "
+               "local s=http.stream(url,function() return true end,"
+               "{headers=many}); "
+               "assert(s.ok==false and s.error:find('too many headers')); "
+               "local n=http.fetch('GET',url,{headers={'X-A: 1',42}}); "
+               "assert(n.error and n.error:find('not a string')); "
+               "local ok={} for i=1,64 do ok[i]='X-H'..i..': v' end; "
+               "local f=http.fetch('GET',url,{headers=ok}); "
+               "assert(not f.error and f.status==200); "
                "local r2=http.fetch('GET',url,"
                "{headers={'X-A: 1','X-B: 2'}}); "
                "assert(not r2.error and r2.status==200); "
