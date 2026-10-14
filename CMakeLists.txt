@@ -64,6 +64,7 @@ link_directories(
 
 # Core library (no Lua dependency - Lua is in the plugin)
 add_library(pressured_core STATIC
+    src/health.c
     src/config.c
     src/cgroup.c
     src/kubelet.c
@@ -116,6 +117,18 @@ add_test(NAME test_service_registry COMMAND test_service_registry)
 add_executable(test_event_generator src/test_event_generator.c)
 target_link_libraries(test_event_generator pressured_core)
 add_test(NAME test_event_generator COMMAND test_event_generator)
+
+add_executable(test_kubelet src/test_kubelet.c)
+target_link_libraries(test_kubelet pressured_core)
+foreach(case dedupe cache age collection)
+    add_test(NAME test_kubelet_${case} COMMAND test_kubelet ${case})
+endforeach()
+
+add_executable(test_health src/test_health.c)
+add_dependencies(test_health pressured)
+foreach(case probe heartbeat)
+    add_test(NAME test_health_${case} COMMAND test_health $<TARGET_FILE:pressured> ${case})
+endforeach()
 
 # Lua plugin shared library
 add_library(pressured_plugin_lua SHARED

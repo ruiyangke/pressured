@@ -20,6 +20,9 @@ static void signal_handler(int sig) {
 
 static void print_usage(const char *program) {
   printf("Usage: %s [options]\n", program);
+  printf("       %s --health-check [max_age_seconds]\n", program);
+  printf("  Probe default: 300 seconds; PRESSURED_HEALTH_FILE defaults to "
+         "/tmp/pressured.healthy\n");
   printf("\nOptions:\n");
   printf("  -c, --config <path>     Config file path (JSON)\n");
   printf("  -l, --log-level <level> Log level (trace, debug, info, warn, "
@@ -30,6 +33,9 @@ static void print_usage(const char *program) {
 }
 
 int main(int argc, char *argv[]) {
+  if (argc > 1 && strcmp(argv[1], "--health-check") == 0)
+    return health_check_cli(argc - 2, argv + 2);
+
   const char *config_path = NULL;
   const char *log_level = "info";
   int dry_run = 0;
@@ -69,6 +75,12 @@ int main(int argc, char *argv[]) {
   // Initialize logging
   log_set_level_str(log_level);
   log_info("pressured %s starting", PRESSURED_VERSION);
+
+  const char *heartbeat_path = health_file_path();
+  if (health_remove(heartbeat_path) != 0) {
+    log_error("failed to remove heartbeat file: %s", heartbeat_path);
+    return 1;
+  }
 
   // Load configuration
   pressured_config_t *config = pressured_config_load(config_path);
@@ -188,11 +200,17 @@ int main(int argc, char *argv[]) {
     int sample_count = 0;
     pressured_memory_sample_t *samples = NULL;
 
+    bool healthy;
     if (config->source_mode == SOURCE_MODE_KUBELET) {
       samples = kubelet_collect(kubelet_source, &sample_count);
+      healthy = kubelet_collect_healthy(kubelet_source);
     } else {
       samples = cgroup_collect(cgroup_source, &sample_count);
+      healthy = samples != NULL;
     }
+
+    if (healthy && health_write(heartbeat_path, time(NULL)) != 0)
+      log_warn("failed to write heartbeat file: %s", heartbeat_path);
 
     if (samples && sample_count > 0) {
       // Analyze samples

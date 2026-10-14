@@ -7,6 +7,14 @@
  */
 
 #include "pressured.h"
+#include <stdint.h>
+#include <time.h>
+
+const char *health_file_path(void);
+int health_remove(const char *path);
+int health_write(const char *path, time_t now);
+const char *health_check(const char *path, time_t now, uintmax_t max_age);
+int health_check_cli(int argc, char **argv);
 
 // ============================================================================
 // Cgroup Source (sidecar mode)
@@ -47,6 +55,9 @@ void kubelet_source_free(kubelet_source_t *source);
 int kubelet_source_init(kubelet_source_t *source);
 pressured_memory_sample_t *kubelet_collect(kubelet_source_t *source,
                                            int *count);
+// True only when node/pod discovery and at least one node stats request
+// succeed. A successful empty node list requires no stats requests.
+bool kubelet_collect_healthy(const kubelet_source_t *source);
 void kubelet_set_namespace_filter(kubelet_source_t *source,
                                   const char *namespaces);
 void kubelet_set_label_selector(kubelet_source_t *source, const char *selector);

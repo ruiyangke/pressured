@@ -32,7 +32,7 @@ typedef struct {
 
 // OOM event tracking (to avoid duplicate notifications)
 typedef struct {
-  char uid[64];     // Event UID (unique per event)
+  char *uid;        // Full event or pod/container/restart identity
   time_t timestamp; // When we first saw this event
 } oom_event_seen_t;
 
@@ -53,6 +53,7 @@ struct kubelet_source {
   // Node discovery
   node_info_t nodes[MAX_NODES];
   int node_count;
+  bool collection_healthy;
 
   // Pod limits cache
   pod_limit_t *pod_limits;
@@ -222,6 +223,8 @@ void kubelet_source_free(kubelet_source_t *source) {
                        source->pod_limits[i].annotations_count);
     }
     free(source->pod_limits);
+    for (int i = 0; i < source->seen_event_count; i++)
+      free(source->seen_events[i].uid);
     if (source->curl)
       curl_easy_cleanup(source->curl);
     free(source);
@@ -308,10 +311,14 @@ static int kubelet_refresh_nodes(kubelet_source_t *source) {
     return -1;
   }
 
-  source->node_count = 0;
-
   struct json_object *items;
-  if (json_object_object_get_ex(root, "items", &items)) {
+  if (!json_object_object_get_ex(root, "items", &items) ||
+      !json_object_is_type(items, json_type_array)) {
+    json_object_put(root);
+    return -1;
+  }
+  source->node_count = 0;
+  {
     int len = json_object_array_length(items);
     for (int i = 0; i < len && source->node_count < MAX_NODES; i++) {
       struct json_object *node = json_object_array_get_idx(items, i);
@@ -406,8 +413,10 @@ parse_annotations(struct json_object *annotations_obj, int *count) {
 
   pressured_annotation_t *annotations =
       calloc(n, sizeof(pressured_annotation_t));
-  if (!annotations)
+  if (!annotations) {
+    *count = -1;
     return NULL;
+  }
 
   struct json_object_iterator it = json_object_iter_begin(annotations_obj);
   struct json_object_iterator end = json_object_iter_end(annotations_obj);
@@ -419,6 +428,11 @@ parse_annotations(struct json_object *annotations_obj, int *count) {
 
     annotations[*count].key = strdup(key);
     annotations[*count].value = value ? strdup(value) : strdup("");
+    if (!annotations[*count].key || !annotations[*count].value) {
+      free_annotations(annotations, *count + 1);
+      *count = -1;
+      return NULL;
+    }
     (*count)++;
 
     json_object_iter_next(&it);
@@ -440,21 +454,16 @@ copy_annotations(const pressured_annotation_t *src, int count) {
   for (int i = 0; i < count; i++) {
     dst[i].key = src[i].key ? strdup(src[i].key) : NULL;
     dst[i].value = src[i].value ? strdup(src[i].value) : NULL;
+    if ((src[i].key && !dst[i].key) || (src[i].value && !dst[i].value)) {
+      free_annotations(dst, count);
+      return NULL;
+    }
   }
 
   return dst;
 }
 
 static int kubelet_refresh_pod_limits(kubelet_source_t *source) {
-  // Free any existing annotations before clearing
-  for (int i = 0; i < source->pod_limit_count; i++) {
-    free_annotations(source->pod_limits[i].annotations,
-                     source->pod_limits[i].annotations_count);
-    source->pod_limits[i].annotations = NULL;
-    source->pod_limits[i].annotations_count = 0;
-  }
-  source->pod_limit_count = 0;
-
   // Build API path with optional namespace filter
   char path[MAX_URL];
   if (source->namespace_filter && strlen(source->namespace_filter) > 0) {
@@ -486,7 +495,23 @@ static int kubelet_refresh_pod_limits(kubelet_source_t *source) {
   }
 
   struct json_object *items;
-  if (json_object_object_get_ex(root, "items", &items)) {
+  if (!json_object_object_get_ex(root, "items", &items) ||
+      !json_object_is_type(items, json_type_array)) {
+    json_object_put(root);
+    return -1;
+  }
+
+  kubelet_source_t replacement = {0};
+  replacement.pod_limit_capacity = 256;
+  replacement.pod_limits =
+      calloc(replacement.pod_limit_capacity, sizeof(pod_limit_t));
+  if (!replacement.pod_limits) {
+    json_object_put(root);
+    return -1;
+  }
+  kubelet_source_t *original = source;
+  source = &replacement;
+  {
     int len = json_object_array_length(items);
     for (int i = 0; i < len; i++) {
       struct json_object *pod = json_object_array_get_idx(items, i);
@@ -533,6 +558,8 @@ static int kubelet_refresh_pod_limits(kubelet_source_t *source) {
                                     &annotations_obj)) {
         pod_annotations =
             parse_annotations(annotations_obj, &pod_annotations_count);
+        if (pod_annotations_count < 0)
+          goto failed;
       }
 
       int annotations_consumed = 0; // Track if first container took ownership
@@ -562,8 +589,11 @@ static int kubelet_refresh_pod_limits(kubelet_source_t *source) {
           int new_cap = source->pod_limit_capacity * 2;
           pod_limit_t *new_limits =
               realloc(source->pod_limits, new_cap * sizeof(pod_limit_t));
-          if (!new_limits)
-            continue;
+          if (!new_limits) {
+            if (!annotations_consumed)
+              free_annotations(pod_annotations, pod_annotations_count);
+            goto failed;
+          }
           source->pod_limits = new_limits;
           source->pod_limit_capacity = new_cap;
         }
@@ -588,6 +618,8 @@ static int kubelet_refresh_pod_limits(kubelet_source_t *source) {
           pl->annotations =
               copy_annotations(pod_annotations, pod_annotations_count);
           pl->annotations_count = pod_annotations_count;
+          if (pod_annotations_count > 0 && !pl->annotations)
+            goto failed;
         }
       }
 
@@ -600,17 +632,27 @@ static int kubelet_refresh_pod_limits(kubelet_source_t *source) {
   }
 
   json_object_put(root);
-  log_debug("cached limits for %d containers", source->pod_limit_count);
+  for (int i = 0; i < original->pod_limit_count; i++)
+    free_annotations(original->pod_limits[i].annotations,
+                     original->pod_limits[i].annotations_count);
+  free(original->pod_limits);
+  original->pod_limits = replacement.pod_limits;
+  original->pod_limit_count = replacement.pod_limit_count;
+  original->pod_limit_capacity = replacement.pod_limit_capacity;
+  log_debug("cached limits for %d containers", original->pod_limit_count);
   return 0;
+
+failed:
+  json_object_put(root);
+  for (int i = 0; i < replacement.pod_limit_count; i++)
+    free_annotations(replacement.pod_limits[i].annotations,
+                     replacement.pod_limits[i].annotations_count);
+  free(replacement.pod_limits);
+  return -1;
 }
 
 int kubelet_source_init(kubelet_source_t *source) {
   if (kubelet_refresh_nodes(source) != 0) {
-    return -1;
-  }
-
-  if (source->node_count == 0) {
-    log_error("no nodes discovered");
     return -1;
   }
 
@@ -676,9 +718,10 @@ static int collect_from_node(kubelet_source_t *source, const char *node_name,
   }
 
   struct json_object *pods_array;
-  if (!json_object_object_get_ex(root, "pods", &pods_array)) {
+  if (!json_object_object_get_ex(root, "pods", &pods_array) ||
+      !json_object_is_type(pods_array, json_type_array)) {
     json_object_put(root);
-    return 0;
+    return -1;
   }
 
   int pod_count = json_object_array_length(pods_array);
@@ -770,18 +813,38 @@ static int is_event_seen(const kubelet_source_t *source, const char *uid) {
 
 // Mark an OOM event as seen
 static void mark_event_seen(kubelet_source_t *source, const char *uid) {
+  char *copy = strdup(uid);
+  if (!copy)
+    return;
   if (source->seen_event_count >= MAX_OOM_EVENTS) {
     // Evict oldest half of events (simple LRU approximation)
     int keep = MAX_OOM_EVENTS / 2;
+    for (int i = 0; i < MAX_OOM_EVENTS - keep; i++)
+      free(source->seen_events[i].uid);
     memmove(source->seen_events, &source->seen_events[MAX_OOM_EVENTS - keep],
             keep * sizeof(oom_event_seen_t));
     source->seen_event_count = keep;
   }
 
   oom_event_seen_t *entry = &source->seen_events[source->seen_event_count++];
-  strncpy(entry->uid, uid, sizeof(entry->uid) - 1);
-  entry->uid[sizeof(entry->uid) - 1] = '\0';
+  entry->uid = copy;
   entry->timestamp = time(NULL);
+}
+
+static bool oom_event_is_old(struct json_object *event, time_t now) {
+  const char *fields[] = {"lastTimestamp", "eventTime", "firstTimestamp"};
+  for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+    struct json_object *value;
+    if (!json_object_object_get_ex(event, fields[i], &value))
+      continue;
+    const char *timestamp = json_object_get_string(value);
+    if (!timestamp || !*timestamp)
+      continue;
+    struct tm tm = {0};
+    if (strptime(timestamp, "%Y-%m-%dT%H:%M:%S", &tm))
+      return difftime(now, timegm(&tm)) > 300;
+  }
+  return false;
 }
 
 // Collect OOM kill events from K8s Events API
@@ -829,6 +892,8 @@ static int collect_oom_events(kubelet_source_t *source,
 
   for (int i = 0; i < event_count && *count < max_count; i++) {
     struct json_object *event = json_object_array_get_idx(items, i);
+    if (oom_event_is_old(event, time(NULL)))
+      continue;
     struct json_object *metadata, *involved_object;
 
     if (!json_object_object_get_ex(event, "metadata", &metadata))
@@ -985,7 +1050,7 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
   int pod_count = json_object_array_length(items);
   for (int i = 0; i < pod_count && *count < max_count; i++) {
     struct json_object *pod = json_object_array_get_idx(items, i);
-    struct json_object *metadata, *status, *spec;
+    struct json_object *metadata, *status, *spec = NULL;
 
     if (!json_object_object_get_ex(pod, "metadata", &metadata))
       continue;
@@ -1005,7 +1070,6 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
     const char *ns = json_object_get_string(ns_obj);
     const char *pod_name = json_object_get_string(name_obj);
     const char *pod_uid = json_object_get_string(uid_obj);
-    (void)pod_uid; // May be used for deduplication in future
 
     // Get node name
     const char *node_name = NULL;
@@ -1082,16 +1146,18 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
 
       // Create unique ID for deduplication: pod_uid + container_name +
       // restart_count This ensures we only report each OOM kill once
-      char unique_id[256];
-      snprintf(unique_id, sizeof(unique_id), "%s-%s-%d", pod_uid,
-               container_name, restart_count);
+      char *unique_id = NULL;
+      if (asprintf(&unique_id, "%zu:%s:%s:%d", strlen(pod_uid), pod_uid,
+                   container_name, restart_count) < 0)
+        continue;
 
       if (is_event_seen(source, unique_id)) {
+        free(unique_id);
         continue;
       }
 
-      // Mark as seen
       mark_event_seen(source, unique_id);
+      free(unique_id);
 
       // Try to find existing sample from kubelet stats (preferred - has real
       // usage)
@@ -1155,15 +1221,18 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
 pressured_memory_sample_t *kubelet_collect(kubelet_source_t *source,
                                            int *count) {
   *count = 0;
+  source->collection_healthy = false;
 
   // Refresh node list each cycle to handle dynamic cluster changes
-  if (kubelet_refresh_nodes(source) != 0) {
+  bool nodes_ok = kubelet_refresh_nodes(source) == 0;
+  if (!nodes_ok) {
     log_warn("failed to refresh nodes, using cached list");
   }
 
   // Refresh pod limits each cycle to handle pod replacements (e.g., after OOM
   // kills)
-  if (kubelet_refresh_pod_limits(source) != 0) {
+  bool pods_ok = kubelet_refresh_pod_limits(source) == 0;
+  if (!pods_ok) {
     log_warn("failed to refresh pod limits, using cached list");
   }
 
@@ -1175,9 +1244,17 @@ pressured_memory_sample_t *kubelet_collect(kubelet_source_t *source,
   }
 
   // Collect memory usage samples from kubelet stats
+  int successful_nodes = 0;
   for (int i = 0; i < source->node_count; i++) {
-    collect_from_node(source, source->nodes[i].name, samples, count, MAX_PODS);
+    if (collect_from_node(source, source->nodes[i].name, samples, count,
+                          MAX_PODS) == 0)
+      successful_nodes++;
   }
+  if (successful_nodes < source->node_count)
+    log_warn("stats collection succeeded for %d of %d nodes", successful_nodes,
+             source->node_count);
+  source->collection_healthy =
+      nodes_ok && pods_ok && (source->node_count == 0 || successful_nodes > 0);
 
   // Collect OOM kill events from K8s Events API (works on some clusters)
   int oom_events = collect_oom_events(source, samples, count, MAX_PODS);
@@ -1197,4 +1274,8 @@ pressured_memory_sample_t *kubelet_collect(kubelet_source_t *source,
 
   log_debug("collected %d samples from %d nodes", *count, source->node_count);
   return samples;
+}
+
+bool kubelet_collect_healthy(const kubelet_source_t *source) {
+  return source && source->collection_healthy;
 }
