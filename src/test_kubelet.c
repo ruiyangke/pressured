@@ -274,7 +274,8 @@ static void test_stats(kubelet_source_t *source) {
   // Cache limits for the containers the stats response will reference.
   fixture_response =
       "{\"items\":["
-      "{\"metadata\":{\"namespace\":\"ns\",\"name\":\"pod-a\"},\"spec\":{"
+      "{\"metadata\":{\"namespace\":\"ns\",\"name\":\"pod-a\","
+      "\"annotations\":{\"team\":\"core\"}},\"spec\":{"
       "\"containers\":["
       "{\"name\":\"int\",\"resources\":{\"limits\":{\"memory\":\"1Mi\"}}},"
       "{\"name\":\"float\",\"resources\":{\"limits\":{\"memory\":\"1Mi\"}}},"
@@ -324,8 +325,13 @@ static void test_stats(kubelet_source_t *source) {
   assert(samples[2].usage_bytes == 9223372036854775807ULL);
   assert(samples[2].limit_bytes == 1073741824ULL);
 
-  for (int i = 0; i < count; i++)
-    pressured_memory_sample_free(&samples[i]);
+  // The sample borrows the pod cache's annotations rather than copying them,
+  // and kubelet samples carry no pod UID.
+  assert(samples[0].annotations ==
+         lookup_pod_info(source, "ns", "pod-a", "int")->annotations);
+  assert(samples[0].annotations_count == 1);
+  assert(strcmp(samples[0].annotations[0].value, "core") == 0);
+  assert(samples[0].pod_uid == NULL);
 
   // max_count caps collection even when more containers qualify.
   fixture_response =
@@ -337,7 +343,6 @@ static void test_stats(kubelet_source_t *source) {
   count = 0;
   assert(collect_from_node(source, "node-a", limited, &count, 1) == 0);
   assert(count == 1);
-  pressured_memory_sample_free(&limited[0]);
 
   // A pod with null containers is skipped, a negative working set is skipped,
   // and the next qualifying container is still collected.
@@ -353,7 +358,6 @@ static void test_stats(kubelet_source_t *source) {
   assert(count == 1);
   assert(strcmp(edge[0].container_name, "float") == 0);
   assert(edge[0].usage_bytes == 7);
-  pressured_memory_sample_free(&edge[0]);
 }
 
 static void test_pod_limits(kubelet_source_t *source) {
@@ -591,7 +595,6 @@ static void test_pod_status_oom(kubelet_source_t *source) {
   assert(samples[0].oom_kill_count == 1);
   assert(samples[0].usage_bytes == 0);
   assert(samples[0].limit_bytes == 1048576);
-  pressured_memory_sample_free(&samples[0]);
 
   // The same UID and restart count is deduplicated.
   memset(samples, 0, sizeof(samples));
@@ -605,7 +608,6 @@ static void test_pod_status_oom(kubelet_source_t *source) {
   count = 0;
   assert(collect_oom_from_pod_status(source, samples, &count, 4) == 1);
   assert(count == 1);
-  pressured_memory_sample_free(&samples[0]);
 
   // A string restartCount is not a number and counts as 0; the new UID is
   // still reported once.
@@ -615,7 +617,6 @@ static void test_pod_status_oom(kubelet_source_t *source) {
   assert(collect_oom_from_pod_status(source, samples, &count, 4) == 1);
   assert(count == 1);
   assert(is_event_seen(source, "7:uid-str:app:0"));
-  pressured_memory_sample_free(&samples[0]);
 
   // A null uid, a null container name and a null reason are each treated as
   // missing, so only the well-formed pod produces a sample.
@@ -642,7 +643,6 @@ static void test_pod_status_oom(kubelet_source_t *source) {
   assert(count == 1);
   assert(source->seen_event_count == seen + 1);
   assert(strcmp(samples[0].container_name, "app") == 0);
-  pressured_memory_sample_free(&samples[0]);
 }
 
 static void test_timestamps(kubelet_source_t *source, bool pod_status) {
@@ -898,9 +898,6 @@ static void test_cycles(kubelet_source_t *source) {
         assert(strlen(events[i].sample.container_name) > 0);
       }
     }
-
-    for (int i = 0; i < count; i++)
-      pressured_memory_sample_free(&samples[i]);
   }
   route = NULL;
   event_generator_free(gen);

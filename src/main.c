@@ -273,14 +273,6 @@ int main(int argc, char *argv[]) {
       }
     }
 
-    // Free sample contents; the source owns the samples array and reuses it
-    // until the next collection or until the source is freed.
-    if (samples) {
-      for (int i = 0; i < sample_count; i++) {
-        pressured_memory_sample_free(&samples[i]);
-      }
-    }
-
     // Sleep until next poll
     usleep(config->poll_interval_ms * 1000);
   }

@@ -1,4 +1,5 @@
 #define _GNU_SOURCE // for strptime and timegm
+#include "arena.h"
 #include "fixed_buffer.h"
 #include "internal.h"
 #include "log.h"
@@ -66,6 +67,9 @@ struct kubelet_source {
   // Reused per-cycle samples buffer (owned by the source)
   pressured_memory_sample_t *samples;
   int sample_count; // Entries written by the previous collect
+
+  // Strings and annotations handed to this cycle's samples
+  arena_t cycle;
 
   // OOM event tracking (to deduplicate K8s events)
   oom_event_seen_t seen_events[MAX_OOM_EVENTS];
@@ -240,6 +244,7 @@ void kubelet_source_free(kubelet_source_t *source) {
     }
     free(source->pod_limits);
     free(source->samples);
+    arena_free(&source->cycle);
     for (int i = 0; i < source->seen_event_count; i++)
       free(source->seen_events[i].uid);
     if (source->curl)
@@ -772,13 +777,20 @@ static int collect_from_node(kubelet_source_t *source, const char *node_name,
         continue;
 
       pressured_memory_sample_t *sample = &samples[*count];
-      sample->namespace = strdup(ns);
-      sample->pod_name = strdup(pod_name);
-      sample->container_name = strdup(container_name);
-      sample->node_name = strdup(node_name);
-      sample->pod_ip = pod_info->pod_ip[0] ? strdup(pod_info->pod_ip) : NULL;
-      sample->annotations =
-          copy_annotations(pod_info->annotations, pod_info->annotations_count);
+      const char *sampled_namespace = arena_strdup(&source->cycle, ns);
+      const char *sampled_pod = arena_strdup(&source->cycle, pod_name);
+      const char *sampled_container =
+          arena_strdup(&source->cycle, container_name);
+      if (!sampled_namespace || !sampled_pod || !sampled_container)
+        continue;
+      sample->namespace = sampled_namespace;
+      sample->pod_name = sampled_pod;
+      sample->container_name = sampled_container;
+      sample->node_name = arena_strdup(&source->cycle, node_name);
+      sample->pod_ip = pod_info->pod_ip[0]
+                           ? arena_strdup(&source->cycle, pod_info->pod_ip)
+                           : NULL;
+      sample->annotations = pod_info->annotations;
       sample->annotations_count = pod_info->annotations_count;
       sample->usage_bytes = usage;
       sample->limit_bytes = pod_info->limit_bytes;
@@ -1022,13 +1034,20 @@ static int collect_oom_events(kubelet_source_t *source,
     // events The oom_kill_count field will trigger OOM_KILLED event in
     // event_generator
     pressured_memory_sample_t *sample = &samples[*count];
-    sample->namespace = strdup(ns);
-    sample->pod_name = strdup(pod_name);
-    sample->container_name = strdup(container_name);
+    const char *sampled_namespace = arena_strdup(&source->cycle, ns);
+    const char *sampled_pod = arena_strdup(&source->cycle, pod_name);
+    const char *sampled_container =
+        arena_strdup(&source->cycle, container_name);
+    if (!sampled_namespace || !sampled_pod || !sampled_container)
+      continue;
+    sample->namespace = sampled_namespace;
+    sample->pod_name = sampled_pod;
+    sample->container_name = sampled_container;
     sample->node_name = NULL;
-    sample->pod_ip = pod_info->pod_ip[0] ? strdup(pod_info->pod_ip) : NULL;
-    sample->annotations =
-        copy_annotations(pod_info->annotations, pod_info->annotations_count);
+    sample->pod_ip = pod_info->pod_ip[0]
+                         ? arena_strdup(&source->cycle, pod_info->pod_ip)
+                         : NULL;
+    sample->annotations = pod_info->annotations;
     sample->annotations_count = pod_info->annotations_count;
     // Use zero usage to avoid triggering memory_pressure events
     // The OOM_KILLED event only checks oom_kill_count, not usage values
@@ -1201,13 +1220,21 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
       // Create OOM-only sample with zero usage to avoid false memory_pressure
       // events
       pressured_memory_sample_t *sample = &samples[*count];
-      sample->namespace = strdup(ns);
-      sample->pod_name = strdup(pod_name);
-      sample->container_name = strdup(container_name);
-      sample->node_name = node_name ? strdup(node_name) : NULL;
-      sample->pod_ip = pod_info->pod_ip[0] ? strdup(pod_info->pod_ip) : NULL;
-      sample->annotations =
-          copy_annotations(pod_info->annotations, pod_info->annotations_count);
+      const char *sampled_namespace = arena_strdup(&source->cycle, ns);
+      const char *sampled_pod = arena_strdup(&source->cycle, pod_name);
+      const char *sampled_container =
+          arena_strdup(&source->cycle, container_name);
+      if (!sampled_namespace || !sampled_pod || !sampled_container)
+        continue;
+      sample->namespace = sampled_namespace;
+      sample->pod_name = sampled_pod;
+      sample->container_name = sampled_container;
+      sample->node_name =
+          node_name ? arena_strdup(&source->cycle, node_name) : NULL;
+      sample->pod_ip = pod_info->pod_ip[0]
+                           ? arena_strdup(&source->cycle, pod_info->pod_ip)
+                           : NULL;
+      sample->annotations = pod_info->annotations;
       sample->annotations_count = pod_info->annotations_count;
       // Use zero usage to avoid triggering memory_pressure events
       sample->usage_bytes = 0;
@@ -1232,6 +1259,7 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
 
 pressured_memory_sample_t *kubelet_collect(kubelet_source_t *source,
                                            int *count) {
+  arena_reset(&source->cycle);
   *count = 0;
   source->collection_healthy = false;
 

@@ -13,6 +13,7 @@
  * 3. /proc/self/cgroup parsing (for containerized deployments)
  */
 
+#include "arena.h"
 #include "fixed_buffer.h"
 #include "internal.h"
 #include "log.h"
@@ -46,6 +47,7 @@ struct cgroup_source {
   bool collection_healthy;
   pressured_memory_sample_t *samples; // Reused per-cycle buffer (owned here)
   int sample_count;                   // Entries written by the previous collect
+  arena_t cycle;                      // Strings handed to this cycle's samples
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -703,6 +705,7 @@ cgroup_source_t *cgroup_source_new(const char *cgroup_path) {
 
 void cgroup_source_free(cgroup_source_t *source) {
   if (source) {
+    arena_free(&source->cycle);
     free(source->samples);
     free(source);
   }
@@ -716,7 +719,7 @@ void cgroup_source_free(cgroup_source_t *source) {
 static int find_container_cgroups(const char *base_path,
                                   cgroup_version_t version,
                                   pressured_memory_sample_t *samples,
-                                  int *count, int max_count,
+                                  arena_t *arena, int *count, int max_count,
                                   bool *memory_read) {
   DIR *dir = opendir(base_path);
   if (!dir) {
@@ -752,8 +755,8 @@ static int find_container_cgroups(const char *base_path,
 
         // Skip containers without limits
         if (limit == UINT64_MAX || limit == 0) {
-          if (find_container_cgroups(path, version, samples, count, max_count,
-                                     memory_read) == -2) {
+          if (find_container_cgroups(path, version, samples, arena, count,
+                                     max_count, memory_read) == -2) {
             closedir(dir);
             return -2;
           }
@@ -763,11 +766,11 @@ static int find_container_cgroups(const char *base_path,
         char *ns = NULL, *pod = NULL, *container = NULL;
         if (cgroup_parse_container_info(path, &ns, &pod, &container) == 0) {
           pressured_memory_sample_t *sample = &samples[*count];
-          sample->namespace = ns;
-          sample->pod_name = pod;
+          sample->namespace = arena_strdup(arena, ns);
+          sample->pod_name = arena_strdup(arena, pod);
           sample->pod_uid = NULL; // Not available in cluster mode scan
-          sample->container_name = container;
-          sample->node_name = strdup("localhost");
+          sample->container_name = arena_strdup(arena, container);
+          sample->node_name = "localhost";
           sample->usage_bytes = usage;
           sample->limit_bytes = limit;
           sample->usage_percent = (double)usage / (double)limit;
@@ -779,11 +782,14 @@ static int find_container_cgroups(const char *base_path,
 
           (*count)++;
         }
+        free(ns);
+        free(pod);
+        free(container);
       }
     }
 
     // Recurse into subdirectories
-    if (find_container_cgroups(path, version, samples, count, max_count,
+    if (find_container_cgroups(path, version, samples, arena, count, max_count,
                                memory_read) == -2) {
       closedir(dir);
       return -2;
@@ -795,6 +801,7 @@ static int find_container_cgroups(const char *base_path,
 }
 
 pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count) {
+  arena_reset(&source->cycle);
   *count = 0;
   source->collection_healthy = false;
 
@@ -837,7 +844,6 @@ pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count) {
             free(pod);
             free(pod_container);
             source->sample_count = *count;
-            cgroup_samples_free(samples, *count);
             *count = 0;
             source->collection_healthy = false;
             return NULL;
@@ -858,20 +864,21 @@ pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count) {
 
           // Extract container ID from the directory name
           char *container_id = NULL;
-          char *container = NULL;
           cgroup_parse_container_info(container_path, NULL, NULL,
                                       &container_id);
-          container = container_id ? container_id : strdup(entry->d_name);
+          const char *container = container_id ? container_id : entry->d_name;
 
           pressured_memory_sample_t *sample = &samples[*count];
-          sample->namespace = ns ? strdup(ns) : strdup("default");
-          sample->pod_name = pod ? strdup(pod) : strdup("unknown");
+          sample->namespace = ns ? arena_strdup(&source->cycle, ns) : "default";
+          sample->pod_name =
+              pod ? arena_strdup(&source->cycle, pod) : "unknown";
           // Get pod_uid from environment variable
           const char *env_pod_uid = getenv("POD_UID");
-          sample->pod_uid =
-              env_pod_uid && env_pod_uid[0] ? strdup(env_pod_uid) : NULL;
-          sample->container_name = container;
-          sample->node_name = strdup("localhost");
+          sample->pod_uid = env_pod_uid && env_pod_uid[0]
+                                ? arena_strdup(&source->cycle, env_pod_uid)
+                                : NULL;
+          sample->container_name = arena_strdup(&source->cycle, container);
+          sample->node_name = "localhost";
           sample->usage_bytes = usage;
           sample->limit_bytes = limit;
           sample->usage_percent = (double)usage / (double)limit;
@@ -886,6 +893,7 @@ pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count) {
               container, sample->usage_percent * 100.0, usage, limit,
               sample->oom_kill_count);
 
+          free(container_id);
           (*count)++;
         }
       }
@@ -909,14 +917,17 @@ pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count) {
                                     &pod_container);
 
         pressured_memory_sample_t *sample = &samples[0];
-        sample->namespace = ns ? ns : strdup("default");
-        sample->pod_name = pod ? pod : strdup("unknown");
+        sample->namespace = ns ? arena_strdup(&source->cycle, ns) : "default";
+        sample->pod_name = pod ? arena_strdup(&source->cycle, pod) : "unknown";
         // Get pod_uid from environment variable
         const char *env_pod_uid = getenv("POD_UID");
-        sample->pod_uid =
-            env_pod_uid && env_pod_uid[0] ? strdup(env_pod_uid) : NULL;
-        sample->container_name = pod_container ? pod_container : strdup("main");
-        sample->node_name = strdup("localhost");
+        sample->pod_uid = env_pod_uid && env_pod_uid[0]
+                              ? arena_strdup(&source->cycle, env_pod_uid)
+                              : NULL;
+        sample->container_name =
+            pod_container ? arena_strdup(&source->cycle, pod_container)
+                          : "main";
+        sample->node_name = "localhost";
         sample->usage_bytes = usage;
         sample->limit_bytes = limit;
         sample->usage_percent = (double)usage / (double)limit;
@@ -930,17 +941,19 @@ pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count) {
                   sample->oom_kill_count);
 
         *count = 1;
+        free(ns);
+        free(pod);
+        free(pod_container);
       }
     }
   } else {
     // Cluster mode: scan all kubepods
     bool memory_read = false;
-    int result =
-        find_container_cgroups(source->base_path, source->version, samples,
-                               count, MAX_CONTAINERS, &memory_read);
+    int result = find_container_cgroups(source->base_path, source->version,
+                                        samples, &source->cycle, count,
+                                        MAX_CONTAINERS, &memory_read);
     if (result == -2) {
       source->sample_count = *count;
-      cgroup_samples_free(samples, *count);
       *count = 0;
       return NULL;
     }
@@ -954,16 +967,6 @@ pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count) {
 
 bool cgroup_collect_healthy(const cgroup_source_t *source) {
   return source && source->collection_healthy;
-}
-
-// Free the contents of each sample. The samples array itself is owned by the
-// cgroup source (see cgroup_source_free) and must not be freed here.
-void cgroup_samples_free(pressured_memory_sample_t *samples, int count) {
-  if (samples) {
-    for (int i = 0; i < count; i++) {
-      pressured_memory_sample_free(&samples[i]);
-    }
-  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

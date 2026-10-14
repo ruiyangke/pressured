@@ -348,9 +348,24 @@ TEST(collect_samples) {
 
   // Should find at least the container
   printf("(found %d samples) ", count);
-  if (samples) {
-    cgroup_samples_free(samples, count);
+  assert(samples != NULL);
+  if (count > 0) {
+    // Sample strings live in the source's cycle arena and stay readable.
+    assert(samples[0].namespace != NULL && samples[0].namespace[0] != '\0');
+    assert(samples[0].pod_name != NULL && samples[0].pod_name[0] != '\0');
+    assert(samples[0].container_name != NULL &&
+           samples[0].container_name[0] != '\0');
+    assert(samples[0].node_name != NULL &&
+           strcmp(samples[0].node_name, "localhost") == 0);
   }
+
+  // A second collect resets the cycle and must still work; the first cycle's
+  // samples are not used after this.
+  int second_count = 0;
+  pressured_memory_sample_t *second = cgroup_collect(source, &second_count);
+  assert(second != NULL);
+  if (second_count > 0)
+    assert(second[0].namespace != NULL && second[0].namespace[0] != '\0');
 
   cgroup_source_free(source);
 }

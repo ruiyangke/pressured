@@ -30,15 +30,12 @@ typedef struct cgroup_source cgroup_source_t;
 cgroup_source_t *cgroup_source_new(const char *base_path);
 void cgroup_source_free(cgroup_source_t *source);
 // Ownership: the returned array is owned by the source and reused by the next
-// cgroup_collect() call. The caller must free each sample's contents with
-// pressured_memory_sample_free() before the next collect, and must never free
-// the array itself.
+// cgroup_collect() call. The samples' strings and annotations are owned by the
+// source and stay valid until its next collect call or until it is freed; the
+// caller never frees anything in a sample, and must never free the array.
 pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count);
 // True when the cgroup root was readable and memory usage was read.
 bool cgroup_collect_healthy(const cgroup_source_t *source);
-// Frees the samples' contents only. The array itself is owned by the source
-// and must not be freed here.
-void cgroup_samples_free(pressured_memory_sample_t *samples, int count);
 
 // Memory reading functions (support both v1 and v2)
 uint64_t cgroup_read_memory_current(const char *path);
@@ -62,9 +59,9 @@ kubelet_source_t *kubelet_source_new(void);
 void kubelet_source_free(kubelet_source_t *source);
 int kubelet_source_init(kubelet_source_t *source);
 // Ownership: the returned array is owned by the source and reused by the next
-// kubelet_collect() call. The caller must free each sample's contents with
-// pressured_memory_sample_free() before the next collect, and must never free
-// the array itself.
+// kubelet_collect() call. The samples' strings and annotations are owned by the
+// source and stay valid until its next collect call or until it is freed; the
+// caller never frees anything in a sample, and must never free the array.
 pressured_memory_sample_t *kubelet_collect(kubelet_source_t *source,
                                            int *count);
 // True only when node/pod discovery and at least one node stats request

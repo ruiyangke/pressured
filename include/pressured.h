@@ -27,16 +27,20 @@ typedef struct {
   char *value;
 } pressured_annotation_t;
 
-// Memory sample from cgroup
+// Memory sample from cgroup. The strings and annotations point into storage
+// owned by the source that produced the sample: they stay valid until that
+// source's next collect call or until the source is freed. The caller never
+// frees anything in a sample. NULL means the field is absent.
 typedef struct {
-  char *namespace;
-  char *pod_name;
-  char *pod_uid;
-  char *container_name;
-  char *node_name;
-  char *pod_ip;
-  pressured_annotation_t *annotations; // Pod annotations array (NULL if none)
-  int annotations_count;               // Number of annotations
+  const char *namespace;
+  const char *pod_name;
+  const char *pod_uid;
+  const char *container_name;
+  const char *node_name;
+  const char *pod_ip;
+  const pressured_annotation_t
+      *annotations;      // Pod annotations array (NULL if none)
+  int annotations_count; // Number of annotations
   uint64_t usage_bytes;
   uint64_t limit_bytes;
   double usage_percent;
@@ -87,8 +91,6 @@ pressured_config_t *pressured_config_load(const char *path);
 char *pressured_config_load_json(
     const char *path); // Returns raw JSON, caller must free
 void pressured_config_free(pressured_config_t *config);
-
-void pressured_memory_sample_free(pressured_memory_sample_t *sample);
 
 const char *pressured_severity_str(pressured_severity_t severity);
 const char *pressured_event_type_str(pressured_event_type_t event_type);
