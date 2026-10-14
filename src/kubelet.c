@@ -14,6 +14,12 @@
 #define MAX_TOKEN 8192
 #define MAX_OOM_EVENTS 256
 
+#define SA_TOKEN_PATH "/var/run/secrets/kubernetes.io/serviceaccount/token"
+#define SA_CA_CERT_PATH "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+// The kubelet rotates the projected service account token file before the
+// token expires, so it must be re-read periodically (client-go uses 1 min).
+#define TOKEN_RELOAD_INTERVAL_SEC 60
+
 // Pod limit cache entry
 typedef struct {
   char key[512]; // namespace/pod/container
@@ -40,6 +46,8 @@ struct kubelet_source {
   // Kubernetes API config
   char *api_server;
   char *token;
+  char *token_path;       // NULL in proxy mode
+  time_t token_loaded_at; // monotonic seconds of last token read
   char *ca_cert_path;
 
   // Node discovery
@@ -113,6 +121,35 @@ static char *read_file(const char *path) {
   return buf;
 }
 
+static time_t monotonic_seconds(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec;
+}
+
+// Re-read the service account token, keeping the previous one on failure
+static void reload_token(kubelet_source_t *source) {
+  source->token_loaded_at = monotonic_seconds();
+
+  char *token = read_file(source->token_path);
+  if (!token || token[0] == '\0') {
+    log_warn("failed to read service account token from %s",
+             source->token_path);
+    free(token);
+    return;
+  }
+
+  if (source->token && strcmp(source->token, token) == 0) {
+    free(token);
+    return;
+  }
+
+  if (source->token)
+    log_info("service account token reloaded");
+  free(source->token);
+  source->token = token;
+}
+
 kubelet_source_t *kubelet_source_new(void) {
   kubelet_source_t *source = calloc(1, sizeof(kubelet_source_t));
   if (!source)
@@ -135,16 +172,16 @@ kubelet_source_t *kubelet_source_new(void) {
     char api_url[512];
     snprintf(api_url, sizeof(api_url), "https://%s:%s", k8s_host, k8s_port);
     source->api_server = strdup(api_url);
-    source->token =
-        read_file("/var/run/secrets/kubernetes.io/serviceaccount/token");
-    source->ca_cert_path =
-        strdup("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt");
+    source->token_path = strdup(SA_TOKEN_PATH);
+    reload_token(source);
+    source->ca_cert_path = strdup(SA_CA_CERT_PATH);
 
     log_info("kubelet source: in-cluster mode api=%s", source->api_server);
   } else {
     // Try kubectl proxy (localhost:8001)
     source->api_server = strdup("http://localhost:8001");
     source->token = NULL;
+    source->token_path = NULL;
     source->ca_cert_path = NULL;
 
     log_info("kubelet source: proxy mode api=%s", source->api_server);
@@ -175,6 +212,7 @@ void kubelet_source_free(kubelet_source_t *source) {
   if (source) {
     free(source->api_server);
     free(source->token);
+    free(source->token_path);
     free(source->ca_cert_path);
     free(source->namespace_filter);
     free(source->label_selector);
@@ -216,6 +254,10 @@ static char *api_request(kubelet_source_t *source, const char *path) {
   curl_easy_setopt(source->curl, CURLOPT_WRITEDATA, &buf);
   curl_easy_setopt(source->curl, CURLOPT_TIMEOUT, 10L);
 
+  if (source->token_path && monotonic_seconds() - source->token_loaded_at >=
+                                TOKEN_RELOAD_INTERVAL_SEC)
+    reload_token(source);
+
   if (source->token) {
     char auth_header[MAX_TOKEN + 32];
     snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s",
@@ -243,6 +285,9 @@ static char *api_request(kubelet_source_t *source, const char *path) {
   curl_easy_getinfo(source->curl, CURLINFO_RESPONSE_CODE, &http_code);
   if (http_code >= 400) {
     log_error("API request returned %ld: %s", http_code, path);
+    // Token may have been rotated since the last reload; pick it up now
+    if (http_code == 401 && source->token_path)
+      reload_token(source);
     free(buf.data);
     return NULL;
   }
