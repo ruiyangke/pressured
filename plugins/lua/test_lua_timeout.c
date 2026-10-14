@@ -5,7 +5,6 @@
 #include <arpa/inet.h>
 #include <assert.h>
 #include <dirent.h>
-#include <json-c/json.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -158,6 +157,29 @@ static void clean_dir(const char *path) {
   assert(rmdir(path) == 0);
 }
 
+// Append `value` to `buf` at *off as the body of a JSON string (no surrounding
+// quotes), escaping '"', '\\' and bytes below 0x20 as \u00XX. The caller must
+// leave enough room: `size` bounds every write.
+static void json_escape(char *buf, size_t size, size_t *off,
+                        const char *value) {
+  for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+    char piece[8];
+    if (*p == '"' || *p == '\\') {
+      piece[0] = '\\';
+      piece[1] = (char)*p;
+      piece[2] = '\0';
+    } else if (*p < 0x20) {
+      snprintf(piece, sizeof(piece), "\\u%04x", *p);
+    } else {
+      piece[0] = (char)*p;
+      piece[1] = '\0';
+    }
+    int n = snprintf(buf + *off, size - *off, "%s", piece);
+    assert(n > 0 && (size_t)n < size - *off);
+    *off += (size_t)n;
+  }
+}
+
 int main(int argc, char **argv) {
   assert(argc == 2);
   alarm(3);
@@ -267,6 +289,11 @@ int main(int argc, char **argv) {
         "assert(type(cfg.empty_obj)=='table' and next(cfg.empty_obj)==nil); "
         "assert(type(cfg.empty_arr)=='table' and #cfg.empty_arr==0); "
         "assert(type(cfg.unicode)=='string' and cfg.unicode=='\\xc3\\xa9'); "
+        "assert(type(cfg.huge)=='number' and math.type(cfg.huge)=='integer' "
+        "and cfg.huge==math.maxinteger); "
+        "assert(type(cfg.nul)=='string' and #cfg.nul==3); "
+        "assert(cfg.dup==2); "
+        "local d=cfg.deep; for i=1,60 do d=d.d end; assert(d==1); "
         "log.info('CONFIG_TYPES_OK'); "
         "function on_event(e,c) return 'ok' end");
   } else if (load_timeout) {
@@ -353,45 +380,42 @@ int main(int argc, char **argv) {
              server.port, call);
   }
 
-  struct json_object *root = json_object_new_object();
-  struct json_object *plugins = json_object_new_object();
-  struct json_object *lua = json_object_new_object();
-  json_object_object_add(root, "plugins", plugins);
-  json_object_object_add(plugins, "lua", lua);
-  // timeout_ms 0 disables the limit
-  json_object_object_add(
-      lua, "timeout_ms",
-      json_object_new_int(strcmp(test, "unlimited") == 0 ? 0 : 200));
-  json_object_object_add(lua, key, json_object_new_string(value));
+  char config[16384];
+  size_t off = 0;
+  off += (size_t)snprintf(config + off, sizeof(config) - off,
+                          "{\"plugins\":{\"lua\":{\"timeout_ms\":%d,\"%s\":\"",
+                          strcmp(test, "unlimited") == 0 ? 0 : 200, key);
+  json_escape(config, sizeof(config), &off, value);
+  off += (size_t)snprintf(config + off, sizeof(config) - off, "\"");
   if (strcmp(test, "config_types") == 0) {
-    json_object_object_add(lua, "int", json_object_new_int(42));
-    json_object_object_add(lua, "big",
-                           json_object_new_int64(9007199254740993LL));
-    json_object_object_add(lua, "float", json_object_new_double(1.5));
-    json_object_object_add(lua, "float_zero", json_object_new_double(2.0));
-    json_object_object_add(lua, "bool_true", json_object_new_boolean(1));
-    json_object_object_add(lua, "bool_false", json_object_new_boolean(0));
-    json_object_object_add(lua, "null_val", NULL);
-    struct json_object *nested = json_object_new_object();
-    json_object_object_add(nested, "inner", json_object_new_string("x"));
-    json_object_object_add(nested, "num", json_object_new_int(7));
-    json_object_object_add(lua, "nested", nested);
-    struct json_object *mixed = json_object_new_array();
-    json_object_array_add(mixed, json_object_new_int(1));
-    json_object_array_add(mixed, json_object_new_double(2.5));
-    json_object_array_add(mixed, json_object_new_string("three"));
-    json_object_array_add(mixed, json_object_new_boolean(1));
-    json_object_object_add(lua, "mixed", mixed);
-    json_object_object_add(lua, "empty_obj", json_object_new_object());
-    json_object_object_add(lua, "empty_arr", json_object_new_array());
-    json_object_object_add(lua, "unicode", json_object_new_string("\xc3\xa9"));
+    // Hand-written syntax: a comment and a trailing comma inside plugins.lua.
+    off += (size_t)snprintf(config + off, sizeof(config) - off,
+                            ",\"int\":42,\"big\":9007199254740993,"
+                            "\"float\":1.5,\"float_zero\":2.0,"
+                            "\"bool_true\":true,\"bool_false\":false,"
+                            "\"null_val\":null,"
+                            "\"nested\":{\"inner\":\"x\",\"num\":7},"
+                            "\"mixed\":[1,2.5,\"three\",true],"
+                            "\"empty_obj\":{},\"empty_arr\":[],"
+                            "\"unicode\":\"\\u00e9\","
+                            "/* comment */"
+                            "\"huge\":18446744073709551615,"
+                            "\"nul\":\"a\\u0000b\","
+                            "\"dup\":1,\"dup\":2,"
+                            "\"deep\":");
+    for (int i = 0; i < 60; i++)
+      off += (size_t)snprintf(config + off, sizeof(config) - off, "{\"d\":");
+    off += (size_t)snprintf(config + off, sizeof(config) - off, "1");
+    for (int i = 0; i < 60; i++)
+      off += (size_t)snprintf(config + off, sizeof(config) - off, "}");
+    off += (size_t)snprintf(config + off, sizeof(config) - off, ",");
   }
+  off += (size_t)snprintf(config + off, sizeof(config) - off, "}}}");
   service_registry_t *sr = service_registry_new();
   assert(sr);
   plugin_manager_t *pm = plugin_manager_new(sr);
   assert(pm);
-  assert(plugin_manager_load(pm, "./plugins/lua.so",
-                             json_object_to_json_string(root)) == 0);
+  assert(plugin_manager_load(pm, "./plugins/lua.so", config) == 0);
   double start = now_ms();
   service_registry_init_all(sr);
   service_ref_t ref = service_registry_acquire(sr, "action");
@@ -430,7 +454,6 @@ int main(int argc, char **argv) {
     assert(strstr(server.recorded, "X-H64: v"));
   service_registry_free(sr);
   plugin_manager_free(pm);
-  json_object_put(root);
   fflush(stderr);
   assert(dup2(saved_stderr, STDERR_FILENO) >= 0);
   close(saved_stderr);

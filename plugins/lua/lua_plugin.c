@@ -18,11 +18,11 @@
 #include "bindings.h"
 #include "fixed_buffer.h"
 #include "log.h"
+#include "pjson.h"
 #include "plugin.h"
 #include "pressured.h"
 #include "service_registry.h"
 #include <dirent.h>
-#include <json-c/json.h>
 #include <lauxlib.h>
 #include <limits.h>
 #include <lua.h>
@@ -95,6 +95,22 @@ static int run_script(lua_State *L, const char *source, int is_file) {
   return status == LUA_OK ? budget_pcall(L, 0, 0) : status;
 }
 
+// Return the value of `key` in `obj` when it is present and a JSON `type`.
+// A missing key or a JSON null returns NULL so the caller keeps its default; a
+// key of any other type also returns NULL, after one warning naming it.
+static yyjson_val *lua_config_value(yyjson_val *obj, const char *key,
+                                    const char *type,
+                                    bool (*is_type)(const yyjson_val *)) {
+  yyjson_val *val = yyjson_obj_get(obj, key);
+  if (!val || yyjson_is_null(val))
+    return NULL;
+  if (!is_type(val)) {
+    log_warn("lua plugin: plugins.lua.%s must be a %s, ignoring it", key, type);
+    return NULL;
+  }
+  return val;
+}
+
 // Parse plugin config from plugins.lua section of full config JSON
 static int parse_plugin_config(pressured_plugin_ctx_t *ctx,
                                const char *config_json) {
@@ -103,40 +119,40 @@ static int parse_plugin_config(pressured_plugin_ctx_t *ctx,
   if (!config_json)
     return 0;
 
-  struct json_object *root = json_tokener_parse(config_json);
-  if (!root)
+  yyjson_doc *doc = pj_parse(config_json, strlen(config_json), PJ_READ_CONFIG,
+                             "lua plugin config");
+  if (!doc)
     return 0;
 
-  // Look for plugins.lua section
-  struct json_object *plugins, *lua_cfg;
-  if (json_object_object_get_ex(root, "plugins", &plugins) &&
-      json_object_object_get_ex(plugins, "lua", &lua_cfg)) {
+  // Look for plugins.lua section; a missing section leaves the defaults.
+  yyjson_val *lua_cfg = yyjson_obj_get(
+      yyjson_obj_get(yyjson_doc_get_root(doc), "plugins"), "lua");
 
-    struct json_object *val;
-    if (json_object_object_get_ex(lua_cfg, "script", &val)) {
-      if (buffer_copy(ctx->cfg.script, sizeof(ctx->cfg.script),
-                      json_object_get_string(val), "Lua script path") != 0) {
-        json_object_put(root);
-        return -1;
-      }
-    }
-    if (json_object_object_get_ex(lua_cfg, "scripts_dir", &val)) {
-      if (buffer_copy(ctx->cfg.scripts_dir, sizeof(ctx->cfg.scripts_dir),
-                      json_object_get_string(val),
-                      "Lua scripts_dir path") != 0) {
-        json_object_put(root);
-        return -1;
-      }
-    }
-    if (json_object_object_get_ex(lua_cfg, "inline_script", &val)) {
-      ctx->cfg.inline_script = strdup(json_object_get_string(val));
-    }
-    if (json_object_object_get_ex(lua_cfg, "timeout_ms", &val)) {
-      ctx->cfg.timeout_ms = json_object_get_int(val);
+  yyjson_val *val =
+      lua_config_value(lua_cfg, "script", "string", yyjson_is_str);
+  if (val) {
+    if (buffer_copy(ctx->cfg.script, sizeof(ctx->cfg.script),
+                    yyjson_get_str(val), "Lua script path") != 0) {
+      yyjson_doc_free(doc);
+      return -1;
     }
   }
+  val = lua_config_value(lua_cfg, "scripts_dir", "string", yyjson_is_str);
+  if (val) {
+    if (buffer_copy(ctx->cfg.scripts_dir, sizeof(ctx->cfg.scripts_dir),
+                    yyjson_get_str(val), "Lua scripts_dir path") != 0) {
+      yyjson_doc_free(doc);
+      return -1;
+    }
+  }
+  val = lua_config_value(lua_cfg, "inline_script", "string", yyjson_is_str);
+  if (val)
+    ctx->cfg.inline_script = strdup(yyjson_get_str(val));
+  val = lua_config_value(lua_cfg, "timeout_ms", "number", yyjson_is_num);
+  if (val)
+    pj_int(val, &ctx->cfg.timeout_ms);
 
-  json_object_put(root);
+  yyjson_doc_free(doc);
   return 0;
 }
 
@@ -257,45 +273,49 @@ typedef struct {
 // JSON to Lua conversion
 // ─────────────────────────────────────────────────────────────────────────────
 
-static void json_to_lua(lua_State *L, struct json_object *obj) {
-  if (!obj) {
+static void json_to_lua(lua_State *L, yyjson_val *v) {
+  if (!v || yyjson_is_null(v)) {
     lua_pushnil(L);
     return;
   }
 
-  switch (json_object_get_type(obj)) {
-  case json_type_null:
-    lua_pushnil(L);
+  switch (yyjson_get_type(v)) {
+  case YYJSON_TYPE_BOOL:
+    lua_pushboolean(L, yyjson_get_bool(v));
     break;
-  case json_type_boolean:
-    lua_pushboolean(L, json_object_get_boolean(obj));
+  case YYJSON_TYPE_NUM:
+    if (yyjson_is_real(v)) {
+      lua_pushnumber(L, yyjson_get_real(v));
+    } else {
+      // pj_int64 clamps an unsigned value above INT64_MAX to math.maxinteger.
+      int64_t n = 0;
+      pj_int64(v, &n);
+      lua_pushinteger(L, n);
+    }
     break;
-  case json_type_int:
-    lua_pushinteger(L, json_object_get_int64(obj));
+  case YYJSON_TYPE_STR:
+    lua_pushlstring(L, yyjson_get_str(v), yyjson_get_len(v));
     break;
-  case json_type_double:
-    lua_pushnumber(L, json_object_get_double(obj));
-    break;
-  case json_type_string:
-    lua_pushstring(L, json_object_get_string(obj));
-    break;
-  case json_type_array: {
-    int len = json_object_array_length(obj);
-    lua_createtable(L, len, 0);
-    for (int i = 0; i < len; i++) {
-      json_to_lua(L, json_object_array_get_idx(obj, i));
-      lua_rawseti(L, -2, i + 1);
+  case YYJSON_TYPE_ARR: {
+    size_t idx, max;
+    yyjson_val *item;
+    lua_createtable(L, (int)yyjson_arr_size(v), 0);
+    yyjson_arr_foreach(v, idx, max, item) {
+      json_to_lua(L, item);
+      lua_rawseti(L, -2, (lua_Integer)idx + 1);
     }
     break;
   }
-  case json_type_object: {
+  case YYJSON_TYPE_OBJ: {
+    size_t idx, max;
+    yyjson_val *key, *val;
     lua_newtable(L);
-    struct json_object_iterator it = json_object_iter_begin(obj);
-    struct json_object_iterator end = json_object_iter_end(obj);
-    while (!json_object_iter_equal(&it, &end)) {
-      json_to_lua(L, json_object_iter_peek_value(&it));
-      lua_setfield(L, -2, json_object_iter_peek_name(&it));
-      json_object_iter_next(&it);
+    yyjson_obj_foreach(v, idx, max, key, val) {
+      // Push the key with its length so a NUL byte stays intact; a duplicate
+      // key overwrites the previous value.
+      lua_pushlstring(L, yyjson_get_str(key), yyjson_get_len(key));
+      json_to_lua(L, val);
+      lua_rawset(L, -3);
     }
     break;
   }
@@ -306,18 +326,22 @@ static void json_to_lua(lua_State *L, struct json_object *obj) {
 }
 
 static void register_config(lua_State *L, const char *config_json_str) {
-  if (config_json_str) {
-    struct json_object *root = json_tokener_parse(config_json_str);
-    if (root) {
-      json_to_lua(L, root);
-      json_object_put(root);
-    } else {
+  yyjson_doc *doc = config_json_str
+                        ? pj_parse(config_json_str, strlen(config_json_str),
+                                   PJ_READ_CONFIG, "lua plugin config")
+                        : NULL;
+  // The reader caps nesting at 64 levels; each level takes at most 3 slots.
+  if (!doc) {
+    if (config_json_str)
       log_warn("lua plugin: failed to parse config JSON");
-      lua_newtable(L);
-    }
-  } else {
     lua_newtable(L);
+  } else if (!lua_checkstack(L, 200)) {
+    log_warn("lua plugin: config nesting exceeds the Lua stack");
+    lua_newtable(L);
+  } else {
+    json_to_lua(L, yyjson_doc_get_root(doc));
   }
+  yyjson_doc_free(doc);
   lua_setglobal(L, "config");
 }
 
