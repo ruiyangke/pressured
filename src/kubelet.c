@@ -24,15 +24,26 @@
 // token expires, so it must be re-read periodically (client-go uses 1 min).
 #define TOKEN_RELOAD_INTERVAL_SEC 60
 
-// Pod limit cache entry
+// Pod limit cache entry. key, pod_ip and annotations live in the owning
+// generation's arena; the same annotations array is shared by every container
+// of the pod.
 typedef struct {
-  char key[512]; // namespace/pod/container
+  const char *key; // namespace/pod/container
   uint64_t limit_bytes;
-  char pod_ip[64];
-  pressured_annotation_t
-      *annotations;      // Pod annotations array (dynamically allocated)
-  int annotations_count; // Number of annotations
+  const char *pod_ip; // NULL when the pod has no IP
+  const pressured_annotation_t *annotations;
+  int annotations_count;
 } pod_limit_t;
+
+// One pod limit cache generation. Refreshes alternate between two of these:
+// the one being rebuilt is not referenced by the samples that still borrow the
+// other. entries grows with realloc and is kept across refreshes.
+typedef struct {
+  arena_t arena; // keys, pod IPs, annotation arrays and strings
+  pod_limit_t *entries;
+  int count;
+  int capacity;
+} pod_cache_t;
 
 // OOM event tracking (to avoid duplicate notifications)
 typedef struct {
@@ -59,10 +70,9 @@ struct kubelet_source {
   int node_count;
   bool collection_healthy;
 
-  // Pod limits cache
-  pod_limit_t *pod_limits;
-  int pod_limit_count;
-  int pod_limit_capacity;
+  // Pod limit cache, two alternating generations
+  pod_cache_t caches[2];
+  int cache_current;
 
   // Reused per-cycle samples buffer (owned by the source)
   pressured_memory_sample_t *samples;
@@ -165,18 +175,9 @@ kubelet_source_t *kubelet_source_new(void) {
   if (!source)
     return NULL;
 
-  // Initialize pod limits cache
-  source->pod_limit_capacity = 256;
-  source->pod_limits = calloc(source->pod_limit_capacity, sizeof(pod_limit_t));
-  if (!source->pod_limits) {
-    free(source);
-    return NULL;
-  }
-
   // Allocate the per-cycle samples buffer once; kubelet_collect() reuses it.
   source->samples = calloc(MAX_PODS, sizeof(pressured_memory_sample_t));
   if (!source->samples) {
-    free(source->pod_limits);
     free(source);
     return NULL;
   }
@@ -221,28 +222,15 @@ kubelet_source_t *kubelet_source_new(void) {
   return source;
 }
 
-// Helper to free annotations array
-static void free_annotations(pressured_annotation_t *annotations, int count) {
-  if (annotations) {
-    for (int i = 0; i < count; i++) {
-      free(annotations[i].key);
-      free(annotations[i].value);
-    }
-    free(annotations);
-  }
-}
-
 void kubelet_source_free(kubelet_source_t *source) {
   if (source) {
     free(source->api_server);
     free(source->namespace_filter);
     free(source->label_selector);
-    // Free annotations in cached entries before freeing the array
-    for (int i = 0; i < source->pod_limit_count; i++) {
-      free_annotations(source->pod_limits[i].annotations,
-                       source->pod_limits[i].annotations_count);
+    for (int i = 0; i < 2; i++) {
+      arena_free(&source->caches[i].arena);
+      free(source->caches[i].entries);
     }
-    free(source->pod_limits);
     free(source->samples);
     arena_free(&source->cycle);
     for (int i = 0; i < source->seen_event_count; i++)
@@ -420,9 +408,10 @@ static uint64_t parse_quantity(const char *str) {
   return (uint64_t)value;
 }
 
-// Helper to parse JSON annotations object into array
-static pressured_annotation_t *parse_annotations(yyjson_val *annotations_obj,
-                                                 int *count) {
+// Helper to parse JSON annotations object into an arena-backed array. The
+// caller stores the returned const array in every container entry of the pod.
+static const pressured_annotation_t *
+parse_annotations(arena_t *arena, yyjson_val *annotations_obj, int *count) {
   *count = 0;
   if (!yyjson_is_obj(annotations_obj))
     return NULL;
@@ -432,7 +421,7 @@ static pressured_annotation_t *parse_annotations(yyjson_val *annotations_obj,
     return NULL;
 
   pressured_annotation_t *annotations =
-      calloc(n, sizeof(pressured_annotation_t));
+      arena_alloc(arena, n * sizeof(pressured_annotation_t));
   if (!annotations) {
     *count = -1;
     return NULL;
@@ -444,10 +433,9 @@ static pressured_annotation_t *parse_annotations(yyjson_val *annotations_obj,
     const char *name = yyjson_get_str(key);
     const char *value = yyjson_get_str(val);
 
-    annotations[*count].key = strdup(name);
-    annotations[*count].value = value ? strdup(value) : strdup("");
+    annotations[*count].key = arena_strdup(arena, name);
+    annotations[*count].value = arena_strdup(arena, value ? value : "");
     if (!annotations[*count].key || !annotations[*count].value) {
-      free_annotations(annotations, *count + 1);
       *count = -1;
       return NULL;
     }
@@ -457,26 +445,18 @@ static pressured_annotation_t *parse_annotations(yyjson_val *annotations_obj,
   return annotations;
 }
 
-// Helper to copy annotations array
-static pressured_annotation_t *
-copy_annotations(const pressured_annotation_t *src, int count) {
-  if (!src || count == 0)
-    return NULL;
-
-  pressured_annotation_t *dst = calloc(count, sizeof(pressured_annotation_t));
-  if (!dst)
-    return NULL;
-
-  for (int i = 0; i < count; i++) {
-    dst[i].key = src[i].key ? strdup(src[i].key) : NULL;
-    dst[i].value = src[i].value ? strdup(src[i].value) : NULL;
-    if ((src[i].key && !dst[i].key) || (src[i].value && !dst[i].value)) {
-      free_annotations(dst, count);
-      return NULL;
-    }
-  }
-
-  return dst;
+// Make room for one more cache entry, starting at 256 and doubling after that.
+static int cache_grow(pod_cache_t *cache) {
+  if (cache->count < cache->capacity)
+    return 0;
+  int capacity = cache->capacity ? cache->capacity * 2 : 256;
+  pod_limit_t *entries =
+      realloc(cache->entries, (size_t)capacity * sizeof(pod_limit_t));
+  if (!entries)
+    return -1;
+  cache->entries = entries;
+  cache->capacity = capacity;
+  return 0;
 }
 
 static int kubelet_refresh_pod_limits(kubelet_source_t *source) {
@@ -524,16 +504,9 @@ static int kubelet_refresh_pod_limits(kubelet_source_t *source) {
     return -1;
   }
 
-  kubelet_source_t replacement = {0};
-  replacement.pod_limit_capacity = 256;
-  replacement.pod_limits =
-      calloc(replacement.pod_limit_capacity, sizeof(pod_limit_t));
-  if (!replacement.pod_limits) {
-    yyjson_doc_free(doc);
-    return -1;
-  }
-  kubelet_source_t *original = source;
-  source = &replacement;
+  pod_cache_t *cache = &source->caches[1 - source->cache_current];
+  arena_reset(&cache->arena);
+  cache->count = 0;
   {
     size_t pod_idx, pod_max;
     yyjson_val *pod;
@@ -557,15 +530,21 @@ static int kubelet_refresh_pod_limits(kubelet_source_t *source) {
       if (yyjson_arr_size(containers) == 0)
         continue;
 
-      // Parse pod annotations into array (only if we have containers to store
-      // them)
-      int pod_annotations_count = 0;
-      pressured_annotation_t *pod_annotations = parse_annotations(
-          yyjson_obj_get(metadata, "annotations"), &pod_annotations_count);
-      if (pod_annotations_count < 0)
+      // Parse the pod's annotations once; every container entry of this pod
+      // points at the same arena-backed array.
+      int annotations_count = 0;
+      const pressured_annotation_t *annotations = parse_annotations(
+          &cache->arena, yyjson_obj_get(metadata, "annotations"),
+          &annotations_count);
+      if (annotations_count < 0)
         goto failed;
 
-      int annotations_consumed = 0; // Track if first container took ownership
+      const char *cached_ip = NULL;
+      if (pod_ip && pod_ip[0]) {
+        cached_ip = arena_strdup(&cache->arena, pod_ip);
+        if (!cached_ip)
+          goto failed;
+      }
 
       size_t container_idx, container_max;
       yyjson_val *container;
@@ -580,75 +559,36 @@ static int kubelet_refresh_pod_limits(kubelet_source_t *source) {
         uint64_t limit =
             parse_quantity(yyjson_get_str(yyjson_obj_get(limits, "memory")));
 
-        // Add to cache
-        if (source->pod_limit_count >= source->pod_limit_capacity) {
-          int new_cap = source->pod_limit_capacity * 2;
-          pod_limit_t *new_limits =
-              realloc(source->pod_limits, new_cap * sizeof(pod_limit_t));
-          if (!new_limits) {
-            if (!annotations_consumed)
-              free_annotations(pod_annotations, pod_annotations_count);
-            goto failed;
-          }
-          source->pod_limits = new_limits;
-          source->pod_limit_capacity = new_cap;
-        }
-
-        pod_limit_t *pl = &source->pod_limits[source->pod_limit_count];
-        if (buffer_format(pl->key, sizeof(pl->key), "pod cache key", "%s/%s/%s",
-                          ns, pod_name, container_name) != 0) {
-          if (!annotations_consumed)
-            free_annotations(pod_annotations, pod_annotations_count);
+        if (cache_grow(cache) != 0)
           goto failed;
-        }
-        source->pod_limit_count++;
-        pl->limit_bytes = limit;
-        if (pod_ip) {
-          strncpy(pl->pod_ip, pod_ip, sizeof(pl->pod_ip) - 1);
-          pl->pod_ip[sizeof(pl->pod_ip) - 1] = '\0';
-        } else {
-          pl->pod_ip[0] = '\0';
-        }
-        // Store annotations (first successful container takes ownership, others
-        // copy)
-        if (!annotations_consumed) {
-          pl->annotations = pod_annotations;
-          pl->annotations_count = pod_annotations_count;
-          annotations_consumed = 1;
-        } else {
-          pl->annotations =
-              copy_annotations(pod_annotations, pod_annotations_count);
-          pl->annotations_count = pod_annotations_count;
-          if (pod_annotations_count > 0 && !pl->annotations)
-            goto failed;
-        }
-      }
 
-      // Free annotations if no container consumed them (all containers failed
-      // validation)
-      if (!annotations_consumed) {
-        free_annotations(pod_annotations, pod_annotations_count);
+        char key[512];
+        if (buffer_format(key, sizeof(key), "pod cache key", "%s/%s/%s", ns,
+                          pod_name, container_name) != 0)
+          goto failed;
+        const char *cached_key = arena_strdup(&cache->arena, key);
+        if (!cached_key)
+          goto failed;
+
+        pod_limit_t *pl = &cache->entries[cache->count++];
+        pl->key = cached_key;
+        pl->limit_bytes = limit;
+        pl->pod_ip = cached_ip;
+        pl->annotations = annotations;
+        pl->annotations_count = annotations_count;
       }
     }
   }
 
   yyjson_doc_free(doc);
-  for (int i = 0; i < original->pod_limit_count; i++)
-    free_annotations(original->pod_limits[i].annotations,
-                     original->pod_limits[i].annotations_count);
-  free(original->pod_limits);
-  original->pod_limits = replacement.pod_limits;
-  original->pod_limit_count = replacement.pod_limit_count;
-  original->pod_limit_capacity = replacement.pod_limit_capacity;
-  log_debug("cached limits for %d containers", original->pod_limit_count);
+  source->cache_current = 1 - source->cache_current;
+  log_debug("cached limits for %d containers", cache->count);
   return 0;
 
 failed:
+  // The half-built spare generation is left behind; the current one is still
+  // intact and all samples borrowing it stay valid.
   yyjson_doc_free(doc);
-  for (int i = 0; i < replacement.pod_limit_count; i++)
-    free_annotations(replacement.pod_limits[i].annotations,
-                     replacement.pod_limits[i].annotations_count);
-  free(replacement.pod_limits);
   return -1;
 }
 
@@ -662,7 +602,7 @@ int kubelet_source_init(kubelet_source_t *source) {
   }
 
   log_info("kubelet source initialized nodes=%d cached_limits=%d",
-           source->node_count, source->pod_limit_count);
+           source->node_count, source->caches[source->cache_current].count);
   return 0;
 }
 
@@ -673,9 +613,10 @@ static pod_limit_t *lookup_pod_info(kubelet_source_t *source, const char *ns,
                     container) != 0)
     return NULL;
 
-  for (int i = 0; i < source->pod_limit_count; i++) {
-    if (strcmp(source->pod_limits[i].key, key) == 0) {
-      return &source->pod_limits[i];
+  pod_cache_t *cache = &source->caches[source->cache_current];
+  for (int i = 0; i < cache->count; i++) {
+    if (strcmp(cache->entries[i].key, key) == 0) {
+      return &cache->entries[i];
     }
   }
 
@@ -787,9 +728,7 @@ static int collect_from_node(kubelet_source_t *source, const char *node_name,
       sample->pod_name = sampled_pod;
       sample->container_name = sampled_container;
       sample->node_name = arena_strdup(&source->cycle, node_name);
-      sample->pod_ip = pod_info->pod_ip[0]
-                           ? arena_strdup(&source->cycle, pod_info->pod_ip)
-                           : NULL;
+      sample->pod_ip = pod_info->pod_ip;
       sample->annotations = pod_info->annotations;
       sample->annotations_count = pod_info->annotations_count;
       sample->usage_bytes = usage;
@@ -1044,9 +983,7 @@ static int collect_oom_events(kubelet_source_t *source,
     sample->pod_name = sampled_pod;
     sample->container_name = sampled_container;
     sample->node_name = NULL;
-    sample->pod_ip = pod_info->pod_ip[0]
-                         ? arena_strdup(&source->cycle, pod_info->pod_ip)
-                         : NULL;
+    sample->pod_ip = pod_info->pod_ip;
     sample->annotations = pod_info->annotations;
     sample->annotations_count = pod_info->annotations_count;
     // Use zero usage to avoid triggering memory_pressure events
@@ -1231,9 +1168,7 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
       sample->container_name = sampled_container;
       sample->node_name =
           node_name ? arena_strdup(&source->cycle, node_name) : NULL;
-      sample->pod_ip = pod_info->pod_ip[0]
-                           ? arena_strdup(&source->cycle, pod_info->pod_ip)
-                           : NULL;
+      sample->pod_ip = pod_info->pod_ip;
       sample->annotations = pod_info->annotations;
       sample->annotations_count = pod_info->annotations_count;
       // Use zero usage to avoid triggering memory_pressure events

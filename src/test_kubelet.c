@@ -175,24 +175,64 @@ static void test_collection(void) {
 }
 
 static void test_cache(kubelet_source_t *source) {
-  fixture_response =
+  const char *pod_response =
       "{\"items\":[{\"metadata\":{\"namespace\":\"ns\",\"name\":\"pod\","
       "\"annotations\":{\"key\":\"value\"}},\"spec\":{\"containers\":["
       "{\"name\":\"app\",\"resources\":{\"limits\":{\"memory\":\"1Mi\"}}},"
       "{\"name\":\"sidecar\"}]}}]}";
+  fixture_response = pod_response;
   int result = kubelet_refresh_pod_limits(source);
   assert(result == 0);
+
+  // Every container of a pod shares the pod's one annotations array.
+  pod_limit_t *app = lookup_pod_info(source, "ns", "pod", "app");
+  pod_limit_t *sidecar = lookup_pod_info(source, "ns", "pod", "sidecar");
+  assert(app != NULL && sidecar != NULL);
+  assert(app->annotations == sidecar->annotations);
+  assert(app->annotations_count == 1);
+  assert(strcmp(app->annotations[0].value, "value") == 0);
+
+  // A failed refresh leaves the current generation and its lookups untouched.
+  int current = source->cache_current;
   const char *failures[] = {NULL, "garbage", "{}", "{\"items\":{}}"};
   for (size_t i = 0; i < sizeof(failures) / sizeof(failures[0]); i++) {
     fixture_response = failures[i];
     result = kubelet_refresh_pod_limits(source);
     assert(result == -1);
+    assert(source->cache_current == current);
     pod_limit_t *pod = lookup_pod_info(source, "ns", "pod", "app");
     assert(pod != NULL);
     assert(pod->limit_bytes == 1048576);
     assert(pod->annotations_count == 1);
     assert(strcmp(pod->annotations[0].value, "value") == 0);
   }
+
+  // Rebuilding the same response into alternating generations reuses each
+  // arena's chunks instead of growing it. A 4 KiB annotation makes a few
+  // refreshes outgrow one chunk if the spare generation were not reset.
+  char big_value[4097];
+  memset(big_value, 'v', sizeof(big_value) - 1);
+  big_value[sizeof(big_value) - 1] = '\0';
+  char big_response[8192];
+  snprintf(big_response, sizeof(big_response),
+           "{\"items\":[{\"metadata\":{\"namespace\":\"ns\",\"name\":"
+           "\"pod\",\"annotations\":{\"big\":\"%s\"}},\"spec\":{"
+           "\"containers\":[{\"name\":\"app\"}]}}]}",
+           big_value);
+  fixture_response = big_response;
+  result = kubelet_refresh_pod_limits(source);
+  assert(result == 0);
+  result = kubelet_refresh_pod_limits(source);
+  assert(result == 0);
+  const size_t capacities[2] = {arena_capacity(&source->caches[0].arena),
+                                arena_capacity(&source->caches[1].arena)};
+  for (int i = 0; i < 32; i++) {
+    result = kubelet_refresh_pod_limits(source);
+    assert(result == 0);
+  }
+  assert(arena_capacity(&source->caches[0].arena) == capacities[0]);
+  assert(arena_capacity(&source->caches[1].arena) == capacities[1]);
+
   fixture_response = "{\"items\":[]}";
   result = kubelet_refresh_pod_limits(source);
   assert(result == 0);
@@ -362,16 +402,20 @@ static void test_stats(kubelet_source_t *source) {
 
 static void test_pod_limits(kubelet_source_t *source) {
   // parse_annotations yields nothing for NULL or an empty object.
+  arena_t arena = {0};
   int annotation_count = 7;
-  pressured_annotation_t *parsed = parse_annotations(NULL, &annotation_count);
+  const pressured_annotation_t *parsed =
+      parse_annotations(&arena, NULL, &annotation_count);
   assert(parsed == NULL);
   assert(annotation_count == 0);
   yyjson_doc *empty = pj_parse("{}", strlen("{}"), PJ_READ_API, "test");
   assert(empty);
-  parsed = parse_annotations(yyjson_doc_get_root(empty), &annotation_count);
+  parsed =
+      parse_annotations(&arena, yyjson_doc_get_root(empty), &annotation_count);
   assert(parsed == NULL);
   assert(annotation_count == 0);
   yyjson_doc_free(empty);
+  arena_free(&arena);
 
   fixture_response =
       "{\"items\":["
@@ -426,7 +470,7 @@ static void test_pod_limits(kubelet_source_t *source) {
   assert(noip->limit_bytes == 2 * 1048576);
   assert(noip->annotations == NULL);
   assert(noip->annotations_count == 0);
-  assert(noip->pod_ip[0] == '\0');
+  assert(noip->pod_ip == NULL);
 
   // JSON null and wrong types behave as missing: a null namespace is skipped,
   // null/non-string annotations read as "", a null podIP is empty and a
@@ -444,13 +488,13 @@ static void test_pod_limits(kubelet_source_t *source) {
       "}]}";
   result = kubelet_refresh_pod_limits(source);
   assert(result == 0);
-  assert(source->pod_limit_count == 2);
+  assert(source->caches[source->cache_current].count == 2);
   assert(lookup_pod_info(source, "ns", "pod-nullns", "app") == NULL);
 
   pod_limit_t *nolimit = lookup_pod_info(source, "ns", "pod-odd", "nolimit");
   assert(nolimit != NULL);
   assert(nolimit->limit_bytes == UINT64_MAX);
-  assert(nolimit->pod_ip[0] == '\0');
+  assert(nolimit->pod_ip == NULL);
   assert(lookup_pod_info(source, "ns", "pod-odd", "numeric")->limit_bytes ==
          UINT64_MAX);
   assert(nolimit->annotations_count == 3);

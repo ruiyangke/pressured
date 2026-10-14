@@ -21,10 +21,11 @@ typedef enum {
   SEVERITY_CRITICAL = 2
 } pressured_severity_t;
 
-// Annotation key-value pair
+// Annotation key-value pair. The strings are owned by whoever handed out the
+// array (a source's cache arena); the reader never frees them.
 typedef struct {
-  char *key;
-  char *value;
+  const char *key;
+  const char *value;
 } pressured_annotation_t;
 
 // Memory sample from cgroup. The strings and annotations point into storage
