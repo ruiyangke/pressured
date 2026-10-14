@@ -1,14 +1,23 @@
 -- pprof_dump.lua - Stream pprof heap directly to storage
--- Uses http.stream + storage.open for true streaming (no full buffering)
+-- Uses http.stream + storage.open to stream profiles to storage. A copy of each
+-- profile up to PPROF_ATTACH_MAX_BYTES is also kept in memory for later
+-- handlers (chunks are merged as they arrive; peak is a small multiple of the
+-- profile size, and both profiles of an event stay in memory until the event
+-- is handled).
 --
 -- This script supports both sidecar and cluster modes:
 --   - Sidecar mode: connects to 127.0.0.1 (same pod)
 --   - Cluster mode: connects to pod_ip from event (requires pprof port exposed)
 --
--- Storage path format:
---   events/{event_type}/{timestamp}-{pod_name}-event.json
---   heaps/{event_type}/{timestamp}-{pod_name}-heap.pb.gz
---   goroutines/{event_type}/{timestamp}-{pod_name}-goroutine.txt
+-- Storage path format (Kubernetes names cannot contain "/"):
+--   events/{event_type}/{namespace}/{pod_name}/{timestamp}-{sequence}-{container_name}-event.json
+--   heaps/{event_type}/{namespace}/{pod_name}/{timestamp}-{sequence}-{container_name}-heap.pb.gz
+--   goroutines/{event_type}/{namespace}/{pod_name}/{timestamp}-{sequence}-{container_name}-goroutine.txt
+--
+-- Captured profiles are also added to event.dumps for handlers that run after
+-- this one (scripts run in filename order, so slack_notify.lua attaches them):
+--   { filename = "...", key = "<storage key>", data = "<bytes>" | nil }
+-- data is nil when the profile is larger than PPROF_ATTACH_MAX_BYTES.
 --
 -- Configuration (via pod annotations, environment variables, or defaults):
 --   Pod annotations (highest priority):
@@ -21,6 +30,8 @@
 --     PPROF_MODE - "sidecar" or "cluster" (default: cluster)
 --     PPROF_INTERVAL_SECONDS - capture an unchanged condition at most this
 --                              often per container (default: 3600, 0 = every event)
+--     PPROF_ATTACH_MAX_BYTES - largest profile kept in memory for later handlers
+--                              (default: 8388608, 0 = none)
 --
 -- Profiles are captured when severity rises above the last capture for that
 -- container, or when the condition is still ongoing after
@@ -35,6 +46,8 @@ local DEFAULT_PPROF_PORT = tonumber(ctx.getenv("PPROF_PORT")) or 8080
 local DEFAULT_PPROF_PATH = "/debug/pprof/heap"
 local PPROF_MODE = ctx.getenv("PPROF_MODE") or "cluster"
 local PPROF_INTERVAL_SECONDS = tonumber(ctx.getenv("PPROF_INTERVAL_SECONDS")) or 3600
+local PPROF_ATTACH_MAX_BYTES = tonumber(ctx.getenv("PPROF_ATTACH_MAX_BYTES")) or 8 * 1024 * 1024
+local capture_seq = 0
 
 local SEVERITY_RANK = {
     ok = 0,
@@ -117,8 +130,9 @@ local function get_pprof_config(event)
 end
 
 -- Stream HTTP response directly to storage using atomic writes
--- Writes to ${key}.part first, then renames on success
--- Returns: total_bytes, error
+-- Writes to ${key}.part first, then renames on success. Also keeps the bytes
+-- in memory while they fit in PPROF_ATTACH_MAX_BYTES.
+-- Returns: total_bytes, error, data (nil if too large)
 local function stream_to_storage(url, storage_key)
     local part_key = storage_key .. ".part"
     log.info(string.format("Opening storage for streaming: %s (via %s)", storage_key, part_key))
@@ -131,6 +145,7 @@ local function stream_to_storage(url, storage_key)
 
     local total_bytes = 0
     local stream_error = nil
+    local chunks = {}
 
     -- Stream HTTP response, writing chunks directly to storage
     log.info(string.format("Starting HTTP stream from: %s", url))
@@ -141,6 +156,17 @@ local function stream_to_storage(url, storage_key)
             return false  -- stop streaming
         end
         total_bytes = total_bytes + #chunk
+        if chunks and total_bytes <= PPROF_ATTACH_MAX_BYTES then
+            -- Merge while the newest piece is at least as large as the one
+            -- before it: pieces stay few and each byte is copied a few times
+            table.insert(chunks, chunk)
+            while #chunks > 1 and #chunks[#chunks] >= #chunks[#chunks - 1] do
+                local top = table.remove(chunks)
+                chunks[#chunks] = chunks[#chunks] .. top
+            end
+        else
+            chunks = nil
+        end
         log.debug(string.format("Streamed chunk: %d bytes (total: %d)", #chunk, total_bytes))
         return true  -- continue streaming
     end)
@@ -171,7 +197,7 @@ local function stream_to_storage(url, storage_key)
     end
 
     log.info(string.format("Renamed %s -> %s", part_key, storage_key))
-    return total_bytes, nil
+    return total_bytes, nil, chunks and table.concat(chunks) or nil
 end
 
 -- Determine pprof host based on mode and event
@@ -203,10 +229,18 @@ function on_event(event, ctx_arg)
     end
 
     local ts = tostring(os.time() * 1000)
+    -- os.time() has second resolution; the sequence keeps keys unique within a second
+    capture_seq = capture_seq + 1
+    local key_ts = string.format("%s-%d", ts, capture_seq)
     local event_type = event.event_type or "unknown"
+    -- Containers of one pod, or pods in different namespaces, can have events
+    -- in the same second
+    local key_path = string.format("%s/%s/%s-%s", event.namespace or "unknown", event.pod_name or "unknown", key_ts,
+        event.container_name or "unknown")
+    local file_prefix = string.format("%s-%s", event.pod_name or "unknown", event.container_name or "unknown")
 
     -- Upload event metadata (for both event types)
-    local meta_key = string.format("events/%s/%s-%s-event.json", event_type, ts, event.pod_name or "unknown")
+    local meta_key = string.format("events/%s/%s-event.json", event_type, key_path)
     local meta_data = string.format(
         '{"timestamp":"%s","event_type":"%s","namespace":"%s","pod":"%s","container":"%s","severity":"%s","usage_percent":%.2f,"usage_bytes":%d,"limit_bytes":%d,"oom_kill_count":%d,"pod_ip":"%s"}',
         ts, event_type, event.namespace or "", event.pod_name or "", event.container_name or "", event.severity or "",
@@ -249,27 +283,30 @@ function on_event(event, ctx_arg)
     -- For memory pressure events, capture pprof data
     log.info("[pprof] Streaming heap profile...")
     local heap_url = string.format("http://%s:%d%s", pprof_host, pprof_cfg.port, pprof_cfg.path)
-    local heap_key = string.format("heaps/%s/%s-%s-heap.pb.gz", event_type, ts, event.pod_name or "unknown")
+    local heap_key = string.format("heaps/%s/%s-heap.pb.gz", event_type, key_path)
 
-    local heap_bytes, heap_err = stream_to_storage(heap_url, heap_key)
+    local heap_bytes, heap_err, heap_data = stream_to_storage(heap_url, heap_key)
     if heap_err then
         log.error(string.format("[pprof] FAILED: Heap stream error: %s (got %d bytes)", heap_err, heap_bytes))
         return "heap_stream_error"
     end
     log.info(string.format("[pprof] SUCCESS: Streamed heap profile (%d bytes)", heap_bytes))
+    event.dumps = event.dumps or {}
+    table.insert(event.dumps, { filename = file_prefix .. "-heap.pb.gz", key = heap_key, data = heap_data })
 
     -- Stream goroutine profile (only for Go standard pprof path)
     -- If custom path is set, skip goroutine as it may not be available
     if pprof_cfg.path == DEFAULT_PPROF_PATH then
         log.info("[pprof] Streaming goroutine profile...")
         local goroutine_url = string.format("http://%s:%d/debug/pprof/goroutine?debug=2", pprof_host, pprof_cfg.port)
-        local goroutine_key = string.format("goroutines/%s/%s-%s-goroutine.txt", event_type, ts, event.pod_name or "unknown")
+        local goroutine_key = string.format("goroutines/%s/%s-goroutine.txt", event_type, key_path)
 
-        local goroutine_bytes, goroutine_err = stream_to_storage(goroutine_url, goroutine_key)
+        local goroutine_bytes, goroutine_err, goroutine_data = stream_to_storage(goroutine_url, goroutine_key)
         if goroutine_err then
             log.error(string.format("[pprof] FAILED: Goroutine stream error: %s (got %d bytes)", goroutine_err, goroutine_bytes))
         else
             log.info(string.format("[pprof] SUCCESS: Streamed goroutine profile (%d bytes)", goroutine_bytes))
+            table.insert(event.dumps, { filename = file_prefix .. "-goroutine.txt", key = goroutine_key, data = goroutine_data })
         end
     else
         log.info("[pprof] Skipping goroutine profile (custom pprof path set)")
