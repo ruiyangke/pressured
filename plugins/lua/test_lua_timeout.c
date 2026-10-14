@@ -241,6 +241,34 @@ int main(int argc, char **argv) {
                    "function on_event(e,c) assert(e.order==1); "
                    "return 'SECOND_OK' end");
     }
+  } else if (strcmp(test, "config_types") == 0) {
+    // Characterizes json_to_lua(): pins the Lua type each JSON value becomes.
+    // JSON null becomes nil, and empty arrays/objects both become empty tables.
+    snprintf(
+        code, sizeof(code),
+        "local cfg = config.plugins.lua; "
+        "assert(type(cfg.int)=='number' and math.type(cfg.int)=='integer' "
+        "and cfg.int==42); "
+        "assert(type(cfg.big)=='number' and math.type(cfg.big)=='integer' "
+        "and cfg.big==9007199254740993); "
+        "assert(type(cfg.float)=='number' and math.type(cfg.float)=='float' "
+        "and cfg.float==1.5); "
+        "assert(type(cfg.float_zero)=='number' "
+        "and math.type(cfg.float_zero)=='float' and cfg.float_zero==2.0); "
+        "assert(type(cfg.bool_true)=='boolean' and cfg.bool_true==true); "
+        "assert(type(cfg.bool_false)=='boolean' and cfg.bool_false==false); "
+        "assert(type(cfg.null_val)=='nil' and cfg.null_val==nil); "
+        "assert(type(cfg.nested)=='table' and cfg.nested.inner=='x' "
+        "and cfg.nested.num==7 and math.type(cfg.nested.num)=='integer'); "
+        "assert(type(cfg.mixed)=='table' and #cfg.mixed==4 "
+        "and cfg.mixed[1]==1 and math.type(cfg.mixed[1])=='integer' "
+        "and cfg.mixed[2]==2.5 and math.type(cfg.mixed[2])=='float' "
+        "and cfg.mixed[3]=='three' and cfg.mixed[4]==true); "
+        "assert(type(cfg.empty_obj)=='table' and next(cfg.empty_obj)==nil); "
+        "assert(type(cfg.empty_arr)=='table' and #cfg.empty_arr==0); "
+        "assert(type(cfg.unicode)=='string' and cfg.unicode=='\\xc3\\xa9'); "
+        "log.info('CONFIG_TYPES_OK'); "
+        "function on_event(e,c) return 'ok' end");
   } else if (load_timeout) {
     snprintf(code, sizeof(code), "while true do end");
     if (strcmp(test, "load_file") == 0) {
@@ -335,6 +363,29 @@ int main(int argc, char **argv) {
       lua, "timeout_ms",
       json_object_new_int(strcmp(test, "unlimited") == 0 ? 0 : 200));
   json_object_object_add(lua, key, json_object_new_string(value));
+  if (strcmp(test, "config_types") == 0) {
+    json_object_object_add(lua, "int", json_object_new_int(42));
+    json_object_object_add(lua, "big",
+                           json_object_new_int64(9007199254740993LL));
+    json_object_object_add(lua, "float", json_object_new_double(1.5));
+    json_object_object_add(lua, "float_zero", json_object_new_double(2.0));
+    json_object_object_add(lua, "bool_true", json_object_new_boolean(1));
+    json_object_object_add(lua, "bool_false", json_object_new_boolean(0));
+    json_object_object_add(lua, "null_val", NULL);
+    struct json_object *nested = json_object_new_object();
+    json_object_object_add(nested, "inner", json_object_new_string("x"));
+    json_object_object_add(nested, "num", json_object_new_int(7));
+    json_object_object_add(lua, "nested", nested);
+    struct json_object *mixed = json_object_new_array();
+    json_object_array_add(mixed, json_object_new_int(1));
+    json_object_array_add(mixed, json_object_new_double(2.5));
+    json_object_array_add(mixed, json_object_new_string("three"));
+    json_object_array_add(mixed, json_object_new_boolean(1));
+    json_object_object_add(lua, "mixed", mixed);
+    json_object_object_add(lua, "empty_obj", json_object_new_object());
+    json_object_object_add(lua, "empty_arr", json_object_new_array());
+    json_object_object_add(lua, "unicode", json_object_new_string("\xc3\xa9"));
+  }
   service_registry_t *sr = service_registry_new();
   assert(sr);
   plugin_manager_t *pm = plugin_manager_new(sr);
@@ -428,14 +479,15 @@ int main(int argc, char **argv) {
       assert(!strstr(output, "[dispatcher] ? error:"));
     }
   } else if (!load_timeout) {
-    const char *marker = strcmp(test, "unlimited") == 0  ? "UNLIMITED_OK"
-                         : strcmp(test, "order") == 0    ? "ORDER_OK"
-                         : strcmp(test, "fetch") == 0    ? "FETCH_OK"
-                         : strcmp(test, "headers") == 0  ? "HEADERS_OK"
-                         : strcmp(test, "download") == 0 ? "DOWNLOAD_OK"
-                         : strcmp(test, "stream") == 0   ? "STREAM_OK"
-                         : strcmp(test, "binary") == 0   ? "BINARY_OK"
-                                                         : "BINARY_STREAM_OK";
+    const char *marker = strcmp(test, "unlimited") == 0      ? "UNLIMITED_OK"
+                         : strcmp(test, "order") == 0        ? "ORDER_OK"
+                         : strcmp(test, "config_types") == 0 ? "CONFIG_TYPES_OK"
+                         : strcmp(test, "fetch") == 0        ? "FETCH_OK"
+                         : strcmp(test, "headers") == 0      ? "HEADERS_OK"
+                         : strcmp(test, "download") == 0     ? "DOWNLOAD_OK"
+                         : strcmp(test, "stream") == 0       ? "STREAM_OK"
+                         : strcmp(test, "binary") == 0       ? "BINARY_OK"
+                                                       : "BINARY_STREAM_OK";
     assert(strstr(output, marker));
   }
   clean_dir(dir);
