@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 // Path to built plugin
@@ -152,6 +153,82 @@ static void test_not_found(storage_t *s) {
   printf("OK\n");
 }
 
+// Load the plugin into a fresh registry and manager with `config` and return
+// the storage service. The caller owns *out_sr and *out_pm.
+static storage_t *load_storage(const char *config, service_registry_t **out_sr,
+                               plugin_manager_t **out_pm) {
+  service_registry_t *sr = service_registry_new();
+  assert(sr != NULL);
+  plugin_manager_t *pm = plugin_manager_new(sr);
+  assert(pm != NULL);
+
+  int rc = plugin_manager_load(pm, PLUGIN_PATH, config);
+  assert(rc == 0);
+  service_registry_init_all(sr);
+
+  service_ref_t ref = service_registry_acquire(sr, "storage");
+  assert(service_ref_valid(&ref));
+  storage_t *s = (storage_t *)ref.instance;
+  service_ref_release(&ref);
+
+  *out_sr = sr;
+  *out_pm = pm;
+  return s;
+}
+
+static void write_object(storage_t *s, const char *key, const char *data) {
+  storage_file_t *f = s->open(s, key, STORAGE_MODE_WRITE);
+  assert(f != NULL);
+
+  int64_t written = s->write(f, data, strlen(data));
+  assert(written == (int64_t)strlen(data));
+
+  int rc = s->close(f);
+  assert(rc == STORAGE_OK);
+}
+
+// storage.path overrides PRESSURED_STORAGE_PATH; a JSON null keeps the env
+// path.
+static void test_config_override(const char *dir, const char *dir2) {
+  printf("  test_config_override: ");
+
+  const char *key = "test/config_override.txt";
+  const char *data = "config override";
+
+  char path[512];
+  char path2[512];
+  snprintf(path, sizeof(path), "%s/%s", dir, key);
+  snprintf(path2, sizeof(path2), "%s/%s", dir2, key);
+
+  struct stat st;
+
+  // Comments and trailing commas are allowed in the config text.
+  char config[512];
+  snprintf(config, sizeof(config),
+           "{/* comment */ \"storage\": {\"path\": \"%s\",},}", dir2);
+
+  service_registry_t *sr;
+  plugin_manager_t *pm;
+  storage_t *s = load_storage(config, &sr, &pm);
+  write_object(s, key, data);
+  assert(stat(path2, &st) == 0);
+  assert(stat(path, &st) != 0);
+  s->remove(s, key);
+  service_registry_free(sr);
+  plugin_manager_free(pm);
+
+  // A null storage.path keeps the environment path.
+  s = load_storage("{\"storage\":{\"path\":null}}", &sr, &pm);
+  write_object(s, key, data);
+  assert(stat(path, &st) == 0);
+  assert(stat(path2, &st) != 0);
+  s->remove(s, key);
+  service_registry_free(sr);
+  plugin_manager_free(pm);
+
+  printf("OK\n");
+}
+
 int main(void) {
   log_init(LOG_DEBUG);
 
@@ -162,6 +239,12 @@ int main(void) {
   char *dir = mkdtemp(tmp_dir);
   assert(dir != NULL);
   printf("  using temp dir: %s\n", dir);
+
+  // Second temp directory for the storage.path override
+  char tmp_dir2[] = "/tmp/pressured_storage_test2_XXXXXX";
+  char *dir2 = mkdtemp(tmp_dir2);
+  assert(dir2 != NULL);
+  printf("  using second temp dir: %s\n", dir2);
 
   // Set environment variable for storage path
   setenv("PRESSURED_STORAGE_PATH", dir, 1);
@@ -201,6 +284,7 @@ int main(void) {
   test_exists(s);
   test_large_streaming(s);
   test_not_found(s);
+  test_config_override(dir, dir2);
 
   // Release storage reference (no-op for singletons)
   service_ref_release(&ref);
@@ -210,9 +294,9 @@ int main(void) {
   service_registry_free(sr);
   plugin_manager_free(pm);
 
-  // Remove temp directory
-  char cmd[256];
-  snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
+  // Remove temp directories
+  char cmd[512];
+  snprintf(cmd, sizeof(cmd), "rm -rf %s %s", dir, dir2);
   system(cmd);
 
   printf("test_storage: PASSED\n");

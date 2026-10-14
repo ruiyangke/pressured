@@ -11,11 +11,11 @@
  */
 
 #include "log.h"
+#include "pjson.h"
 #include "plugin.h"
 #include "service_registry.h"
 #include "storage.h"
 #include <errno.h>
-#include <json-c/json.h>
 #include <libgen.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -335,19 +335,16 @@ pressured_plugin_load(const char *config_json, service_registry_t *sr) {
 
   /* Parse JSON config if provided */
   if (config_json && config_json[0]) {
-    struct json_object *root = json_tokener_parse(config_json);
-    if (root) {
-      struct json_object *storage_obj;
-      if (json_object_object_get_ex(root, "storage", &storage_obj)) {
-        struct json_object *path_obj;
-        if (json_object_object_get_ex(storage_obj, "path", &path_obj)) {
-          const char *path = json_object_get_string(path_obj);
-          if (path && path[0]) {
-            strncpy(ctx->base_path, path, MAX_PATH_LEN - 1);
-          }
-        }
+    yyjson_doc *doc = pj_parse(config_json, strlen(config_json), PJ_READ_CONFIG,
+                               "local storage config");
+    if (doc) {
+      yyjson_val *path = yyjson_obj_get(
+          yyjson_obj_get(yyjson_doc_get_root(doc), "storage"), "path");
+      const char *path_str = yyjson_get_str(path);
+      if (path_str && path_str[0]) {
+        strncpy(ctx->base_path, path_str, MAX_PATH_LEN - 1);
       }
-      json_object_put(root);
+      yyjson_doc_free(doc);
     }
   }
 
