@@ -70,6 +70,9 @@
 #define MULTIPART_PART_SIZE (64 * 1024 * 1024) // 64MB per part
 #define MAX_PARTS 10000
 #define S3_ETAG_MAX 128
+
+// One multipart ETag, stored in place in the etags array
+typedef char s3_etag_t[S3_ETAG_MAX];
 #define STREAMING_CHUNK_SIZE (64 * 1024)  // 64KB chunks for streaming PutObject
 #define MAX_STREAMING_BUFFER (256 * 1024) // Cap buffer at 256KB to bound memory
 #define RING_BUFFER_SIZE (64 * 1024)      // 64KB ring buffer for true streaming
@@ -133,7 +136,7 @@ typedef struct {
   // For writes: multipart upload state
   char *upload_id;
   int part_number;
-  char (*etags)[S3_ETAG_MAX]; // Array of ETags
+  s3_etag_t *etags; // Array of ETags
   int etags_capacity;
 
   // Write buffer - accumulate data until S3_MIN_PART_SIZE
@@ -1198,8 +1201,7 @@ static int s3_ensure_etag_capacity(s3_file_t *sf, int needed) {
   while (new_cap < needed)
     new_cap *= 2;
 
-  char (*new_etags)[S3_ETAG_MAX] =
-      realloc(sf->etags, new_cap * sizeof *sf->etags);
+  s3_etag_t *new_etags = realloc(sf->etags, new_cap * sizeof *sf->etags);
   if (!new_etags)
     return -1;
 
@@ -1330,8 +1332,7 @@ static int s3_upload_part(pressured_plugin_ctx_t *ctx, const char *key,
 
 static int s3_complete_multipart_upload(pressured_plugin_ctx_t *ctx,
                                         const char *key, const char *upload_id,
-                                        char (*etags)[S3_ETAG_MAX],
-                                        int num_parts) {
+                                        s3_etag_t *etags, int num_parts) {
   char url[MAX_URL_LEN];
   build_url(ctx, key, url, sizeof(url));
 
