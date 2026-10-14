@@ -338,9 +338,9 @@ pressured_plugin_load(const char *config_json, service_registry_t *sr) {
     yyjson_doc *doc = pj_parse(config_json, strlen(config_json), PJ_READ_CONFIG,
                                "local storage config");
     if (doc) {
-      yyjson_val *path = yyjson_obj_get(
-          yyjson_obj_get(yyjson_doc_get_root(doc), "storage"), "path");
-      const char *path_str = yyjson_get_str(path);
+      yyjson_val *storage = yyjson_obj_get(yyjson_doc_get_root(doc), "storage");
+      const char *path_str = yyjson_get_str(pj_config_value(
+          storage, "storage", "path", "a string", yyjson_is_str));
       if (path_str && path_str[0]) {
         strncpy(ctx->base_path, path_str, MAX_PATH_LEN - 1);
       }

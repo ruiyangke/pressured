@@ -45,7 +45,8 @@ static inline yyjson_doc *pj_parse(const char *data, size_t len,
 // Config value of `key` in `obj` when `is_type` accepts it. A missing key or a
 // JSON null returns NULL silently so the caller keeps its default (Helm renders
 // unset values as null); any other type returns NULL after one warning naming
-// `section`.`key` and the expected `type` ("" for a top-level key).
+// `section`.`key` and the expected `type`, e.g. "a number" ("" section for a
+// top-level key).
 static inline yyjson_val *pj_config_value(yyjson_val *obj, const char *section,
                                           const char *key, const char *type,
                                           bool (*is_type)(const yyjson_val *)) {
@@ -53,7 +54,7 @@ static inline yyjson_val *pj_config_value(yyjson_val *obj, const char *section,
   if (!val || yyjson_is_null(val))
     return NULL;
   if (!is_type(val)) {
-    log_warn("config: %s%s%s must be a %s, ignoring it", section,
+    log_warn("config: %s%s%s must be %s, ignoring it", section,
              section[0] ? "." : "", key, type);
     return NULL;
   }

@@ -34,42 +34,45 @@ pressured_config_t *pressured_config_load(const char *path) {
 
   // Read JSON config file
   char *text = pressured_config_load_json(path);
-  yyjson_doc *doc =
-      text ? pj_parse(text, strlen(text), PJ_READ_CONFIG, path) : NULL;
-  free(text);
-  if (!doc) {
-    log_warn("failed to parse config file: %s", path);
+  if (!text) {
+    log_warn("failed to read config file: %s", path);
     return config;
   }
+  // pj_parse logs the parse error itself.
+  yyjson_doc *doc = pj_parse(text, strlen(text), PJ_READ_CONFIG, path);
+  free(text);
+  if (!doc)
+    return config;
 
   yyjson_val *root = yyjson_doc_get_root(doc);
   yyjson_val *source, *val;
   int n;
 
   // Thresholds
-  yyjson_val *thresholds = yyjson_obj_get(root, "thresholds");
-  val = pj_config_value(thresholds, "thresholds", "warn_percent", "number",
+  yyjson_val *thresholds =
+      pj_config_value(root, "", "thresholds", "an object", yyjson_is_obj);
+  val = pj_config_value(thresholds, "thresholds", "warn_percent", "a number",
                         yyjson_is_num);
   if (val)
     config->warn_percent = yyjson_get_num(val) / 100.0;
-  val = pj_config_value(thresholds, "thresholds", "critical_percent", "number",
-                        yyjson_is_num);
+  val = pj_config_value(thresholds, "thresholds", "critical_percent",
+                        "a number", yyjson_is_num);
   if (val)
     config->critical_percent = yyjson_get_num(val) / 100.0;
   val = pj_config_value(thresholds, "thresholds", "hysteresis_percent",
-                        "number", yyjson_is_num);
+                        "a number", yyjson_is_num);
   if (val)
     config->hysteresis_percent = yyjson_get_num(val) / 100.0;
-  val = pj_config_value(thresholds, "thresholds", "cooldown_seconds", "number",
-                        yyjson_is_num);
+  val = pj_config_value(thresholds, "thresholds", "cooldown_seconds",
+                        "a number", yyjson_is_num);
   if (val && pj_int(val, &n))
     config->cooldown_seconds = n;
 
   // Source
-  source = yyjson_obj_get(root, "source");
+  source = pj_config_value(root, "", "source", "an object", yyjson_is_obj);
 
   // Mode selection: "cgroup" or "kubelet"
-  val = pj_config_value(source, "source", "mode", "string", yyjson_is_str);
+  val = pj_config_value(source, "source", "mode", "a string", yyjson_is_str);
   if (val) {
     const char *mode = yyjson_get_str(val);
     if (strcmp(mode, "kubelet") == 0 || strcmp(mode, "cluster") == 0)
@@ -79,15 +82,16 @@ pressured_config_t *pressured_config_load(const char *path) {
   }
 
   // Poll interval (applies to both modes)
-  val = pj_config_value(source, "source", "poll_interval_ms", "number",
+  val = pj_config_value(source, "source", "poll_interval_ms", "a number",
                         yyjson_is_num);
   if (val && pj_int(val, &n))
     config->poll_interval_ms = n;
 
   // Cgroup-specific settings
-  yyjson_val *cgroup = yyjson_obj_get(source, "cgroup");
-  val =
-      pj_config_value(cgroup, "source.cgroup", "path", "string", yyjson_is_str);
+  yyjson_val *cgroup =
+      pj_config_value(source, "source", "cgroup", "an object", yyjson_is_obj);
+  val = pj_config_value(cgroup, "source.cgroup", "path", "a string",
+                        yyjson_is_str);
   if (val) {
     if (buffer_copy(config->cgroup_path, sizeof(config->cgroup_path),
                     yyjson_get_str(val), "cgroup path") != 0) {
@@ -96,31 +100,32 @@ pressured_config_t *pressured_config_load(const char *path) {
       return NULL;
     }
   }
-  val = pj_config_value(cgroup, "source.cgroup", "poll_interval_ms", "number",
+  val = pj_config_value(cgroup, "source.cgroup", "poll_interval_ms", "a number",
                         yyjson_is_num);
   if (val && pj_int(val, &n))
     config->poll_interval_ms = n;
 
   // Kubelet-specific settings
-  yyjson_val *kubelet = yyjson_obj_get(source, "kubelet");
-  val = pj_config_value(kubelet, "source.kubelet", "namespace_filter", "string",
-                        yyjson_is_str);
+  yyjson_val *kubelet =
+      pj_config_value(source, "source", "kubelet", "an object", yyjson_is_obj);
+  val = pj_config_value(kubelet, "source.kubelet", "namespace_filter",
+                        "a string", yyjson_is_str);
   if (val)
     config->namespace_filter = strdup(yyjson_get_str(val));
-  val = pj_config_value(kubelet, "source.kubelet", "label_selector", "string",
+  val = pj_config_value(kubelet, "source.kubelet", "label_selector", "a string",
                         yyjson_is_str);
   if (val)
     config->label_selector = strdup(yyjson_get_str(val));
-  val = pj_config_value(kubelet, "source.kubelet", "poll_interval_ms", "number",
-                        yyjson_is_num);
+  val = pj_config_value(kubelet, "source.kubelet", "poll_interval_ms",
+                        "a number", yyjson_is_num);
   if (val && pj_int(val, &n))
     config->poll_interval_ms = n;
 
   // General
-  val = pj_config_value(root, "", "dry_run", "boolean", yyjson_is_bool);
+  val = pj_config_value(root, "", "dry_run", "a boolean", yyjson_is_bool);
   if (val)
     config->dry_run = yyjson_get_bool(val);
-  val = pj_config_value(root, "", "log_level", "string", yyjson_is_str);
+  val = pj_config_value(root, "", "log_level", "a string", yyjson_is_str);
   if (val) {
     free(config->log_level);
     config->log_level = strdup(yyjson_get_str(val));

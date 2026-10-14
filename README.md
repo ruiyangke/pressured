@@ -70,7 +70,7 @@ helm install pressured charts/pressured \
 
 ### From Source
 
-Prerequisites: CMake 3.16+, C11 compiler, libcurl, lua5.4, OpenSSL or mbedTLS. JSON parsing uses the vendored yyjson (`third_party/yyjson`, MIT).
+Prerequisites: CMake 3.16+, C11 compiler, libcurl, lua5.4, zlib, OpenSSL or mbedTLS. JSON parsing uses the vendored yyjson (`third_party/yyjson`, MIT).
 
 ```bash
 # Build
@@ -98,7 +98,7 @@ helm install pressured charts/pressured
 
 ## Configuration
 
-Configuration is JSON-based. Create a `config.json`:
+Configuration is JSON-based. The file may contain `//` and `/* */` comments and trailing commas. A key that is missing or `null` keeps its default; a key of the wrong type (for example `"80"` where a number is expected) keeps its default and logs a warning. Create a `config.json`:
 
 ```json
 {

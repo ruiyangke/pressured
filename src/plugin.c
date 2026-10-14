@@ -118,8 +118,12 @@ static int plugin_is_disabled(const char *plugin_name,
   yyjson_val *plugin_cfg =
       yyjson_obj_get(yyjson_obj_get(root, "plugins"), plugin_name);
 
-  /* Only disabled if explicitly set to false */
-  int disabled = yyjson_is_false(yyjson_obj_get(plugin_cfg, "enabled"));
+  /* Only the JSON value false disables a plugin; any other non-null value
+   * warns and leaves it enabled */
+  char section[128];
+  snprintf(section, sizeof(section), "plugins.%s", plugin_name);
+  int disabled = yyjson_is_false(pj_config_value(plugin_cfg, section, "enabled",
+                                                 "a boolean", yyjson_is_bool));
 
   yyjson_doc_free(doc);
   return disabled;

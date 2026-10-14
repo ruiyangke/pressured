@@ -112,8 +112,8 @@ static int parse_plugin_config(pressured_plugin_ctx_t *ctx,
   yyjson_val *lua_cfg = yyjson_obj_get(
       yyjson_obj_get(yyjson_doc_get_root(doc), "plugins"), "lua");
 
-  yyjson_val *val = pj_config_value(lua_cfg, "plugins.lua", "script", "string",
-                                    yyjson_is_str);
+  yyjson_val *val = pj_config_value(lua_cfg, "plugins.lua", "script",
+                                    "a string", yyjson_is_str);
   if (val) {
     if (buffer_copy(ctx->cfg.script, sizeof(ctx->cfg.script),
                     yyjson_get_str(val), "Lua script path") != 0) {
@@ -121,7 +121,7 @@ static int parse_plugin_config(pressured_plugin_ctx_t *ctx,
       return -1;
     }
   }
-  val = pj_config_value(lua_cfg, "plugins.lua", "scripts_dir", "string",
+  val = pj_config_value(lua_cfg, "plugins.lua", "scripts_dir", "a string",
                         yyjson_is_str);
   if (val) {
     if (buffer_copy(ctx->cfg.scripts_dir, sizeof(ctx->cfg.scripts_dir),
@@ -130,11 +130,11 @@ static int parse_plugin_config(pressured_plugin_ctx_t *ctx,
       return -1;
     }
   }
-  val = pj_config_value(lua_cfg, "plugins.lua", "inline_script", "string",
+  val = pj_config_value(lua_cfg, "plugins.lua", "inline_script", "a string",
                         yyjson_is_str);
   if (val)
     ctx->cfg.inline_script = strdup(yyjson_get_str(val));
-  val = pj_config_value(lua_cfg, "plugins.lua", "timeout_ms", "number",
+  val = pj_config_value(lua_cfg, "plugins.lua", "timeout_ms", "a number",
                         yyjson_is_num);
   if (val)
     pj_int(val, &ctx->cfg.timeout_ms);
@@ -317,10 +317,9 @@ static void register_config(lua_State *L, const char *config_json_str) {
                         ? pj_parse(config_json_str, strlen(config_json_str),
                                    PJ_READ_CONFIG, "lua plugin config")
                         : NULL;
-  // The reader caps nesting at 64 levels; each level takes at most 3 slots.
+  // pj_parse logs a parse error itself. The reader caps nesting at 64 levels
+  // and each level takes at most 3 Lua stack slots.
   if (!doc) {
-    if (config_json_str)
-      log_warn("lua plugin: failed to parse config JSON");
     lua_newtable(L);
   } else if (!lua_checkstack(L, 200)) {
     log_warn("lua plugin: config nesting exceeds the Lua stack");

@@ -2607,7 +2607,8 @@ static void s3_storage_destructor(void *instance, void *userdata) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Read the storage.s3 section, falling back to the flat root object used by
-// direct plugin tests. Non-string values keep the current setting.
+// direct plugin tests when storage.s3 is not an object. A value of the wrong
+// type keeps the current setting, with a warning.
 static void parse_s3_config(pressured_plugin_ctx_t *ctx,
                             const char *config_json) {
   yyjson_doc *doc = pj_parse(config_json, strlen(config_json), PJ_READ_CONFIG,
@@ -2618,22 +2619,23 @@ static void parse_s3_config(pressured_plugin_ctx_t *ctx,
   yyjson_val *root = yyjson_doc_get_root(doc);
   yyjson_val *s3 = yyjson_obj_get(yyjson_obj_get(root, "storage"), "s3");
   yyjson_val *section = yyjson_is_obj(s3) ? s3 : root;
-
-  const char *bucket = yyjson_get_str(yyjson_obj_get(section, "bucket"));
-  if (bucket)
-    strncpy(ctx->bucket, bucket, sizeof(ctx->bucket) - 1);
-
-  const char *region = yyjson_get_str(yyjson_obj_get(section, "region"));
-  if (region)
-    strncpy(ctx->region, region, sizeof(ctx->region) - 1);
-
-  const char *prefix = yyjson_get_str(yyjson_obj_get(section, "prefix"));
-  if (prefix)
-    strncpy(ctx->prefix, prefix, sizeof(ctx->prefix) - 1);
-
-  const char *endpoint = yyjson_get_str(yyjson_obj_get(section, "endpoint"));
-  if (endpoint)
-    strncpy(ctx->endpoint, endpoint, sizeof(ctx->endpoint) - 1);
+  const char *where = yyjson_is_obj(s3) ? "storage.s3" : "";
+  struct {
+    const char *key;
+    char *dst;
+    size_t size;
+  } fields[] = {
+      {"bucket", ctx->bucket, sizeof(ctx->bucket)},
+      {"region", ctx->region, sizeof(ctx->region)},
+      {"prefix", ctx->prefix, sizeof(ctx->prefix)},
+      {"endpoint", ctx->endpoint, sizeof(ctx->endpoint)},
+  };
+  for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+    const char *value = yyjson_get_str(pj_config_value(
+        section, where, fields[i].key, "a string", yyjson_is_str));
+    if (value)
+      strncpy(fields[i].dst, value, fields[i].size - 1);
+  }
 
   yyjson_doc_free(doc);
 }
