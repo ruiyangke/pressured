@@ -1,3 +1,4 @@
+#include "fixed_buffer.h"
 #include "log.h"
 #include "pressured.h"
 #include <json-c/json.h>
@@ -16,7 +17,11 @@ pressured_config_t *pressured_config_load(const char *path) {
   config->critical_percent = 0.85;
   config->hysteresis_percent = 0.05;
   config->cooldown_seconds = 60;
-  config->cgroup_path = strdup("/sys/fs/cgroup");
+  if (buffer_copy(config->cgroup_path, sizeof(config->cgroup_path),
+                  "/sys/fs/cgroup", "cgroup path") != 0) {
+    pressured_config_free(config);
+    return NULL;
+  }
   config->poll_interval_ms = 1000;
   config->namespace_filter = NULL;
   config->label_selector = NULL;
@@ -76,8 +81,12 @@ pressured_config_t *pressured_config_load(const char *path) {
     struct json_object *cgroup;
     if (json_object_object_get_ex(obj, "cgroup", &cgroup)) {
       if (json_object_object_get_ex(cgroup, "path", &val)) {
-        free(config->cgroup_path);
-        config->cgroup_path = strdup(json_object_get_string(val));
+        if (buffer_copy(config->cgroup_path, sizeof(config->cgroup_path),
+                        json_object_get_string(val), "cgroup path") != 0) {
+          json_object_put(root);
+          pressured_config_free(config);
+          return NULL;
+        }
       }
       if (json_object_object_get_ex(cgroup, "poll_interval_ms", &val)) {
         config->poll_interval_ms = json_object_get_int(val);
@@ -116,7 +125,6 @@ pressured_config_t *pressured_config_load(const char *path) {
 
 void pressured_config_free(pressured_config_t *config) {
   if (config) {
-    free(config->cgroup_path);
     free(config->namespace_filter);
     free(config->label_selector);
     free(config->log_level);

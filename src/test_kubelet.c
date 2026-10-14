@@ -42,6 +42,7 @@ static http_buffer_t *response_buffer;
 static char request_path[2048];
 static int node_requests;
 static long response_code = 200;
+static long forced_response_code = 200;
 static CURLcode fixture_setopt(CURL *curl, CURLoption option, ...) {
   (void)curl;
   va_list args;
@@ -55,7 +56,7 @@ static CURLcode fixture_setopt(CURL *curl, CURLoption option, ...) {
 }
 static CURLcode fixture_perform(CURL *curl) {
   (void)curl;
-  response_code = 200;
+  response_code = forced_response_code;
   if (scenario >= 0) {
     fixture_response = "{\"items\":[]}";
     if (strstr(request_path, "/stats/summary")) {
@@ -321,12 +322,93 @@ static void test_timestamps(kubelet_source_t *source, bool pod_status) {
   assert(failures == 0);
 }
 
+static void write_token(const char *path, const char *token) {
+  FILE *file = fopen(path, "w");
+  assert(file);
+  int result = fputs(token, file);
+  assert(result >= 0);
+  result = fclose(file);
+  assert(result == 0);
+}
+
+static void test_token(kubelet_source_t *source) {
+  char path[PATH_MAX] = "./token-bounds-XXXXXX";
+  int fd = mkstemp(path);
+  assert(fd >= 0);
+  assert(close(fd) == 0);
+  assert(buffer_copy(source->token_path, sizeof(source->token_path), path,
+                     "test token path") == 0);
+  FILE *messages = tmpfile();
+  assert(messages);
+  int saved = dup(STDERR_FILENO);
+  assert(saved >= 0);
+  assert(dup2(fileno(messages), STDERR_FILENO) >= 0);
+
+  write_token(path, "previous\r\n");
+  reload_token(source);
+  assert(strcmp(source->token, "previous") == 0);
+  reload_token(source);
+  char token[MAX_TOKEN + 1];
+  memset(token, 'x', sizeof(token) - 1);
+  token[sizeof(token) - 1] = '\0';
+  write_token(path, token);
+  reload_token(source);
+  assert(strcmp(source->token, "previous") == 0);
+  token[MAX_TOKEN - 1] = '\0';
+  write_token(path, token);
+  reload_token(source);
+  assert(strcmp(source->token, token) == 0);
+  write_token(path, "rotated");
+  source->token_loaded_at = monotonic_seconds() + 1;
+  char *response = api_request(source, "/api/v1/pods");
+  assert(response);
+  free(response);
+  assert(strcmp(source->token, token) == 0);
+  source->token_loaded_at = monotonic_seconds() - TOKEN_RELOAD_INTERVAL_SEC;
+  response = api_request(source, "/api/v1/pods");
+  assert(response);
+  free(response);
+  assert(strcmp(source->token, "rotated") == 0);
+  write_token(path, "after-401");
+  forced_response_code = 401;
+  assert(api_request(source, "/api/v1/pods") == NULL);
+  forced_response_code = 200;
+  assert(strcmp(source->token, "after-401") == 0);
+  reload_token(source);
+  write_token(path, "\r\n");
+  reload_token(source);
+  assert(strcmp(source->token, "after-401") == 0);
+  assert(unlink(path) == 0);
+  reload_token(source);
+  assert(strcmp(source->token, "after-401") == 0);
+
+  int result = fflush(stderr);
+  assert(result == 0);
+  assert(dup2(saved, STDERR_FILENO) >= 0);
+  close(saved);
+  rewind(messages);
+  char message[1024];
+  int reloads = 0, oversized = 0;
+  while (fgets(message, sizeof(message), messages)) {
+    if (strstr(message, "service account token reloaded"))
+      reloads++;
+    if (strstr(message, "WARN") && strstr(message, "too long"))
+      oversized++;
+  }
+  assert(reloads == 3);
+  assert(oversized == 1);
+  result = fclose(messages);
+  assert(result == 0);
+}
+
 int main(int argc, char **argv) {
   assert(argc == 2);
   unsetenv("KUBERNETES_SERVICE_HOST");
   kubelet_source_t *source = kubelet_source_new();
   assert(source);
-  if (strcmp(argv[1], "dedupe") == 0)
+  if (strcmp(argv[1], "token") == 0)
+    test_token(source);
+  else if (strcmp(argv[1], "dedupe") == 0)
     test_dedupe(source);
   else if (strcmp(argv[1], "cache") == 0)
     test_cache(source);

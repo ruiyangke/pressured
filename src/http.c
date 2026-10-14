@@ -5,6 +5,7 @@
  */
 
 #include "http.h"
+#include "fixed_buffer.h"
 #include "log.h"
 #include "pressured.h"
 #include <curl/curl.h>
@@ -22,7 +23,7 @@ struct http_client {
   int timeout_ms;
   int connect_timeout_ms;
   bool skip_ssl_verify;
-  char *ca_path;
+  char ca_path[PATH_MAX];
   char *proxy;
   char *bearer_token; // "Authorization: Bearer xxx"
   char *basic_auth;   // "user:pass"
@@ -89,8 +90,8 @@ http_client_t *http_client_new(const http_opts_t *opts) {
       c->connect_timeout_ms = opts->connect_timeout_ms;
     c->skip_ssl_verify = opts->skip_ssl_verify;
     if (opts->ca_path) {
-      c->ca_path = strdup(opts->ca_path);
-      if (!c->ca_path)
+      if (buffer_copy(c->ca_path, sizeof(c->ca_path), opts->ca_path,
+                      "HTTP CA path") != 0)
         goto fail;
     }
     if (opts->proxy) {
@@ -107,7 +108,6 @@ http_client_t *http_client_new(const http_opts_t *opts) {
   return c;
 
 fail:
-  free(c->ca_path);
   free(c->proxy);
   free(c);
   return NULL;
@@ -118,7 +118,6 @@ void http_client_free(http_client_t *c) {
     return;
   free(c->bearer_token);
   free(c->basic_auth);
-  free(c->ca_path);
   free(c->proxy);
   if (c->curl)
     curl_easy_cleanup(c->curl);
@@ -135,7 +134,12 @@ int http_client_auth_basic(http_client_t *c, const char *user,
   c->basic_auth = malloc(len);
   if (!c->basic_auth)
     return -1;
-  snprintf(c->basic_auth, len, "%s:%s", user, pass);
+  if (buffer_format(c->basic_auth, len, "basic authorization", "%s:%s", user,
+                    pass) != 0) {
+    free(c->basic_auth);
+    c->basic_auth = NULL;
+    return -1;
+  }
   return 0;
 }
 
@@ -148,7 +152,12 @@ int http_client_auth_bearer(http_client_t *c, const char *token) {
   c->bearer_token = malloc(len);
   if (!c->bearer_token)
     return -1;
-  snprintf(c->bearer_token, len, "Authorization: Bearer %s", token);
+  if (buffer_format(c->bearer_token, len, "bearer authorization",
+                    "Authorization: Bearer %s", token) != 0) {
+    free(c->bearer_token);
+    c->bearer_token = NULL;
+    return -1;
+  }
   return 0;
 }
 
@@ -235,7 +244,7 @@ static void setup_curl_opts(http_client_t *c, CURL *curl,
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
   }
-  if (c->ca_path) {
+  if (c->ca_path[0]) {
     curl_easy_setopt(curl, CURLOPT_CAINFO, c->ca_path);
   }
   if (c->proxy) {
@@ -289,13 +298,13 @@ http_response_t *http_fetch(http_client_t *c, const char *method,
 
   // Content-Type
   if (req && req->content_type) {
-    size_t ct_len = strlen("Content-Type: ") + strlen(req->content_type) + 1;
-    char *ct = malloc(ct_len);
-    if (!ct)
-      goto header_fail;
-    snprintf(ct, ct_len, "Content-Type: %s", req->content_type);
+    char ct[1024];
+    if (buffer_format(ct, sizeof(ct), "Content-Type header", "Content-Type: %s",
+                      req->content_type) != 0) {
+      r->error = strdup("Content-Type header too long");
+      return r;
+    }
     struct curl_slist *tmp = curl_slist_append(headers, ct);
-    free(ct);
     if (!tmp)
       goto header_fail;
     headers = tmp;
@@ -407,15 +416,13 @@ int http_stream(http_client_t *c, const char *method, const char *url,
 
   // Content-Type
   if (req && req->content_type) {
-    size_t ct_len = strlen("Content-Type: ") + strlen(req->content_type) + 1;
-    char *ct = malloc(ct_len);
-    if (ct) {
-      snprintf(ct, ct_len, "Content-Type: %s", req->content_type);
-      struct curl_slist *tmp = curl_slist_append(headers, ct);
-      free(ct);
-      if (tmp)
-        headers = tmp;
-    }
+    char ct[1024];
+    if (buffer_format(ct, sizeof(ct), "Content-Type header", "Content-Type: %s",
+                      req->content_type) != 0)
+      return -1;
+    struct curl_slist *tmp = curl_slist_append(headers, ct);
+    if (tmp)
+      headers = tmp;
   }
 
   // Custom headers

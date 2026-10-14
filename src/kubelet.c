@@ -1,4 +1,5 @@
 #define _GNU_SOURCE // for strptime and timegm
+#include "fixed_buffer.h"
 #include "internal.h"
 #include "log.h"
 #include <ctype.h>
@@ -47,10 +48,10 @@ typedef struct {
 struct kubelet_source {
   // Kubernetes API config
   char *api_server;
-  char *token;
-  char *token_path;       // NULL in proxy mode
-  time_t token_loaded_at; // monotonic seconds of last token read
-  char *ca_cert_path;
+  char token[MAX_TOKEN];
+  char token_path[PATH_MAX]; // Empty in proxy mode
+  time_t token_loaded_at;    // monotonic seconds of last token read
+  char ca_cert_path[PATH_MAX];
 
   // Node discovery
   node_info_t nodes[MAX_NODES];
@@ -97,31 +98,24 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb,
   return realsize;
 }
 
-static char *read_file(const char *path) {
-  FILE *f = fopen(path, "r");
-  if (!f)
-    return NULL;
-
-  fseek(f, 0, SEEK_END);
-  long size = ftell(f);
-  fseek(f, 0, SEEK_SET);
-
-  char *buf = malloc(size + 1);
-  if (!buf) {
-    fclose(f);
-    return NULL;
+static int read_token(const char *path, char *buffer, size_t size) {
+  FILE *file = fopen(path, "r");
+  if (!file)
+    return -1;
+  size_t length = fread(buffer, 1, size - 1, file);
+  int extra = fgetc(file);
+  int failed = ferror(file);
+  fclose(file);
+  if (extra != EOF) {
+    log_warn("service account token file too long (buffer size %zu)", size);
+    return -1;
   }
-
-  size_t read = fread(buf, 1, size, f);
-  buf[read] = '\0';
-  fclose(f);
-
-  // Trim trailing newline
-  while (read > 0 && (buf[read - 1] == '\n' || buf[read - 1] == '\r')) {
-    buf[--read] = '\0';
-  }
-
-  return buf;
+  if (failed)
+    return -1;
+  while (length && (buffer[length - 1] == '\n' || buffer[length - 1] == '\r'))
+    length--;
+  buffer[length] = '\0';
+  return 0;
 }
 
 static time_t monotonic_seconds(void) {
@@ -134,23 +128,20 @@ static time_t monotonic_seconds(void) {
 static void reload_token(kubelet_source_t *source) {
   source->token_loaded_at = monotonic_seconds();
 
-  char *token = read_file(source->token_path);
-  if (!token || token[0] == '\0') {
+  char token[MAX_TOKEN];
+  if (read_token(source->token_path, token, sizeof(token)) != 0 || !token[0]) {
     log_warn("failed to read service account token from %s",
              source->token_path);
-    free(token);
     return;
   }
-
-  if (source->token && strcmp(source->token, token) == 0) {
-    free(token);
+  if (strcmp(source->token, token) == 0)
     return;
-  }
-
-  if (source->token)
+  bool had_token = source->token[0] != '\0';
+  if (buffer_copy(source->token, sizeof(source->token), token,
+                  "service account token") != 0)
+    return;
+  if (had_token)
     log_info("service account token reloaded");
-  free(source->token);
-  source->token = token;
 }
 
 kubelet_source_t *kubelet_source_new(void) {
@@ -173,19 +164,25 @@ kubelet_source_t *kubelet_source_new(void) {
   if (k8s_host && k8s_port) {
     // In-cluster mode
     char api_url[512];
-    snprintf(api_url, sizeof(api_url), "https://%s:%s", k8s_host, k8s_port);
+    if (buffer_format(api_url, sizeof(api_url), "API URL", "https://%s:%s",
+                      k8s_host, k8s_port) != 0) {
+      kubelet_source_free(source);
+      return NULL;
+    }
     source->api_server = strdup(api_url);
-    source->token_path = strdup(SA_TOKEN_PATH);
+    if (buffer_copy(source->token_path, sizeof(source->token_path),
+                    SA_TOKEN_PATH, "service account token path") != 0 ||
+        buffer_copy(source->ca_cert_path, sizeof(source->ca_cert_path),
+                    SA_CA_CERT_PATH, "service account CA path") != 0) {
+      kubelet_source_free(source);
+      return NULL;
+    }
     reload_token(source);
-    source->ca_cert_path = strdup(SA_CA_CERT_PATH);
 
     log_info("kubelet source: in-cluster mode api=%s", source->api_server);
   } else {
     // Try kubectl proxy (localhost:8001)
     source->api_server = strdup("http://localhost:8001");
-    source->token = NULL;
-    source->token_path = NULL;
-    source->ca_cert_path = NULL;
 
     log_info("kubelet source: proxy mode api=%s", source->api_server);
   }
@@ -214,9 +211,6 @@ static void free_annotations(pressured_annotation_t *annotations, int count) {
 void kubelet_source_free(kubelet_source_t *source) {
   if (source) {
     free(source->api_server);
-    free(source->token);
-    free(source->token_path);
-    free(source->ca_cert_path);
     free(source->namespace_filter);
     free(source->label_selector);
     // Free annotations in cached entries before freeing the array
@@ -248,7 +242,9 @@ void kubelet_set_label_selector(kubelet_source_t *source,
 // Make an authenticated API request
 static char *api_request(kubelet_source_t *source, const char *path) {
   char url[MAX_URL];
-  snprintf(url, sizeof(url), "%s%s", source->api_server, path);
+  if (buffer_format(url, sizeof(url), "API URL", "%s%s", source->api_server,
+                    path) != 0)
+    return NULL;
 
   http_buffer_t buf = {0};
   struct curl_slist *headers = NULL;
@@ -259,19 +255,20 @@ static char *api_request(kubelet_source_t *source, const char *path) {
   curl_easy_setopt(source->curl, CURLOPT_WRITEDATA, &buf);
   curl_easy_setopt(source->curl, CURLOPT_TIMEOUT, 10L);
 
-  if (source->token_path && monotonic_seconds() - source->token_loaded_at >=
-                                TOKEN_RELOAD_INTERVAL_SEC)
+  if (source->token_path[0] && monotonic_seconds() - source->token_loaded_at >=
+                                   TOKEN_RELOAD_INTERVAL_SEC)
     reload_token(source);
 
-  if (source->token) {
+  if (source->token[0]) {
     char auth_header[MAX_TOKEN + 32];
-    snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s",
-             source->token);
+    if (buffer_format(auth_header, sizeof(auth_header), "authorization header",
+                      "Authorization: Bearer %s", source->token) != 0)
+      return NULL;
     headers = curl_slist_append(headers, auth_header);
     curl_easy_setopt(source->curl, CURLOPT_HTTPHEADER, headers);
   }
 
-  if (source->ca_cert_path) {
+  if (source->ca_cert_path[0]) {
     curl_easy_setopt(source->curl, CURLOPT_CAINFO, source->ca_cert_path);
   } else {
     curl_easy_setopt(source->curl, CURLOPT_SSL_VERIFYPEER, 0L);
@@ -291,7 +288,7 @@ static char *api_request(kubelet_source_t *source, const char *path) {
   if (http_code >= 400) {
     log_error("API request returned %ld: %s", http_code, path);
     // Token may have been rotated since the last reload; pick it up now
-    if (http_code == 401 && source->token_path)
+    if (http_code == 401 && source->token_path[0])
       reload_token(source);
     free(buf.data);
     return NULL;
@@ -468,20 +465,28 @@ copy_annotations(const pressured_annotation_t *src, int count) {
 static int kubelet_refresh_pod_limits(kubelet_source_t *source) {
   // Build API path with optional namespace filter
   char path[MAX_URL];
-  if (source->namespace_filter && strlen(source->namespace_filter) > 0) {
+  if (source->namespace_filter && source->namespace_filter[0]) {
     // Single namespace
-    snprintf(path, sizeof(path), "/api/v1/namespaces/%s/pods",
-             source->namespace_filter);
+    if (buffer_format(path, sizeof(path), "kubelet API path",
+                      "/api/v1/namespaces/%s/pods",
+                      source->namespace_filter) != 0)
+      return -1;
   } else {
-    snprintf(path, sizeof(path), "/api/v1/pods");
+    if (buffer_format(path, sizeof(path), "kubelet API path", "/api/v1/pods") !=
+        0)
+      return -1;
   }
 
-  if (source->label_selector && strlen(source->label_selector) > 0) {
+  if (source->label_selector && source->label_selector[0]) {
     char encoded[512];
     // Simple URL encoding for label selector
-    snprintf(encoded, sizeof(encoded), "?labelSelector=%s",
-             source->label_selector);
-    strncat(path, encoded, sizeof(path) - strlen(path) - 1);
+    if (buffer_format(encoded, sizeof(encoded), "kubelet API path",
+                      "?labelSelector=%s", source->label_selector) != 0)
+      return -1;
+    size_t used = strnlen(path, sizeof(path));
+    if (used >= sizeof(path) || buffer_copy(path + used, sizeof(path) - used,
+                                            encoded, "pods API path") != 0)
+      return -1;
   }
 
   char *response = api_request(source, path);
@@ -600,9 +605,14 @@ static int kubelet_refresh_pod_limits(kubelet_source_t *source) {
           source->pod_limit_capacity = new_cap;
         }
 
-        pod_limit_t *pl = &source->pod_limits[source->pod_limit_count++];
-        snprintf(pl->key, sizeof(pl->key), "%s/%s/%s", ns, pod_name,
-                 container_name);
+        pod_limit_t *pl = &source->pod_limits[source->pod_limit_count];
+        if (buffer_format(pl->key, sizeof(pl->key), "pod cache key", "%s/%s/%s",
+                          ns, pod_name, container_name) != 0) {
+          if (!annotations_consumed)
+            free_annotations(pod_annotations, pod_annotations_count);
+          goto failed;
+        }
+        source->pod_limit_count++;
         pl->limit_bytes = limit;
         if (pod_ip) {
           strncpy(pl->pod_ip, pod_ip, sizeof(pl->pod_ip) - 1);
@@ -670,7 +680,9 @@ int kubelet_source_init(kubelet_source_t *source) {
 static pod_limit_t *lookup_pod_info(kubelet_source_t *source, const char *ns,
                                     const char *pod, const char *container) {
   char key[512];
-  snprintf(key, sizeof(key), "%s/%s/%s", ns, pod, container);
+  if (buffer_format(key, sizeof(key), "pod cache key", "%s/%s/%s", ns, pod,
+                    container) != 0)
+    return NULL;
 
   for (int i = 0; i < source->pod_limit_count; i++) {
     if (strcmp(source->pod_limits[i].key, key) == 0) {
@@ -702,8 +714,9 @@ static int collect_from_node(kubelet_source_t *source, const char *node_name,
                              int max_count) {
   // Query kubelet via API server proxy
   char path[MAX_URL];
-  snprintf(path, sizeof(path), "/api/v1/nodes/%s/proxy/stats/summary",
-           node_name);
+  if (buffer_format(path, sizeof(path), "kubelet API path",
+                    "/api/v1/nodes/%s/proxy/stats/summary", node_name) != 0)
+    return -1;
 
   char *response = api_request(source, path);
   if (!response) {
@@ -746,7 +759,7 @@ static int collect_from_node(kubelet_source_t *source, const char *node_name,
     const char *pod_name = json_object_get_string(name_obj);
 
     // Apply namespace filter
-    if (source->namespace_filter && strlen(source->namespace_filter) > 0) {
+    if (source->namespace_filter && source->namespace_filter[0]) {
       if (strcmp(ns, source->namespace_filter) != 0)
         continue;
     }
@@ -911,13 +924,16 @@ static int collect_oom_events(kubelet_source_t *source,
   // Build events API path
   // Query for OOMKilling events (this is the reason kubelet sets for OOM kills)
   char path[MAX_URL];
-  if (source->namespace_filter && strlen(source->namespace_filter) > 0) {
-    snprintf(path, sizeof(path),
-             "/api/v1/namespaces/%s/events?fieldSelector=reason=OOMKilling",
-             source->namespace_filter);
+  if (source->namespace_filter && source->namespace_filter[0]) {
+    if (buffer_format(
+            path, sizeof(path), "kubelet API path",
+            "/api/v1/namespaces/%s/events?fieldSelector=reason=OOMKilling",
+            source->namespace_filter) != 0)
+      return -1;
   } else {
-    snprintf(path, sizeof(path),
-             "/api/v1/events?fieldSelector=reason=OOMKilling");
+    if (buffer_format(path, sizeof(path), "kubelet API path",
+                      "/api/v1/events?fieldSelector=reason=OOMKilling") != 0)
+      return -1;
   }
 
   char *response = api_request(source, path);
@@ -1074,11 +1090,15 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
 
   // Build pods API path
   char path[MAX_URL];
-  if (source->namespace_filter && strlen(source->namespace_filter) > 0) {
-    snprintf(path, sizeof(path), "/api/v1/namespaces/%s/pods",
-             source->namespace_filter);
+  if (source->namespace_filter && source->namespace_filter[0]) {
+    if (buffer_format(path, sizeof(path), "kubelet API path",
+                      "/api/v1/namespaces/%s/pods",
+                      source->namespace_filter) != 0)
+      return -1;
   } else {
-    snprintf(path, sizeof(path), "/api/v1/pods");
+    if (buffer_format(path, sizeof(path), "kubelet API path", "/api/v1/pods") !=
+        0)
+      return -1;
   }
 
   char *response = api_request(source, path);

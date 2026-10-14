@@ -1,6 +1,7 @@
 #ifndef PRESSURED_H
 #define PRESSURED_H
 
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <time.h>
@@ -69,7 +70,7 @@ typedef struct {
   int cooldown_seconds;
 
   // Cgroup source settings
-  char *cgroup_path;
+  char cgroup_path[PATH_MAX];
   int poll_interval_ms;
 
   // Kubelet source settings

@@ -1,3 +1,4 @@
+#include "fixed_buffer.h"
 #include "internal.h"
 #include <ctype.h>
 #include <errno.h>
@@ -19,20 +20,18 @@ int health_remove(const char *path) {
 int health_write(const char *path, time_t now) {
   if (now < 0)
     return -1;
-  char *temporary = malloc(strlen(path) + sizeof(".XXXXXX"));
-  if (!temporary)
+  char temporary[PATH_MAX];
+  if (buffer_format(temporary, sizeof(temporary), "heartbeat temporary path",
+                    "%s.XXXXXX", path) != 0)
     return -1;
-  sprintf(temporary, "%s.XXXXXX", path);
   int fd = mkstemp(temporary);
   if (fd < 0) {
-    free(temporary);
     return -1;
   }
   FILE *file = fdopen(fd, "w");
   if (!file) {
     close(fd);
     unlink(temporary);
-    free(temporary);
     return -1;
   }
   int result = fprintf(file, "%jd\n", (intmax_t)now) < 0 ? -1 : 0;
@@ -42,7 +41,6 @@ int health_write(const char *path, time_t now) {
     result = -1;
   if (result != 0)
     unlink(temporary);
-  free(temporary);
   return result;
 }
 

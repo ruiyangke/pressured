@@ -16,6 +16,7 @@
  */
 
 #include "bindings.h"
+#include "fixed_buffer.h"
 #include "log.h"
 #include "plugin.h"
 #include "pressured.h"
@@ -37,10 +38,10 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 typedef struct {
-  char *script;        // Single script path
-  char *scripts_dir;   // Directory with multiple .lua files
-  char *inline_script; // Inline Lua code
-  int timeout_ms;      // Script timeout (default: 5000)
+  char script[PATH_MAX];      // Single script path
+  char scripts_dir[PATH_MAX]; // Directory with multiple .lua files
+  char *inline_script;        // Inline Lua code
+  int timeout_ms;             // Script timeout (default: 5000)
 } lua_plugin_config_t;
 
 struct pressured_plugin_ctx {
@@ -95,16 +96,16 @@ static int run_script(lua_State *L, const char *source, int is_file) {
 }
 
 // Parse plugin config from plugins.lua section of full config JSON
-static void parse_plugin_config(pressured_plugin_ctx_t *ctx,
-                                const char *config_json) {
+static int parse_plugin_config(pressured_plugin_ctx_t *ctx,
+                               const char *config_json) {
   ctx->cfg.timeout_ms = 5000; // Default
 
   if (!config_json)
-    return;
+    return 0;
 
   struct json_object *root = json_tokener_parse(config_json);
   if (!root)
-    return;
+    return 0;
 
   // Look for plugins.lua section
   struct json_object *plugins, *lua_cfg;
@@ -113,10 +114,19 @@ static void parse_plugin_config(pressured_plugin_ctx_t *ctx,
 
     struct json_object *val;
     if (json_object_object_get_ex(lua_cfg, "script", &val)) {
-      ctx->cfg.script = strdup(json_object_get_string(val));
+      if (buffer_copy(ctx->cfg.script, sizeof(ctx->cfg.script),
+                      json_object_get_string(val), "Lua script path") != 0) {
+        json_object_put(root);
+        return -1;
+      }
     }
     if (json_object_object_get_ex(lua_cfg, "scripts_dir", &val)) {
-      ctx->cfg.scripts_dir = strdup(json_object_get_string(val));
+      if (buffer_copy(ctx->cfg.scripts_dir, sizeof(ctx->cfg.scripts_dir),
+                      json_object_get_string(val),
+                      "Lua scripts_dir path") != 0) {
+        json_object_put(root);
+        return -1;
+      }
     }
     if (json_object_object_get_ex(lua_cfg, "inline_script", &val)) {
       ctx->cfg.inline_script = strdup(json_object_get_string(val));
@@ -127,6 +137,7 @@ static void parse_plugin_config(pressured_plugin_ctx_t *ctx,
   }
 
   json_object_put(root);
+  return 0;
 }
 
 // Retain the handlers table even if a script replaces its global alias.
@@ -196,7 +207,11 @@ static int load_scripts_from_dir(lua_State *L, const char *dir_path,
   int loaded = 0;
   for (int i = 0; i < count; i++) {
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/%s", dir_path, entries[i]->d_name);
+    if (buffer_format(path, sizeof(path), "Lua script path", "%s/%s", dir_path,
+                      entries[i]->d_name) != 0) {
+      loaded = -1;
+      break;
+    }
     struct stat st;
     if (stat(path, &st) != 0 || !S_ISREG(st.st_mode))
       continue;
@@ -232,7 +247,7 @@ typedef struct {
   lua_budget_t budget;
   int dispatcher;
   int handlers_ref;
-  char *script_path;
+  char script_path[PATH_MAX];
   char *inline_script;
   http_client_t *http_client;
   struct pressured_plugin_ctx *ctx;
@@ -493,12 +508,14 @@ static lua_action_t *lua_action_create(pressured_plugin_ctx_t *ctx) {
   register_config(a->L, ctx->config_json);
 
   // Load script(s) from plugins.lua config
-  a->script_path = ctx->cfg.script ? strdup(ctx->cfg.script) : NULL;
+  if (buffer_copy(a->script_path, sizeof(a->script_path), ctx->cfg.script,
+                  "Lua script path") != 0)
+    goto fail;
   a->inline_script =
       ctx->cfg.inline_script ? strdup(ctx->cfg.inline_script) : NULL;
   const char *scripts_dir = ctx->cfg.scripts_dir;
 
-  if (a->script_path) {
+  if (a->script_path[0]) {
     // Load single script file
     if (run_script(a->L, a->script_path, 1) != LUA_OK) {
       log_error("lua plugin: failed to load %s: %s", a->script_path,
@@ -506,7 +523,7 @@ static lua_action_t *lua_action_create(pressured_plugin_ctx_t *ctx) {
       goto fail;
     }
     log_info("lua plugin: loaded script %s", a->script_path);
-  } else if (scripts_dir) {
+  } else if (scripts_dir[0]) {
     a->dispatcher = 1;
     // Load all .lua files from directory
     int loaded = load_scripts_from_dir(a->L, scripts_dir, &a->handlers_ref);
@@ -562,7 +579,6 @@ fail:
   lua_settop(a->L, 0); // Clear stack (safe regardless of current state)
   lua_close(a->L);
   http_client_free(a->http_client);
-  free(a->script_path);
   free(a->inline_script);
   free(a);
   return NULL;
@@ -576,7 +592,6 @@ static void lua_action_destroy(lua_action_t *a) {
     lua_close(a->L);
   if (a->http_client)
     http_client_free(a->http_client);
-  free(a->script_path);
   free(a->inline_script);
   free(a);
 
@@ -657,7 +672,12 @@ pressured_plugin_load(const char *config_json, service_registry_t *sr) {
   ctx->sr = sr;
 
   // Parse plugin-specific config from plugins.lua section
-  parse_plugin_config(ctx, config_json);
+  if (parse_plugin_config(ctx, config_json) != 0) {
+    free(ctx->config_json);
+    free(ctx->cfg.inline_script);
+    free(ctx);
+    return NULL;
+  }
 
   /* Register action service with the registry */
   int rc = service_registry_register(
@@ -666,8 +686,6 @@ pressured_plugin_load(const char *config_json, service_registry_t *sr) {
   if (rc != 0) {
     log_error("lua: failed to register with service registry");
     free(ctx->config_json);
-    free(ctx->cfg.script);
-    free(ctx->cfg.scripts_dir);
     free(ctx->cfg.inline_script);
     free(ctx);
     return NULL;
@@ -682,8 +700,6 @@ pressured_plugin_unload(pressured_plugin_ctx_t *ctx) {
   if (!ctx)
     return;
   free(ctx->config_json);
-  free(ctx->cfg.script);
-  free(ctx->cfg.scripts_dir);
   free(ctx->cfg.inline_script);
   free(ctx);
   log_info("lua plugin unloaded");

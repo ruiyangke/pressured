@@ -5,11 +5,13 @@
  * Plugins register their services with the service_registry during load().
  */
 
+#include "fixed_buffer.h"
 #include "log.h"
 #include "plugin_manager.h"
 #include <dirent.h>
 #include <dlfcn.h>
 #include <json-c/json.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,8 +24,8 @@
  */
 
 typedef struct {
-  void *dl_handle; /* dlopen handle */
-  char *path;      /* Plugin file path */
+  void *dl_handle;     /* dlopen handle */
+  char path[PATH_MAX]; /* Plugin file path */
 
   /* Function pointers from plugin */
   pressured_plugin_get_metadata_fn get_metadata;
@@ -78,8 +80,6 @@ void plugin_manager_free(plugin_manager_t *pm) {
     if (lp->dl_handle) {
       dlclose(lp->dl_handle);
     }
-
-    free(lp->path);
   }
 
   free(pm);
@@ -145,6 +145,10 @@ int plugin_manager_load(plugin_manager_t *pm, const char *path,
     return -1;
   }
 
+  loaded_plugin_t *lp = &pm->plugins[pm->count];
+  if (buffer_copy(lp->path, sizeof(lp->path), path, "plugin path") != 0)
+    return -1;
+
   /* Open shared library */
   void *handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
   if (!handle) {
@@ -194,15 +198,7 @@ int plugin_manager_load(plugin_manager_t *pm, const char *path,
   }
 
   /* Store plugin */
-  loaded_plugin_t *lp = &pm->plugins[pm->count];
   lp->dl_handle = handle;
-  lp->path = strdup(path);
-  if (!lp->path) {
-    log_error("failed to allocate plugin path");
-    unload_fn(ctx);
-    dlclose(handle);
-    return -1;
-  }
   lp->get_metadata = get_metadata;
   lp->load = load_fn;
   lp->unload = unload_fn;
@@ -241,8 +237,12 @@ int plugin_manager_load_dir(plugin_manager_t *pm, const char *dir,
       continue;
     }
 
-    char path[1024];
-    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    char path[PATH_MAX];
+    if (buffer_format(path, sizeof(path), "plugin path", "%s/%s", dir, name) !=
+        0) {
+      closedir(d);
+      return -1;
+    }
 
     if (plugin_manager_load(pm, path, config_json) == 0) {
       loaded++;

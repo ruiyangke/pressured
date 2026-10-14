@@ -13,6 +13,7 @@
  * 3. /proc/self/cgroup parsing (for containerized deployments)
  */
 
+#include "fixed_buffer.h"
 #include "internal.h"
 #include "log.h"
 #include <ctype.h>
@@ -25,7 +26,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define MAX_PATH 4096
 #define MAX_CONTAINERS 1024
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -33,14 +33,15 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 typedef enum {
+  CGROUP_ERROR = -1,
   CGROUP_V1 = 1,
   CGROUP_V2 = 2,
   CGROUP_UNKNOWN = 0
 } cgroup_version_t;
 
 struct cgroup_source {
-  char *base_path;       // Root cgroup path (e.g., /sys/fs/cgroup)
-  char *discovered_path; // Auto-discovered pod/container path
+  char base_path[PATH_MAX];       // Root cgroup path (e.g., /sys/fs/cgroup)
+  char discovered_path[PATH_MAX]; // Auto-discovered pod/container path
   cgroup_version_t version;
   bool collection_healthy;
 };
@@ -61,30 +62,41 @@ struct cgroup_source {
  * - memory/ subdirectory with memory.usage_in_bytes
  */
 static cgroup_version_t detect_cgroup_version(const char *path) {
-  char check_path[MAX_PATH];
+  char check_path[PATH_MAX];
 
   // Check for v2 indicators
-  snprintf(check_path, sizeof(check_path), "%s/cgroup.controllers", path);
+  if (buffer_format(check_path, sizeof(check_path), "cgroup path",
+                    "%s/cgroup.controllers", path) != 0) {
+    return CGROUP_ERROR;
+  }
   if (access(check_path, F_OK) == 0) {
     log_debug("cgroup: detected v2 (cgroup.controllers exists)");
     return CGROUP_V2;
   }
 
-  snprintf(check_path, sizeof(check_path), "%s/memory.current", path);
+  if (buffer_format(check_path, sizeof(check_path), "cgroup path",
+                    "%s/memory.current", path) != 0) {
+    return CGROUP_ERROR;
+  }
   if (access(check_path, F_OK) == 0) {
     log_debug("cgroup: detected v2 (memory.current exists)");
     return CGROUP_V2;
   }
 
   // Check for v1 indicators
-  snprintf(check_path, sizeof(check_path), "%s/memory.usage_in_bytes", path);
+  if (buffer_format(check_path, sizeof(check_path), "cgroup path",
+                    "%s/memory.usage_in_bytes", path) != 0) {
+    return CGROUP_ERROR;
+  }
   if (access(check_path, F_OK) == 0) {
     log_debug("cgroup: detected v1 (memory.usage_in_bytes exists)");
     return CGROUP_V1;
   }
 
-  snprintf(check_path, sizeof(check_path), "%s/memory/memory.usage_in_bytes",
-           path);
+  if (buffer_format(check_path, sizeof(check_path), "cgroup path",
+                    "%s/memory/memory.usage_in_bytes", path) != 0) {
+    return CGROUP_ERROR;
+  }
   if (access(check_path, F_OK) == 0) {
     log_debug("cgroup: detected v1 (memory/ subdirectory exists)");
     return CGROUP_V1;
@@ -107,76 +119,38 @@ static cgroup_version_t detect_cgroup_version(const char *path) {
  * - docker-<id>.scope
  * - 64-char hex string
  */
-static char *extract_container_id(const char *path) {
+// Returns 0 for an ID, 1 for no match, and -1 for overflow.
+static int extract_container_id(const char *path, char *id, size_t size) {
+  id[0] = '\0';
   if (!path)
-    return NULL;
-
-  // Get the last component of the path
+    return 1;
   const char *name = strrchr(path, '/');
   name = name ? name + 1 : path;
-
-  // Pattern: cri-containerd-<id>.scope
-  const char *prefix = "cri-containerd-";
-  if (strncmp(name, prefix, strlen(prefix)) == 0) {
-    const char *id_start = name + strlen(prefix);
-    const char *id_end = strstr(id_start, ".scope");
-    if (id_end) {
-      size_t len = id_end - id_start;
-      char *id = malloc(len + 1);
-      if (id) {
-        strncpy(id, id_start, len);
-        id[len] = '\0';
-        return id;
-      }
+  const char *prefixes[] = {"cri-containerd-", "crio-", "docker-"};
+  for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+    size_t prefix_len = strlen(prefixes[i]);
+    if (strncmp(name, prefixes[i], prefix_len) != 0)
+      continue;
+    const char *start = name + prefix_len;
+    const char *end = strstr(start, ".scope");
+    if (!end)
+      continue;
+    size_t length = (size_t)(end - start);
+    if (length >= size) {
+      log_error("cgroup container ID too long (buffer size %zu)", size);
+      return -1;
     }
+    memcpy(id, start, length);
+    id[length] = '\0';
+    return 0;
   }
-
-  // Pattern: crio-<id>.scope
-  prefix = "crio-";
-  if (strncmp(name, prefix, strlen(prefix)) == 0) {
-    const char *id_start = name + strlen(prefix);
-    const char *id_end = strstr(id_start, ".scope");
-    if (id_end) {
-      size_t len = id_end - id_start;
-      char *id = malloc(len + 1);
-      if (id) {
-        strncpy(id, id_start, len);
-        id[len] = '\0';
-        return id;
-      }
-    }
+  if (strnlen(name, 65) == 64) {
+    for (int i = 0; i < 64; i++)
+      if (!isxdigit((unsigned char)name[i]))
+        return 1;
+    return buffer_copy(id, size, name, "cgroup container ID");
   }
-
-  // Pattern: docker-<id>.scope
-  prefix = "docker-";
-  if (strncmp(name, prefix, strlen(prefix)) == 0) {
-    const char *id_start = name + strlen(prefix);
-    const char *id_end = strstr(id_start, ".scope");
-    if (id_end) {
-      size_t len = id_end - id_start;
-      char *id = malloc(len + 1);
-      if (id) {
-        strncpy(id, id_start, len);
-        id[len] = '\0';
-        return id;
-      }
-    }
-  }
-
-  // Pattern: plain 64-char hex (container ID)
-  if (strlen(name) == 64) {
-    int is_hex = 1;
-    for (int i = 0; i < 64 && is_hex; i++) {
-      if (!isxdigit((unsigned char)name[i])) {
-        is_hex = 0;
-      }
-    }
-    if (is_hex) {
-      return strdup(name);
-    }
-  }
-
-  return NULL;
+  return 1;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -196,25 +170,26 @@ static char *extract_container_id(const char *path) {
  * The UID in the path has dashes replaced with underscores for systemd
  * compatibility.
  */
-static char *discover_pod_cgroup_by_uid(const char *base_path,
-                                        const char *pod_uid) {
+static int discover_pod_cgroup_by_uid(const char *base_path,
+                                      const char *pod_uid, char *result,
+                                      size_t size) {
   if (!base_path || !pod_uid)
-    return NULL;
+    return 0;
 
   char uid_escaped[128];
   char uid_plain[128];
 
   // Create both formats: dashes -> underscores (systemd) and dashes removed
   // (cgroupfs)
-  strncpy(uid_escaped, pod_uid, sizeof(uid_escaped) - 1);
-  uid_escaped[sizeof(uid_escaped) - 1] = '\0';
+  if (buffer_copy(uid_escaped, sizeof(uid_escaped), pod_uid, "pod UID") != 0)
+    return -1;
   for (char *p = uid_escaped; *p; p++) {
     if (*p == '-')
       *p = '_';
   }
 
-  strncpy(uid_plain, pod_uid, sizeof(uid_plain) - 1);
-  uid_plain[sizeof(uid_plain) - 1] = '\0';
+  if (buffer_copy(uid_plain, sizeof(uid_plain), pod_uid, "pod UID") != 0)
+    return -1;
   char *dst = uid_plain;
   for (const char *src = uid_plain; *src; src++) {
     if (*src != '-')
@@ -227,47 +202,66 @@ static char *discover_pod_cgroup_by_uid(const char *base_path,
 
   for (int i = 0; i < 4; i++) {
     const char *qos = qos_classes[i];
-    char path[MAX_PATH];
+    char path[PATH_MAX];
 
     if (qos) {
       // QoS-specific paths
       // systemd format: kubepods-<qos>.slice/kubepods-<qos>-pod<uid>.slice
-      snprintf(path, sizeof(path),
-               "%s/kubepods.slice/kubepods-%s.slice/kubepods-%s-pod%s.slice",
-               base_path, qos, qos, uid_escaped);
+      if (buffer_format(
+              path, sizeof(path), "cgroup path",
+              "%s/kubepods.slice/kubepods-%s.slice/kubepods-%s-pod%s.slice",
+              base_path, qos, qos, uid_escaped) != 0)
+        return -1;
       if (access(path, F_OK) == 0) {
         log_info("cgroup: discovered pod path (systemd %s): %s", qos, path);
-        return strdup(path);
+        return buffer_copy(result, size, path, "discovered cgroup path") == 0
+                   ? 1
+                   : -1;
       }
 
       // cgroupfs format: kubepods/<qos>/pod<uid>
-      snprintf(path, sizeof(path), "%s/kubepods/%s/pod%s", base_path, qos,
-               uid_plain);
+      if (buffer_format(path, sizeof(path), "cgroup path",
+                        "%s/kubepods/%s/pod%s", base_path, qos,
+                        uid_plain) != 0) {
+        return -1;
+      }
       if (access(path, F_OK) == 0) {
         log_info("cgroup: discovered pod path (cgroupfs %s): %s", qos, path);
-        return strdup(path);
+        return buffer_copy(result, size, path, "discovered cgroup path") == 0
+                   ? 1
+                   : -1;
       }
     } else {
       // Guaranteed QoS (no intermediate directory)
       // systemd format: kubepods.slice/kubepods-pod<uid>.slice
-      snprintf(path, sizeof(path), "%s/kubepods.slice/kubepods-pod%s.slice",
-               base_path, uid_escaped);
+      if (buffer_format(path, sizeof(path), "cgroup path",
+                        "%s/kubepods.slice/kubepods-pod%s.slice", base_path,
+                        uid_escaped) != 0) {
+        return -1;
+      }
       if (access(path, F_OK) == 0) {
         log_info("cgroup: discovered pod path (systemd guaranteed): %s", path);
-        return strdup(path);
+        return buffer_copy(result, size, path, "discovered cgroup path") == 0
+                   ? 1
+                   : -1;
       }
 
       // cgroupfs format: kubepods/pod<uid>
-      snprintf(path, sizeof(path), "%s/kubepods/pod%s", base_path, uid_plain);
+      if (buffer_format(path, sizeof(path), "cgroup path", "%s/kubepods/pod%s",
+                        base_path, uid_plain) != 0) {
+        return -1;
+      }
       if (access(path, F_OK) == 0) {
         log_info("cgroup: discovered pod path (cgroupfs guaranteed): %s", path);
-        return strdup(path);
+        return buffer_copy(result, size, path, "discovered cgroup path") == 0
+                   ? 1
+                   : -1;
       }
     }
   }
 
   log_warn("cgroup: could not discover pod cgroup for UID %s", pod_uid);
-  return NULL;
+  return 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -283,19 +277,25 @@ static char *discover_pod_cgroup_by_uid(const char *base_path,
  * Returns the cgroup path for the memory controller (v1) or unified hierarchy
  * (v2).
  */
-static char *discover_self_cgroup(const char *base_path) {
+static int discover_self_cgroup(const char *base_path, char *result,
+                                size_t size) {
   FILE *f = fopen("/proc/self/cgroup", "r");
   if (!f) {
     log_debug("cgroup: cannot open /proc/self/cgroup: %s", strerror(errno));
-    return NULL;
+    return 0;
   }
 
-  char line[MAX_PATH];
-  char *result = NULL;
+  char line[PATH_MAX];
+  int found = 0;
 
   while (fgets(line, sizeof(line), f)) {
     // Remove trailing newline
-    size_t len = strlen(line);
+    size_t len = strnlen(line, sizeof(line));
+    if (len == sizeof(line) - 1 && line[len - 1] != '\n') {
+      log_error("self cgroup line too long");
+      found = -1;
+      break;
+    }
     if (len > 0 && line[len - 1] == '\n') {
       line[len - 1] = '\0';
     }
@@ -310,10 +310,17 @@ static char *discover_self_cgroup(const char *base_path) {
 
     // v2 unified hierarchy (hierarchy-id = 0, empty controllers)
     if (strcmp(hierarchy, "0") == 0) {
-      char full_path[MAX_PATH];
-      snprintf(full_path, sizeof(full_path), "%s%s", base_path, cgroup_path);
+      char full_path[PATH_MAX];
+      if (buffer_format(full_path, sizeof(full_path), "cgroup path", "%s%s",
+                        base_path, cgroup_path) != 0) {
+        fclose(f);
+        return -1;
+      }
       if (access(full_path, F_OK) == 0) {
-        result = strdup(full_path);
+        found =
+            buffer_copy(result, size, full_path, "discovered cgroup path") == 0
+                ? 1
+                : -1;
         log_info("cgroup: discovered self path (v2): %s", result);
         break;
       }
@@ -321,11 +328,17 @@ static char *discover_self_cgroup(const char *base_path) {
 
     // v1 memory controller
     if (controllers && strstr(controllers, "memory")) {
-      char full_path[MAX_PATH];
-      snprintf(full_path, sizeof(full_path), "%s/memory%s", base_path,
-               cgroup_path);
+      char full_path[PATH_MAX];
+      if (buffer_format(full_path, sizeof(full_path), "cgroup path",
+                        "%s/memory%s", base_path, cgroup_path) != 0) {
+        fclose(f);
+        return -1;
+      }
       if (access(full_path, F_OK) == 0) {
-        result = strdup(full_path);
+        found =
+            buffer_copy(result, size, full_path, "discovered cgroup path") == 0
+                ? 1
+                : -1;
         log_info("cgroup: discovered self path (v1 memory): %s", result);
         break;
       }
@@ -333,7 +346,7 @@ static char *discover_self_cgroup(const char *base_path) {
   }
 
   fclose(f);
-  return result;
+  return found;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -348,8 +361,11 @@ static bool read_memory_current(const char *path, uint64_t *value) {
                          "memory/memory.usage_in_bytes"};
   *value = 0;
   for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
-    char filepath[MAX_PATH];
-    snprintf(filepath, sizeof(filepath), "%s/%s", path, files[i]);
+    char filepath[PATH_MAX];
+    if (buffer_format(filepath, sizeof(filepath), "cgroup path", "%s/%s", path,
+                      files[i]) != 0) {
+      return false;
+    }
     FILE *file = fopen(filepath, "r");
     if (!file)
       continue;
@@ -373,12 +389,15 @@ uint64_t cgroup_read_memory_current(const char *path) {
  * Read memory limit (cgroup v2: memory.max, v1: memory.limit_in_bytes)
  */
 uint64_t cgroup_read_memory_max(const char *path) {
-  char filepath[MAX_PATH];
+  char filepath[PATH_MAX];
   FILE *f;
   char buf[64];
 
   // Try v2 first
-  snprintf(filepath, sizeof(filepath), "%s/memory.max", path);
+  if (buffer_format(filepath, sizeof(filepath), "cgroup path", "%s/memory.max",
+                    path) != 0) {
+    return UINT64_MAX;
+  }
   f = fopen(filepath, "r");
   if (f) {
     if (fgets(buf, sizeof(buf), f)) {
@@ -393,7 +412,10 @@ uint64_t cgroup_read_memory_max(const char *path) {
   }
 
   // Try v1
-  snprintf(filepath, sizeof(filepath), "%s/memory.limit_in_bytes", path);
+  if (buffer_format(filepath, sizeof(filepath), "cgroup path",
+                    "%s/memory.limit_in_bytes", path) != 0) {
+    return UINT64_MAX;
+  }
   f = fopen(filepath, "r");
   if (f) {
     if (fgets(buf, sizeof(buf), f)) {
@@ -409,7 +431,10 @@ uint64_t cgroup_read_memory_max(const char *path) {
   }
 
   // Try v1 with memory subdirectory
-  snprintf(filepath, sizeof(filepath), "%s/memory/memory.limit_in_bytes", path);
+  if (buffer_format(filepath, sizeof(filepath), "cgroup path",
+                    "%s/memory/memory.limit_in_bytes", path) != 0) {
+    return UINT64_MAX;
+  }
   f = fopen(filepath, "r");
   if (f) {
     if (fgets(buf, sizeof(buf), f)) {
@@ -443,13 +468,16 @@ uint64_t cgroup_read_memory_max(const char *path) {
  *   oom_kill <count>    <- This is what we want
  */
 static uint64_t cgroup_read_oom_kill_count(const char *path) {
-  char filepath[MAX_PATH];
+  char filepath[PATH_MAX];
   char line[256];
   FILE *f;
   uint64_t oom_kill = 0;
 
   // Try cgroup v2 memory.events first
-  snprintf(filepath, sizeof(filepath), "%s/memory.events", path);
+  if (buffer_format(filepath, sizeof(filepath), "cgroup path",
+                    "%s/memory.events", path) != 0) {
+    return 0;
+  }
   f = fopen(filepath, "r");
   if (f) {
     while (fgets(line, sizeof(line), f)) {
@@ -463,7 +491,10 @@ static uint64_t cgroup_read_oom_kill_count(const char *path) {
   }
 
   // Try cgroup v1 memory.oom_control
-  snprintf(filepath, sizeof(filepath), "%s/memory.oom_control", path);
+  if (buffer_format(filepath, sizeof(filepath), "cgroup path",
+                    "%s/memory.oom_control", path) != 0) {
+    return 0;
+  }
   f = fopen(filepath, "r");
   if (f) {
     while (fgets(line, sizeof(line), f)) {
@@ -477,7 +508,10 @@ static uint64_t cgroup_read_oom_kill_count(const char *path) {
   }
 
   // Try v1 with memory subdirectory
-  snprintf(filepath, sizeof(filepath), "%s/memory/memory.oom_control", path);
+  if (buffer_format(filepath, sizeof(filepath), "cgroup path",
+                    "%s/memory/memory.oom_control", path) != 0) {
+    return 0;
+  }
   f = fopen(filepath, "r");
   if (f) {
     while (fgets(line, sizeof(line), f)) {
@@ -537,10 +571,12 @@ int cgroup_parse_container_info(const char *cgroup_path, char **namespace,
   if (uid_len == 0)
     return -1;
 
-  char *pod_uid = malloc(uid_len + 1);
-  if (!pod_uid)
+  char pod_uid[128];
+  if (uid_len >= sizeof(pod_uid)) {
+    log_error("cgroup pod UID too long (buffer size %zu)", sizeof(pod_uid));
     return -1;
-  strncpy(pod_uid, uid_start, uid_len);
+  }
+  memcpy(pod_uid, uid_start, uid_len);
   pod_uid[uid_len] = '\0';
 
   // Convert underscores back to dashes for display
@@ -557,12 +593,7 @@ int cgroup_parse_container_info(const char *cgroup_path, char **namespace,
     *namespace = strdup(env_ns ? env_ns : "unknown");
   }
   if (pod_name) {
-    *pod_name = env_name ? strdup(env_name) : pod_uid;
-    if (env_name) {
-      free(pod_uid);
-    }
-  } else {
-    free(pod_uid);
+    *pod_name = strdup(env_name ? env_name : pod_uid);
   }
 
   // Extract container name - prefer environment variable for sidecar mode
@@ -571,10 +602,20 @@ int cgroup_parse_container_info(const char *cgroup_path, char **namespace,
     if (env_container && env_container[0]) {
       *container_name = strdup(env_container);
     } else {
-      *container_name = extract_container_id(cgroup_path);
-      if (!*container_name) {
-        *container_name = strdup("main");
+      char id[NAME_MAX + 1];
+      int result = extract_container_id(cgroup_path, id, sizeof(id));
+      if (result < 0) {
+        if (namespace) {
+          free(*namespace);
+          *namespace = NULL;
+        }
+        if (pod_name) {
+          free(*pod_name);
+          *pod_name = NULL;
+        }
+        return -1;
       }
+      *container_name = strdup(result == 0 ? id : "main");
     }
   }
 
@@ -591,37 +632,59 @@ cgroup_source_t *cgroup_source_new(const char *cgroup_path) {
     return NULL;
 
   // Default base path
-  source->base_path = strdup(cgroup_path ? cgroup_path : "/sys/fs/cgroup");
-  if (!source->base_path) {
+  if (buffer_copy(source->base_path, sizeof(source->base_path),
+                  cgroup_path && cgroup_path[0] ? cgroup_path
+                                                : "/sys/fs/cgroup",
+                  "cgroup base path") != 0) {
     free(source);
     return NULL;
   }
 
   // Detect cgroup version
   source->version = detect_cgroup_version(source->base_path);
+  if (source->version == CGROUP_ERROR) {
+    free(source);
+    return NULL;
+  }
 
   // Auto-discover pod cgroup if explicit path is just the base
   const char *pod_uid = getenv("POD_UID");
   if (pod_uid && pod_uid[0]) {
-    source->discovered_path =
-        discover_pod_cgroup_by_uid(source->base_path, pod_uid);
-    if (source->discovered_path) {
+    if (discover_pod_cgroup_by_uid(source->base_path, pod_uid,
+                                   source->discovered_path,
+                                   sizeof(source->discovered_path)) < 0) {
+      free(source);
+      return NULL;
+    }
+    if (source->discovered_path[0]) {
       // Re-detect version at discovered path
       source->version = detect_cgroup_version(source->discovered_path);
+      if (source->version == CGROUP_ERROR) {
+        free(source);
+        return NULL;
+      }
     }
   }
 
   // Fallback: try /proc/self/cgroup discovery
-  if (!source->discovered_path) {
-    source->discovered_path = discover_self_cgroup(source->base_path);
-    if (source->discovered_path) {
+  if (!source->discovered_path[0]) {
+    if (discover_self_cgroup(source->base_path, source->discovered_path,
+                             sizeof(source->discovered_path)) < 0) {
+      free(source);
+      return NULL;
+    }
+    if (source->discovered_path[0]) {
       source->version = detect_cgroup_version(source->discovered_path);
+      if (source->version == CGROUP_ERROR) {
+        free(source);
+        return NULL;
+      }
     }
   }
 
   log_info("cgroup: source initialized base=%s discovered=%s version=%s",
            source->base_path,
-           source->discovered_path ? source->discovered_path : "(none)",
+           source->discovered_path[0] ? source->discovered_path : "(none)",
            source->version == CGROUP_V2   ? "v2"
            : source->version == CGROUP_V1 ? "v1"
                                           : "unknown");
@@ -631,8 +694,6 @@ cgroup_source_t *cgroup_source_new(const char *cgroup_path) {
 
 void cgroup_source_free(cgroup_source_t *source) {
   if (source) {
-    free(source->base_path);
-    free(source->discovered_path);
     free(source);
   }
 }
@@ -641,7 +702,7 @@ void cgroup_source_free(cgroup_source_t *source) {
 // Collection
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Recursively find container cgroups
+// Recursively find container cgroups; -2 indicates a path overflow.
 static int find_container_cgroups(const char *base_path,
                                   cgroup_version_t version,
                                   pressured_memory_sample_t *samples,
@@ -657,8 +718,12 @@ static int find_container_cgroups(const char *base_path,
     if (entry->d_name[0] == '.')
       continue;
 
-    char path[MAX_PATH];
-    snprintf(path, sizeof(path), "%s/%s", base_path, entry->d_name);
+    char path[PATH_MAX];
+    if (buffer_format(path, sizeof(path), "cgroup path", "%s/%s", base_path,
+                      entry->d_name) != 0) {
+      closedir(dir);
+      return -2;
+    }
 
     struct stat st;
     if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
@@ -677,8 +742,11 @@ static int find_container_cgroups(const char *base_path,
 
         // Skip containers without limits
         if (limit == UINT64_MAX || limit == 0) {
-          find_container_cgroups(path, version, samples, count, max_count,
-                                 memory_read);
+          if (find_container_cgroups(path, version, samples, count, max_count,
+                                     memory_read) == -2) {
+            closedir(dir);
+            return -2;
+          }
           continue;
         }
 
@@ -705,8 +773,11 @@ static int find_container_cgroups(const char *base_path,
     }
 
     // Recurse into subdirectories
-    find_container_cgroups(path, version, samples, count, max_count,
-                           memory_read);
+    if (find_container_cgroups(path, version, samples, count, max_count,
+                               memory_read) == -2) {
+      closedir(dir);
+      return -2;
+    }
   }
 
   closedir(dir);
@@ -726,7 +797,7 @@ pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count) {
 
   // If we have a discovered path (single pod mode), collect from container
   // cgroups within it
-  if (source->discovered_path) {
+  if (source->discovered_path[0]) {
     // Parse pod-level info from the discovered path
     char *ns = NULL, *pod = NULL, *pod_container = NULL;
     cgroup_parse_container_info(source->discovered_path, &ns, &pod,
@@ -748,8 +819,18 @@ pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count) {
             strstr(entry->d_name, "docker-") != NULL) {
 
           char container_path[PATH_MAX];
-          snprintf(container_path, sizeof(container_path), "%s/%s",
-                   source->discovered_path, entry->d_name);
+          if (buffer_format(container_path, sizeof(container_path),
+                            "cgroup path", "%s/%s", source->discovered_path,
+                            entry->d_name) != 0) {
+            closedir(dir);
+            free(ns);
+            free(pod);
+            free(pod_container);
+            cgroup_samples_free(samples, *count);
+            *count = 0;
+            source->collection_healthy = false;
+            return NULL;
+          }
 
           uint64_t usage;
           if (read_memory_current(container_path, &usage))
@@ -846,6 +927,11 @@ pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count) {
     int result =
         find_container_cgroups(source->base_path, source->version, samples,
                                count, MAX_CONTAINERS, &memory_read);
+    if (result == -2) {
+      cgroup_samples_free(samples, *count);
+      *count = 0;
+      return NULL;
+    }
     source->collection_healthy = result == 0 && memory_read;
   }
 
@@ -871,7 +957,7 @@ void cgroup_samples_free(pressured_memory_sample_t *samples, int count) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const char *cgroup_source_get_discovered_path(cgroup_source_t *source) {
-  return source ? source->discovered_path : NULL;
+  return source && source->discovered_path[0] ? source->discovered_path : NULL;
 }
 
 int cgroup_source_get_version(const cgroup_source_t *source) {

@@ -126,7 +126,7 @@ add_test(NAME test_health_check_cli
 
 add_executable(test_kubelet src/test_kubelet.c)
 target_link_libraries(test_kubelet pressured_core)
-foreach(case dedupe cache age collection series timestamps pod_timestamps)
+foreach(case dedupe cache age collection series timestamps pod_timestamps token)
     add_test(NAME test_kubelet_${case} COMMAND test_kubelet ${case})
 endforeach()
 
@@ -313,6 +313,15 @@ install(TARGETS pressured_plugin_lua DESTINATION lib/pressured/plugins)
 install(TARGETS storage_local DESTINATION lib/pressured/plugins)
 install(TARGETS storage_s3 DESTINATION lib/pressured/plugins)
 install(TARGETS pprof_plugin DESTINATION lib/pressured/plugins)
+
+
+add_executable(test_fixed_buffers src/test_fixed_buffers.c)
+target_link_libraries(test_fixed_buffers pressured_core)
+add_dependencies(test_fixed_buffers pressured_plugin_lua)
+set_target_properties(test_fixed_buffers PROPERTIES ENABLE_EXPORTS ON)
+foreach(case config health cgroup ca content_type stream_content_type pod_uid container_id lua_script lua_scripts_dir)
+    add_test(NAME test_fixed_buffers_${case} COMMAND test_fixed_buffers ${case})
+endforeach()
 
 # Tests rely on assert(); keep it enabled in Release builds (CI builds Release)
 get_property(_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
