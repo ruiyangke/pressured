@@ -1156,14 +1156,15 @@ static size_t etag_header_callback(char *buffer, size_t size, size_t nitems,
                                    void *userdata) {
   size_t total = size * nitems;
   etag_header_ctx_t *hdr = (etag_header_ctx_t *)userdata;
+  const char *end = buffer + total;
 
-  if (strncasecmp(buffer, "ETag:", 5) == 0) {
+  if (total >= 5 && strncasecmp(buffer, "ETag:", 5) == 0) {
     const char *value = buffer + 5;
-    while (*value == ' ' || *value == '\t')
+    while (value < end && (*value == ' ' || *value == '\t'))
       value++;
 
     size_t i = 0;
-    while (*value && *value != '\r' && *value != '\n') {
+    while (value < end && *value && *value != '\r' && *value != '\n') {
       if (*value != '"') {
         // Reserve one byte for the terminator; refuse to truncate
         if (i + 1 >= hdr->etag_size) {
@@ -1181,6 +1182,25 @@ static size_t etag_header_callback(char *buffer, size_t size, size_t nitems,
 
   return total;
 }
+
+#ifdef S3_UPLOAD_MULTIPART
+// Ensure the etags array can hold at least `needed` entries, doubling its
+// capacity as required. Returns 0 on success, -1 on allocation failure.
+static int s3_ensure_etag_capacity(s3_file_t *sf, int needed) {
+  if (needed <= sf->etags_capacity)
+    return 0;
+
+  int new_cap = sf->etags_capacity * 2;
+  char (*new_etags)[S3_ETAG_MAX] =
+      realloc(sf->etags, new_cap * sizeof *sf->etags);
+  if (!new_etags)
+    return -1;
+
+  sf->etags = new_etags;
+  sf->etags_capacity = new_cap;
+  return 0;
+}
+#endif
 
 static char *s3_create_multipart_upload(pressured_plugin_ctx_t *ctx,
                                         const char *key) {
@@ -1239,6 +1259,9 @@ static int s3_upload_part(pressured_plugin_ctx_t *ctx, const char *key,
                           const char *upload_id, int part_number,
                           const void *data, size_t len, char *etag_out,
                           size_t etag_out_size) {
+  if (etag_out_size == 0)
+    return -1;
+
   char url[MAX_URL_LEN];
   build_url(ctx, key, url, sizeof(url));
 
@@ -1269,9 +1292,7 @@ static int s3_upload_part(pressured_plugin_ctx_t *ctx, const char *key,
       .etag_size = etag_out_size,
       .failed = 0,
   };
-  if (etag_out_size > 0) {
-    etag_out[0] = '\0';
-  }
+  etag_out[0] = '\0';
   curl_easy_setopt(ctx->curl, CURLOPT_HEADERFUNCTION, etag_header_callback);
   curl_easy_setopt(ctx->curl, CURLOPT_HEADERDATA, &etag_ctx);
 
@@ -2145,18 +2166,8 @@ static int64_t s3_write(storage_file_t *f, const void *data, size_t len) {
     // If buffer reached minimum part size, upload it
     if (sf->write_buffer_size >= S3_MIN_PART_SIZE) {
       // Expand etags array if needed (check BEFORE incrementing part_number)
-      if (sf->part_number + 1 > sf->etags_capacity) {
-        int new_cap = sf->etags_capacity * 2;
-        char (*new_etags)[S3_ETAG_MAX] =
-            realloc(sf->etags, new_cap * S3_ETAG_MAX);
-        if (!new_etags)
-          return STORAGE_ERR_IO;
-        // Zero-initialize new slots
-        memset(new_etags + sf->etags_capacity, 0,
-               (new_cap - sf->etags_capacity) * S3_ETAG_MAX);
-        sf->etags = new_etags;
-        sf->etags_capacity = new_cap;
-      }
+      if (s3_ensure_etag_capacity(sf, sf->part_number + 1) != 0)
+        return STORAGE_ERR_IO;
 
       if (s3_upload_part(sf->ctx, sf->key, sf->upload_id, sf->part_number + 1,
                          sf->write_buffer, sf->write_buffer_size,
@@ -2373,21 +2384,11 @@ static int s3_close(storage_file_t *f) {
     // The last part can be smaller than S3_MIN_PART_SIZE
     if (sf->write_buffer_size > 0) {
       // Expand etags array if needed (check BEFORE incrementing part_number)
-      if (sf->part_number + 1 > sf->etags_capacity) {
-        int new_cap = sf->etags_capacity * 2;
-        char (*new_etags)[S3_ETAG_MAX] =
-            realloc(sf->etags, new_cap * S3_ETAG_MAX);
-        if (!new_etags) {
-          log_error("s3_storage: failed to expand etags array for final part");
-          s3_abort_multipart_upload(sf->ctx, sf->key, sf->upload_id);
-          rc = STORAGE_ERR_IO;
-          goto cleanup_multipart;
-        }
-        // Zero-initialize new slots
-        memset(new_etags + sf->etags_capacity, 0,
-               (new_cap - sf->etags_capacity) * S3_ETAG_MAX);
-        sf->etags = new_etags;
-        sf->etags_capacity = new_cap;
+      if (s3_ensure_etag_capacity(sf, sf->part_number + 1) != 0) {
+        log_error("s3_storage: failed to expand etags array for final part");
+        s3_abort_multipart_upload(sf->ctx, sf->key, sf->upload_id);
+        rc = STORAGE_ERR_IO;
+        goto cleanup_multipart;
       }
 
       log_info("s3_storage: flushing final part %d (%zu bytes)",
