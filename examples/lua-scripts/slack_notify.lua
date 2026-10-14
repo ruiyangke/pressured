@@ -8,6 +8,16 @@
 --   plugins.lua.slack.channels    - Channels to post to (comma-separated string or array)
 --   plugins.lua.slack.username    - Bot username (default: "Pressured")
 --   plugins.lua.slack.template    - Custom message template (see below)
+--   plugins.lua.slack.remind_seconds - Re-notify an unchanged condition at most
+--                                   this often (default: 3600, env:
+--                                   SLACK_REMIND_SECONDS, 0 = every event)
+--
+-- The event generator re-emits memory_pressure every cooldown period while a
+-- container stays above its threshold. To keep the channel usable, a message
+-- is only sent when:
+--   - a container is OOM killed
+--   - severity rises above what was last sent for that container
+--   - the condition is still ongoing after remind_seconds
 --
 -- Example config.json:
 --   {
@@ -51,6 +61,7 @@ local BOT_TOKEN = slack_cfg.bot_token or ctx.getenv("SLACK_BOT_TOKEN")
 local CHANNELS_STR = slack_cfg.channels or ctx.getenv("SLACK_CHANNELS")
 local USERNAME = slack_cfg.username or "Pressured"
 local TEMPLATE = slack_cfg.template
+local REMIND_SECONDS = tonumber(slack_cfg.remind_seconds or ctx.getenv("SLACK_REMIND_SECONDS")) or 3600
 
 local SLACK_API_URL = "https://slack.com/api/chat.postMessage"
 
@@ -66,6 +77,43 @@ local EVENT_EMOJI = {
     memory_pressure = ":warning:",
     oom_killed = ":skull:",
 }
+
+local SEVERITY_RANK = {
+    ok = 0,
+    warn = 1,
+    warning = 1,
+    critical = 2,
+}
+
+-- Last notification per container: { rank = severity rank, at = os.time() }
+local last_notified = {}
+
+-- Decide whether an event should be sent to Slack
+-- Returns: should_notify, is_reminder
+local function should_notify(event)
+    if event.event_type == "oom_killed" then
+        return true, false
+    end
+
+    local now = os.time()
+    local key = string.format("%s/%s/%s", event.namespace or "", event.pod_name or "", event.container_name or "")
+    local rank = SEVERITY_RANK[event.severity] or 0
+    local last = last_notified[key]
+
+    -- Forget containers that have been quiet longer than the reminder interval
+    for k, v in pairs(last_notified) do
+        if now - v.at >= REMIND_SECONDS then
+            last_notified[k] = nil
+        end
+    end
+
+    if last and rank <= last.rank and now - last.at < REMIND_SECONDS then
+        return false, false
+    end
+
+    last_notified[key] = { rank = rank, at = now }
+    return true, last ~= nil and rank <= last.rank
+end
 
 -- Parse channels string into array
 local function parse_channels(channels_input)
@@ -131,7 +179,7 @@ local function expand_template(template, vars)
 end
 
 -- Build default Slack payload (attachment format)
-local function build_default_payload(event, channel)
+local function build_default_payload(event, channel, reminder)
     local vars = build_vars(event)
 
     local title
@@ -139,6 +187,9 @@ local function build_default_payload(event, channel)
         title = string.format("%s OOM Kill: %s/%s", vars.emoji, vars.namespace, vars.pod_name)
     else
         title = string.format("%s Memory Pressure: %s/%s", vars.emoji, vars.namespace, vars.pod_name)
+        if reminder then
+            title = title .. " (ongoing)"
+        end
     end
 
     local fields = {
@@ -295,6 +346,12 @@ function on_event(event, ctx_arg)
         return "skipped"
     end
 
+    local notify, reminder = should_notify(event)
+    if not notify then
+        log.debug("Already notified for this condition, skipping")
+        return "suppressed"
+    end
+
     -- Check dry run
     if ctx_arg and ctx_arg.dry_run then
         log.info("Dry run - skipping Slack notification")
@@ -310,7 +367,7 @@ function on_event(event, ctx_arg)
         if TEMPLATE then
             payload = build_template_payload(event, channel, TEMPLATE)
         else
-            payload = build_default_payload(event, channel)
+            payload = build_default_payload(event, channel, reminder)
         end
 
         local ok, err = send_to_slack(payload)

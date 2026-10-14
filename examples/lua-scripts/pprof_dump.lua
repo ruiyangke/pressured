@@ -19,6 +19,12 @@
 --   Environment variables (fallback):
 --     PPROF_PORT - pprof endpoint port (default: 8080)
 --     PPROF_MODE - "sidecar" or "cluster" (default: cluster)
+--     PPROF_INTERVAL_SECONDS - capture an unchanged condition at most this
+--                              often per container (default: 3600, 0 = every event)
+--
+-- Profiles are captured when severity rises above the last capture for that
+-- container, or when the condition is still ongoing after
+-- PPROF_INTERVAL_SECONDS. Event metadata is uploaded for every event.
 --
 -- Event types handled:
 --   memory_pressure - High memory usage detected, captures pprof data
@@ -28,6 +34,39 @@
 local DEFAULT_PPROF_PORT = tonumber(ctx.getenv("PPROF_PORT")) or 8080
 local DEFAULT_PPROF_PATH = "/debug/pprof/heap"
 local PPROF_MODE = ctx.getenv("PPROF_MODE") or "cluster"
+local PPROF_INTERVAL_SECONDS = tonumber(ctx.getenv("PPROF_INTERVAL_SECONDS")) or 3600
+
+local SEVERITY_RANK = {
+    ok = 0,
+    warn = 1,
+    warning = 1,
+    critical = 2,
+}
+
+-- Last capture per container: { rank = severity rank, at = os.time() }
+local last_captured = {}
+
+-- Decide whether to capture profiles for this event
+local function should_capture(event)
+    local now = os.time()
+    local key = string.format("%s/%s/%s", event.namespace or "", event.pod_name or "", event.container_name or "")
+    local rank = SEVERITY_RANK[event.severity] or 0
+    local last = last_captured[key]
+
+    -- Forget containers that have been quiet longer than the capture interval
+    for k, v in pairs(last_captured) do
+        if now - v.at >= PPROF_INTERVAL_SECONDS then
+            last_captured[k] = nil
+        end
+    end
+
+    if last and rank <= last.rank and now - last.at < PPROF_INTERVAL_SECONDS then
+        return false
+    end
+
+    last_captured[key] = { rank = rank, at = now }
+    return true
+end
 
 -- Helper to safely get annotation value
 local function get_annotation(event, key)
@@ -61,10 +100,17 @@ local function get_pprof_config(event)
         end
     end
 
-    -- Get path from annotation
+    -- Get path from annotation. It must be an absolute path: it is appended
+    -- to "http://<host>:<port>", so a value like "@other-host/x" would
+    -- otherwise redirect the request to a different host.
     local path_ann = get_annotation(event, "pressured.io/pprof-path")
     if path_ann and path_ann ~= "" then
-        config.path = path_ann
+        if path_ann:sub(1, 1) == "/" and not path_ann:find("[%s%c]") then
+            config.path = path_ann
+        else
+            log.warn(string.format("[pprof] Ignoring invalid pressured.io/pprof-path %q, using %s",
+                path_ann, DEFAULT_PPROF_PATH))
+        end
     end
 
     return config
@@ -185,8 +231,13 @@ function on_event(event, ctx_arg)
 
     -- Check if pprof is disabled for this pod
     if not pprof_cfg.enabled then
-        log.info("[pprof] pprof disabled for this pod via annotation (pressured.io/pprof-enabled=false)")
+        log.info("[pprof] pprof not enabled for this pod (pressured.io/pprof-enabled is not \"true\")")
         return "pprof_disabled"
+    end
+
+    if not should_capture(event) then
+        log.info("[pprof] Already captured for this condition, skipping profiles")
+        return "capture_suppressed"
     end
 
     -- Get pprof host (pod IP in cluster mode, localhost in sidecar mode)
