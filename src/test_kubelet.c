@@ -216,6 +216,19 @@ static void test_nodes(kubelet_source_t *source) {
   assert(source->nodes[1].address[0] == '\0');
   assert(strcmp(source->nodes[2].name, "node-c") == 0);
   assert(source->nodes[2].address[0] == '\0');
+
+  // A null name is skipped and a null address type does not match InternalIP.
+  fixture_response =
+      "{\"items\":["
+      "{\"metadata\":{\"name\":null}},"
+      "{\"metadata\":{\"name\":\"node-d\"},\"status\":{\"addresses\":["
+      "{\"type\":null,\"address\":\"1.1.1.1\"},"
+      "{\"type\":\"InternalIP\",\"address\":\"2.2.2.2\"}]}}]}";
+  result = kubelet_refresh_nodes(source);
+  assert(result == 0);
+  assert(source->node_count == 1);
+  assert(strcmp(source->nodes[0].name, "node-d") == 0);
+  assert(strcmp(source->nodes[0].address, "2.2.2.2") == 0);
 }
 
 static void test_stats(kubelet_source_t *source) {
@@ -276,12 +289,12 @@ static void test_pod_limits(kubelet_source_t *source) {
   pressured_annotation_t *parsed = parse_annotations(NULL, &annotation_count);
   assert(parsed == NULL);
   assert(annotation_count == 0);
-  struct json_object *empty = json_tokener_parse("{}");
+  yyjson_doc *empty = pj_parse("{}", strlen("{}"), PJ_READ_API, "test");
   assert(empty);
-  parsed = parse_annotations(empty, &annotation_count);
+  parsed = parse_annotations(yyjson_doc_get_root(empty), &annotation_count);
   assert(parsed == NULL);
   assert(annotation_count == 0);
-  json_object_put(empty);
+  yyjson_doc_free(empty);
 
   fixture_response =
       "{\"items\":["
@@ -337,6 +350,45 @@ static void test_pod_limits(kubelet_source_t *source) {
   assert(noip->annotations == NULL);
   assert(noip->annotations_count == 0);
   assert(noip->pod_ip[0] == '\0');
+
+  // JSON null and wrong types behave as missing: a null namespace is skipped,
+  // null/non-string annotations read as "", a null podIP is empty and a
+  // null/numeric memory limit gives UINT64_MAX.
+  fixture_response =
+      "{\"items\":["
+      "{\"metadata\":{\"namespace\":null,\"name\":\"pod-nullns\"},\"spec\":{"
+      "\"containers\":[{\"name\":\"app\"}]}},"
+      "{\"metadata\":{\"namespace\":\"ns\",\"name\":\"pod-odd\","
+      "\"annotations\":{\"k\":null,\"n\":5,\"t\":\"x\"}},"
+      "\"status\":{\"podIP\":null},\"spec\":{\"containers\":["
+      "{\"name\":null},"
+      "{\"name\":\"nolimit\",\"resources\":{\"limits\":{\"memory\":null}}},"
+      "{\"name\":\"numeric\",\"resources\":{\"limits\":{\"memory\":1048576}}}]}"
+      "}]}";
+  result = kubelet_refresh_pod_limits(source);
+  assert(result == 0);
+  assert(source->pod_limit_count == 2);
+  assert(lookup_pod_info(source, "ns", "pod-nullns", "app") == NULL);
+
+  pod_limit_t *nolimit = lookup_pod_info(source, "ns", "pod-odd", "nolimit");
+  assert(nolimit != NULL);
+  assert(nolimit->limit_bytes == UINT64_MAX);
+  assert(nolimit->pod_ip[0] == '\0');
+  assert(lookup_pod_info(source, "ns", "pod-odd", "numeric")->limit_bytes ==
+         UINT64_MAX);
+  assert(nolimit->annotations_count == 3);
+  int saw_k = 0, saw_n = 0, saw_t = 0;
+  for (int i = 0; i < nolimit->annotations_count; i++) {
+    const char *key = nolimit->annotations[i].key;
+    const char *value = nolimit->annotations[i].value;
+    if (strcmp(key, "k") == 0)
+      saw_k = strcmp(value, "") == 0;
+    if (strcmp(key, "n") == 0)
+      saw_n = strcmp(value, "") == 0;
+    if (strcmp(key, "t") == 0)
+      saw_t = strcmp(value, "x") == 0;
+  }
+  assert(saw_k && saw_n && saw_t);
 }
 
 static void test_age(kubelet_source_t *source) {

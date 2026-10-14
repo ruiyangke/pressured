@@ -2,6 +2,7 @@
 #include "fixed_buffer.h"
 #include "internal.h"
 #include "log.h"
+#include "pjson.h"
 #include <ctype.h>
 #include <curl/curl.h>
 #include <errno.h>
@@ -323,53 +324,49 @@ static int kubelet_refresh_nodes(kubelet_source_t *source) {
   if (!response)
     return -1;
 
-  struct json_object *root = json_tokener_parse(response);
+  yyjson_doc *doc =
+      pj_parse(response, strlen(response), PJ_READ_API, "nodes response");
   free(response);
 
-  if (!root) {
+  if (!doc) {
     log_error("failed to parse nodes response");
     return -1;
   }
 
-  struct json_object *items;
-  if (!json_object_object_get_ex(root, "items", &items) ||
-      !json_object_is_type(items, json_type_array)) {
-    json_object_put(root);
+  yyjson_val *root = yyjson_doc_get_root(doc);
+  yyjson_val *items = yyjson_obj_get(root, "items");
+  if (!yyjson_is_arr(items)) {
+    yyjson_doc_free(doc);
     return -1;
   }
   source->node_count = 0;
   {
-    int len = json_object_array_length(items);
-    for (int i = 0; i < len && source->node_count < MAX_NODES; i++) {
-      struct json_object *node = json_object_array_get_idx(items, i);
-      struct json_object *metadata, *status, *name_obj;
+    size_t idx, max;
+    yyjson_val *node;
+    yyjson_arr_foreach(items, idx, max, node) {
+      if (source->node_count >= MAX_NODES)
+        break;
 
-      if (!json_object_object_get_ex(node, "metadata", &metadata))
-        continue;
-      if (!json_object_object_get_ex(metadata, "name", &name_obj))
+      yyjson_val *metadata = yyjson_obj_get(node, "metadata");
+      const char *name = yyjson_get_str(yyjson_obj_get(metadata, "name"));
+      if (!name)
         continue;
 
-      const char *name = json_object_get_string(name_obj);
       node_info_t *ni = &source->nodes[source->node_count];
       strncpy(ni->name, name, sizeof(ni->name) - 1);
 
       // Get node address (prefer InternalIP)
-      if (json_object_object_get_ex(node, "status", &status)) {
-        struct json_object *addresses;
-        if (json_object_object_get_ex(status, "addresses", &addresses)) {
-          int addr_len = json_object_array_length(addresses);
-          for (int j = 0; j < addr_len; j++) {
-            struct json_object *addr = json_object_array_get_idx(addresses, j);
-            struct json_object *type_obj, *addr_obj;
-            if (json_object_object_get_ex(addr, "type", &type_obj) &&
-                json_object_object_get_ex(addr, "address", &addr_obj)) {
-              const char *type = json_object_get_string(type_obj);
-              if (strcmp(type, "InternalIP") == 0) {
-                strncpy(ni->address, json_object_get_string(addr_obj),
-                        sizeof(ni->address) - 1);
-                break;
-              }
-            }
+      yyjson_val *addresses =
+          yyjson_obj_get(yyjson_obj_get(node, "status"), "addresses");
+      if (yyjson_is_arr(addresses)) {
+        size_t addr_idx, addr_max;
+        yyjson_val *addr;
+        yyjson_arr_foreach(addresses, addr_idx, addr_max, addr) {
+          const char *type = yyjson_get_str(yyjson_obj_get(addr, "type"));
+          const char *address = yyjson_get_str(yyjson_obj_get(addr, "address"));
+          if (type && address && strcmp(type, "InternalIP") == 0) {
+            strncpy(ni->address, address, sizeof(ni->address) - 1);
+            break;
           }
         }
       }
@@ -378,7 +375,7 @@ static int kubelet_refresh_nodes(kubelet_source_t *source) {
     }
   }
 
-  json_object_put(root);
+  yyjson_doc_free(doc);
   log_info("discovered %d nodes", source->node_count);
   return 0;
 }
@@ -421,13 +418,13 @@ static uint64_t parse_quantity(const char *str) {
 }
 
 // Helper to parse JSON annotations object into array
-static pressured_annotation_t *
-parse_annotations(struct json_object *annotations_obj, int *count) {
+static pressured_annotation_t *parse_annotations(yyjson_val *annotations_obj,
+                                                 int *count) {
   *count = 0;
-  if (!annotations_obj)
+  if (!yyjson_is_obj(annotations_obj))
     return NULL;
 
-  int n = json_object_object_length(annotations_obj);
+  size_t n = yyjson_obj_size(annotations_obj);
   if (n == 0)
     return NULL;
 
@@ -438,15 +435,13 @@ parse_annotations(struct json_object *annotations_obj, int *count) {
     return NULL;
   }
 
-  struct json_object_iterator it = json_object_iter_begin(annotations_obj);
-  struct json_object_iterator end = json_object_iter_end(annotations_obj);
+  size_t idx, max;
+  yyjson_val *key, *val;
+  yyjson_obj_foreach(annotations_obj, idx, max, key, val) {
+    const char *name = yyjson_get_str(key);
+    const char *value = yyjson_get_str(val);
 
-  while (!json_object_iter_equal(&it, &end)) {
-    const char *key = json_object_iter_peek_name(&it);
-    struct json_object *val = json_object_iter_peek_value(&it);
-    const char *value = json_object_get_string(val);
-
-    annotations[*count].key = strdup(key);
+    annotations[*count].key = strdup(name);
     annotations[*count].value = value ? strdup(value) : strdup("");
     if (!annotations[*count].key || !annotations[*count].value) {
       free_annotations(annotations, *count + 1);
@@ -454,8 +449,6 @@ parse_annotations(struct json_object *annotations_obj, int *count) {
       return NULL;
     }
     (*count)++;
-
-    json_object_iter_next(&it);
   }
 
   return annotations;
@@ -514,18 +507,19 @@ static int kubelet_refresh_pod_limits(kubelet_source_t *source) {
   if (!response)
     return -1;
 
-  struct json_object *root = json_tokener_parse(response);
+  yyjson_doc *doc =
+      pj_parse(response, strlen(response), PJ_READ_API, "pods response");
   free(response);
 
-  if (!root) {
+  if (!doc) {
     log_error("failed to parse pods response");
     return -1;
   }
 
-  struct json_object *items;
-  if (!json_object_object_get_ex(root, "items", &items) ||
-      !json_object_is_type(items, json_type_array)) {
-    json_object_put(root);
+  yyjson_val *root = yyjson_doc_get_root(doc);
+  yyjson_val *items = yyjson_obj_get(root, "items");
+  if (!yyjson_is_arr(items)) {
+    yyjson_doc_free(doc);
     return -1;
   }
 
@@ -534,46 +528,35 @@ static int kubelet_refresh_pod_limits(kubelet_source_t *source) {
   replacement.pod_limits =
       calloc(replacement.pod_limit_capacity, sizeof(pod_limit_t));
   if (!replacement.pod_limits) {
-    json_object_put(root);
+    yyjson_doc_free(doc);
     return -1;
   }
   kubelet_source_t *original = source;
   source = &replacement;
   {
-    int len = json_object_array_length(items);
-    for (int i = 0; i < len; i++) {
-      struct json_object *pod = json_object_array_get_idx(items, i);
-      struct json_object *metadata, *spec;
+    size_t pod_idx, pod_max;
+    yyjson_val *pod;
+    yyjson_arr_foreach(items, pod_idx, pod_max, pod) {
+      yyjson_val *metadata = yyjson_obj_get(pod, "metadata");
+      yyjson_val *spec = yyjson_obj_get(pod, "spec");
 
-      if (!json_object_object_get_ex(pod, "metadata", &metadata))
-        continue;
-      if (!json_object_object_get_ex(pod, "spec", &spec))
-        continue;
-
-      struct json_object *ns_obj, *name_obj;
-      if (!json_object_object_get_ex(metadata, "namespace", &ns_obj))
-        continue;
-      if (!json_object_object_get_ex(metadata, "name", &name_obj))
+      if (!metadata || !spec)
         continue;
 
-      const char *ns = json_object_get_string(ns_obj);
-      const char *pod_name = json_object_get_string(name_obj);
+      const char *ns = yyjson_get_str(yyjson_obj_get(metadata, "namespace"));
+      const char *pod_name = yyjson_get_str(yyjson_obj_get(metadata, "name"));
+      if (!ns || !pod_name)
+        continue;
 
       // Get pod IP from status
-      const char *pod_ip = NULL;
-      struct json_object *status;
-      if (json_object_object_get_ex(pod, "status", &status)) {
-        struct json_object *pod_ip_obj;
-        if (json_object_object_get_ex(status, "podIP", &pod_ip_obj)) {
-          pod_ip = json_object_get_string(pod_ip_obj);
-        }
-      }
+      const char *pod_ip = yyjson_get_str(
+          yyjson_obj_get(yyjson_obj_get(pod, "status"), "podIP"));
 
-      struct json_object *containers;
-      if (!json_object_object_get_ex(spec, "containers", &containers))
+      yyjson_val *containers = yyjson_obj_get(spec, "containers");
+      if (!yyjson_is_arr(containers))
         continue;
 
-      int container_count = json_object_array_length(containers);
+      size_t container_count = yyjson_arr_size(containers);
       if (container_count == 0)
         continue;
 
@@ -581,9 +564,8 @@ static int kubelet_refresh_pod_limits(kubelet_source_t *source) {
       // them)
       pressured_annotation_t *pod_annotations = NULL;
       int pod_annotations_count = 0;
-      struct json_object *annotations_obj;
-      if (json_object_object_get_ex(metadata, "annotations",
-                                    &annotations_obj)) {
+      yyjson_val *annotations_obj = yyjson_obj_get(metadata, "annotations");
+      if (annotations_obj) {
         pod_annotations =
             parse_annotations(annotations_obj, &pod_annotations_count);
         if (pod_annotations_count < 0)
@@ -592,25 +574,20 @@ static int kubelet_refresh_pod_limits(kubelet_source_t *source) {
 
       int annotations_consumed = 0; // Track if first container took ownership
 
-      for (int j = 0; j < container_count; j++) {
-        struct json_object *container =
-            json_object_array_get_idx(containers, j);
-        struct json_object *container_name_obj, *resources;
-
-        if (!json_object_object_get_ex(container, "name", &container_name_obj))
+      size_t container_idx, container_max;
+      yyjson_val *container;
+      yyjson_arr_foreach(containers, container_idx, container_max, container) {
+        const char *container_name =
+            yyjson_get_str(yyjson_obj_get(container, "name"));
+        if (!container_name)
           continue;
-        const char *container_name = json_object_get_string(container_name_obj);
 
         uint64_t limit = UINT64_MAX;
-        if (json_object_object_get_ex(container, "resources", &resources)) {
-          struct json_object *limits;
-          if (json_object_object_get_ex(resources, "limits", &limits)) {
-            struct json_object *mem_limit;
-            if (json_object_object_get_ex(limits, "memory", &mem_limit)) {
-              limit = parse_quantity(json_object_get_string(mem_limit));
-            }
-          }
-        }
+        yyjson_val *limits =
+            yyjson_obj_get(yyjson_obj_get(container, "resources"), "limits");
+        yyjson_val *mem_limit = yyjson_obj_get(limits, "memory");
+        if (mem_limit)
+          limit = parse_quantity(yyjson_get_str(mem_limit));
 
         // Add to cache
         if (source->pod_limit_count >= source->pod_limit_capacity) {
@@ -664,7 +641,7 @@ static int kubelet_refresh_pod_limits(kubelet_source_t *source) {
     }
   }
 
-  json_object_put(root);
+  yyjson_doc_free(doc);
   for (int i = 0; i < original->pod_limit_count; i++)
     free_annotations(original->pod_limits[i].annotations,
                      original->pod_limits[i].annotations_count);
@@ -676,7 +653,7 @@ static int kubelet_refresh_pod_limits(kubelet_source_t *source) {
   return 0;
 
 failed:
-  json_object_put(root);
+  yyjson_doc_free(doc);
   for (int i = 0; i < replacement.pod_limit_count; i++)
     free_annotations(replacement.pod_limits[i].annotations,
                      replacement.pod_limits[i].annotations_count);
