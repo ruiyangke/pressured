@@ -7,6 +7,10 @@ metadata:
     {{- include "pressured.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  {{- with .Values.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "pressured.selectorLabels" . | nindent 6 }}
@@ -53,26 +57,34 @@ spec:
             - "--log-level"
             - {{ .Values.config.log_level | quote }}
             {{- end }}
-          livenessProbe:
+          {{- with .Values.healthCheck }}
+          {{- if .enabled }}
+          {{- /* A heartbeat is written once per poll: never expect one more often */ -}}
+          {{- $poll := div $.Values.config.source.kubelet.poll_interval_ms 1000 }}
+          {{- $ready := max .readyMaxAgeSeconds (add (mul $poll 2) 30) }}
+          {{- $live := max .liveMaxAgeSeconds (add (mul $poll 3) 60) }}
+          # The image has no shell: probes ask pressured itself how old the
+          # heartbeat from its last healthy collection is
+          startupProbe:
             exec:
-              command:
-                - /bin/sh
-                - -c
-                - "test -f /proc/1/exe"
-            initialDelaySeconds: 10
-            periodSeconds: 30
+              command: ["/usr/local/bin/pressured", "--health-check={{ $live }}"]
+            periodSeconds: 10
             timeoutSeconds: 5
-            failureThreshold: 3
+            failureThreshold: {{ div (max .startupTimeoutSeconds $live) 10 | max 1 }}
           readinessProbe:
             exec:
-              command:
-                - /bin/sh
-                - -c
-                - "test -f /proc/1/exe"
-            initialDelaySeconds: 5
+              command: ["/usr/local/bin/pressured", "--health-check={{ $ready }}"]
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["/usr/local/bin/pressured", "--health-check={{ $live }}"]
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          {{- end }}
+          {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
@@ -109,6 +121,20 @@ spec:
             # Directory containing Lua script files
             - name: PRESSURED_LUA_SCRIPTS_DIR
               value: {{ .Values.lua.scriptsDir | quote }}
+            {{- end }}
+            {{- with .Values.lua.slack }}
+            {{- if .existingSecret }}
+            {{- range $.Values.extraEnvVars }}
+            {{- if eq .name "SLACK_BOT_TOKEN" }}
+            {{- fail "SLACK_BOT_TOKEN comes from lua.slack.existingSecret; remove it from extraEnvVars" }}
+            {{- end }}
+            {{- end }}
+            - name: SLACK_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .existingSecret }}
+                  key: {{ .botTokenKey | default "slack-bot-token" }}
+            {{- end }}
             {{- end }}
             {{- end }}
             {{- if .Values.storage.enabled }}

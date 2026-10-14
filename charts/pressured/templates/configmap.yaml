@@ -1,3 +1,64 @@
+{{- /* config.json is built as a dict and serialized, so it is always valid JSON */ -}}
+{{- $v := .Values -}}
+{{- $cluster := eq $v.mode "cluster" -}}
+
+{{- $kubelet := dict -}}
+{{- with $v.config.source.kubelet.namespace_filter }}{{ $_ := set $kubelet "namespace_filter" . }}{{ end -}}
+{{- with $v.config.source.kubelet.label_selector }}{{ $_ := set $kubelet "label_selector" . }}{{ end -}}
+{{- $source := dict
+      "mode" (ternary "kubelet" "cgroup" $cluster)
+      "poll_interval_ms" (ternary $v.config.source.kubelet.poll_interval_ms $v.config.source.cgroup.poll_interval_ms $cluster)
+      "cgroup" (dict "path" $v.config.source.cgroup.path)
+      "kubelet" $kubelet -}}
+
+{{- $config := dict
+      "source" $source
+      "thresholds" $v.config.thresholds
+      "dry_run" $v.config.dry_run
+      "log_level" $v.config.log_level -}}
+
+{{- if $v.storage.enabled }}
+{{- $backend := $v.storage.backend -}}
+{{- $storage := dict "backend" $backend -}}
+{{- if eq $backend "local" }}
+{{- $_ := set $storage "local" (dict "path" $v.storage.local.path) -}}
+{{- else if eq $backend "s3" }}
+{{- $s3 := dict "bucket" $v.storage.s3.bucket "prefix" $v.storage.s3.prefix "region" $v.storage.s3.region -}}
+{{- with $v.storage.s3.endpoint }}{{ $_ := set $s3 "endpoint" . }}{{ end -}}
+{{- $_ := set $storage "s3" $s3 -}}
+{{- else if eq $backend "gcs" }}
+{{- $_ := set $storage "gcs" (dict "bucket" $v.storage.gcs.bucket "prefix" $v.storage.gcs.prefix) -}}
+{{- else if eq $backend "azure" }}
+{{- $_ := set $storage "azure" (dict "container" $v.storage.azure.container "prefix" $v.storage.azure.prefix "storage_account" $v.storage.azure.storageAccount) -}}
+{{- end }}
+{{- $_ := set $config "storage" $storage -}}
+{{- end }}
+
+{{- $plugins := dict -}}
+{{- if $v.lua.enabled }}
+{{- $lua := dict -}}
+{{- if $v.lua.inlineScript }}
+{{- $_ := set $lua "inline_script" $v.lua.inlineScript -}}
+{{- else if or $v.lua.scripts $v.lua.existingConfigMap }}
+{{- $_ := set $lua "scripts_dir" $v.lua.scriptsDir -}}
+{{- end }}
+{{- with $v.lua.timeoutMs }}{{ $_ := set $lua "timeout_ms" . }}{{ end -}}
+{{- with $v.lua.slack }}
+{{- $slack := dict -}}
+{{- with .channels }}{{ $_ := set $slack "channels" . }}{{ end -}}
+{{- with .username }}{{ $_ := set $slack "username" . }}{{ end -}}
+{{- with .template }}{{ $_ := set $slack "template" . }}{{ end -}}
+{{- with .apiBase }}{{ $_ := set $slack "api_base" . }}{{ end -}}
+{{- if hasKey . "remindSeconds" }}{{ $_ := set $slack "remind_seconds" .remindSeconds }}{{ end -}}
+{{- if $slack }}{{ $_ := set $lua "slack" $slack }}{{ end -}}
+{{- end }}
+{{- $_ := set $plugins "lua" $lua -}}
+{{- end }}
+{{- if and $v.storage.enabled (ne $v.storage.backend "local") }}
+{{- /* Only one storage backend: keep the local one out of the way */ -}}
+{{- $_ := set $plugins "local-storage" (dict "enabled" false) -}}
+{{- end }}
+{{- if $plugins }}{{ $_ := set $config "plugins" $plugins }}{{ end -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -6,83 +67,4 @@ metadata:
     {{- include "pressured.labels" . | nindent 4 }}
 data:
   config.json: |
-    {
-      "source": {
-        "mode": {{ if eq .Values.mode "cluster" }}"kubelet"{{ else }}"cgroup"{{ end }},
-        "poll_interval_ms": {{ if eq .Values.mode "cluster" }}{{ .Values.config.source.kubelet.poll_interval_ms }}{{ else }}{{ .Values.config.source.cgroup.poll_interval_ms }}{{ end }},
-        "cgroup": {
-          "path": {{ .Values.config.source.cgroup.path | quote }}
-        },
-        "kubelet": {
-          {{- $kubeletItems := list }}
-          {{- if .Values.config.source.kubelet.namespace_filter }}
-          {{- $kubeletItems = append $kubeletItems (printf "\"namespace_filter\": %s" (.Values.config.source.kubelet.namespace_filter | quote)) }}
-          {{- end }}
-          {{- if .Values.config.source.kubelet.label_selector }}
-          {{- $kubeletItems = append $kubeletItems (printf "\"label_selector\": %s" (.Values.config.source.kubelet.label_selector | quote)) }}
-          {{- end }}
-          {{- if $kubeletItems }}
-          {{ join ",\n          " $kubeletItems | nindent 10 }}
-          {{- end }}
-        }
-      },
-      "thresholds": {
-        "warn_percent": {{ .Values.config.thresholds.warn_percent }},
-        "critical_percent": {{ .Values.config.thresholds.critical_percent }},
-        "hysteresis_percent": {{ .Values.config.thresholds.hysteresis_percent }},
-        "cooldown_seconds": {{ .Values.config.thresholds.cooldown_seconds }}
-      },
-      {{- if .Values.storage.enabled }}
-      "storage": {
-        "backend": {{ .Values.storage.backend | quote }},
-        {{- if eq .Values.storage.backend "local" }}
-        "local": {
-          "path": {{ .Values.storage.local.path | quote }}
-        }
-        {{- else if eq .Values.storage.backend "s3" }}
-        "s3": {
-          "bucket": {{ .Values.storage.s3.bucket | quote }},
-          "prefix": {{ .Values.storage.s3.prefix | quote }},
-          "region": {{ .Values.storage.s3.region | quote }}
-          {{- if .Values.storage.s3.endpoint }},
-          "endpoint": {{ .Values.storage.s3.endpoint | quote }}
-          {{- end }}
-        }
-        {{- else if eq .Values.storage.backend "gcs" }}
-        "gcs": {
-          "bucket": {{ .Values.storage.gcs.bucket | quote }},
-          "prefix": {{ .Values.storage.gcs.prefix | quote }}
-        }
-        {{- else if eq .Values.storage.backend "azure" }}
-        "azure": {
-          "container": {{ .Values.storage.azure.container | quote }},
-          "prefix": {{ .Values.storage.azure.prefix | quote }},
-          "storage_account": {{ .Values.storage.azure.storageAccount | quote }}
-        }
-        {{- end }}
-      },
-      {{- end }}
-      {{- if or .Values.lua.enabled (and .Values.storage.enabled (ne .Values.storage.backend "local")) }}
-      "plugins": {
-        {{- if .Values.lua.enabled }}
-        "lua": {
-          {{- if .Values.lua.inlineScript }}
-          "inline_script": {{ .Values.lua.inlineScript | quote }}
-          {{- else if or .Values.lua.scripts .Values.lua.existingConfigMap }}
-          "scripts_dir": {{ .Values.lua.scriptsDir | quote }}
-          {{- end }}
-          {{- if .Values.lua.timeoutMs }},
-          "timeout_ms": {{ .Values.lua.timeoutMs }}
-          {{- end }}
-        }{{ if and .Values.storage.enabled (ne .Values.storage.backend "local") }},{{ end }}
-        {{- end }}
-        {{- if and .Values.storage.enabled (ne .Values.storage.backend "local") }}
-        "storage_local": {
-          "enabled": false
-        }
-        {{- end }}
-      },
-      {{- end }}
-      "dry_run": {{ .Values.config.dry_run }},
-      "log_level": {{ .Values.config.log_level | quote }}
-    }
+    {{- toPrettyJson $config | nindent 4 }}

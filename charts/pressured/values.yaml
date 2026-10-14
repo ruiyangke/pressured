@@ -8,6 +8,28 @@ mode: cluster
 
 replicaCount: 1
 
+# Every replica watches the whole cluster and sends its own alerts, so run one.
+# Recreate stops the old pod before starting the new one during upgrades, so
+# two never alert at once. OOM kills in the short gap are usually still
+# reported: pod status keeps the last termination and kills from the last
+# 5 minutes are replayed on start (not if the pod was deleted meanwhile).
+strategy:
+  type: Recreate
+
+# Health probes. pressured writes a heartbeat after each healthy collection
+# (API reachable and authorized, stats from at least one node, pod list read);
+# probes run `pressured --health-check=<max age>` against it. Needs an image
+# whose `pressured --help` lists --health-check; set enabled: false for older
+# images. Ages are raised automatically for long poll intervals.
+healthCheck:
+  enabled: true
+  # Not ready (and not counted as rolled out) when the heartbeat is older
+  readyMaxAgeSeconds: 120
+  # Restarted when the heartbeat is older (allow for slow event handlers)
+  liveMaxAgeSeconds: 300
+  # Time allowed for the first healthy collection after start
+  startupTimeoutSeconds: 300
+
 image:
   repository: ghcr.io/ruiyangke/pressured
   pullPolicy: IfNotPresent
@@ -130,8 +152,21 @@ lua:
   #   end
   inlineScript: ""
   # Lua scripts as ConfigMap entries (name -> script content)
-  # Each entry becomes a .lua file mounted in scriptsDir
+  # Each entry becomes a .lua file mounted in scriptsDir; scripts run in
+  # filename order. Changing them restarts the pod.
+  #   helm upgrade ... --set-file 'lua.scripts.slack_notify\.lua=examples/lua-scripts/slack_notify.lua'
   scripts: {}
+  # Use a ConfigMap you manage instead (pods are not restarted when it changes)
+  existingConfigMap: ""
+  # Settings for examples/lua-scripts/slack_notify.lua (plugins.lua.slack)
+  slack: {}
+  #   channels: "#alerts"            # comma-separated, or a list
+  #   username: "Pressured"
+  #   remindSeconds: 3600            # re-notify an ongoing condition at most this often
+  #   apiBase: "https://slack.com/api/"
+  #   template: ""                   # see slack_notify.lua
+  #   existingSecret: "slack"        # Secret with the bot token -> SLACK_BOT_TOKEN
+  #   botTokenKey: "slack-bot-token"
   # Example:
   #   alert.lua: |
   #     function on_event(event, ctx)
