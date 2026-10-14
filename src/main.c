@@ -20,7 +20,7 @@ static void signal_handler(int sig) {
 
 static void print_usage(const char *program) {
   printf("Usage: %s [options]\n", program);
-  printf("       %s --health-check [max_age_seconds]\n", program);
+  printf("       %s --health-check[=max_age_seconds]\n", program);
   printf("  Probe default: 300 seconds; PRESSURED_HEALTH_FILE defaults to "
          "/tmp/pressured.healthy\n");
   printf("\nOptions:\n");
@@ -35,6 +35,10 @@ static void print_usage(const char *program) {
 int main(int argc, char *argv[]) {
   if (argc > 1 && strcmp(argv[1], "--health-check") == 0)
     return health_check_cli(argc - 2, argv + 2);
+  if (argc > 1 && strncmp(argv[1], "--health-check=", 15) == 0) {
+    char *max_age = argv[1] + 15;
+    return health_check_cli(argc - 1, &max_age);
+  }
 
   const char *config_path = NULL;
   const char *log_level = "info";
