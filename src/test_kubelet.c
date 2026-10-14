@@ -207,6 +207,28 @@ static void test_cache(kubelet_source_t *source) {
     assert(strcmp(pod->annotations[0].value, "value") == 0);
   }
 
+  // A refresh that fails after the spare generation was reset (the key buffer
+  // overflows on the long container name) must leave the current generation
+  // and its lookups untouched, just like a failure before the reset.
+  char long_name[601];
+  memset(long_name, 'c', sizeof(long_name) - 1);
+  long_name[sizeof(long_name) - 1] = '\0';
+  char long_response[2048];
+  snprintf(long_response, sizeof(long_response),
+           "{\"items\":[{\"metadata\":{\"namespace\":\"ns\",\"name\":\"pod2\"},"
+           "\"status\":{\"podIP\":\"10.0.0.1\"},\"spec\":{\"containers\":["
+           "{\"name\":\"ok\"},{\"name\":\"%s\"}]}}]}",
+           long_name);
+  fixture_response = long_response;
+  result = kubelet_refresh_pod_limits(source);
+  assert(result == -1);
+  assert(source->cache_current == current);
+  pod_limit_t *late = lookup_pod_info(source, "ns", "pod", "app");
+  assert(late != NULL);
+  assert(late->limit_bytes == 1048576);
+  assert(late->annotations_count == 1);
+  assert(strcmp(late->annotations[0].value, "value") == 0);
+
   // Rebuilding the same response into alternating generations reuses each
   // arena's chunks instead of growing it. A 4 KiB annotation makes a few
   // refreshes outgrow one chunk if the spare generation were not reset.
@@ -325,7 +347,10 @@ static void test_stats(kubelet_source_t *source) {
       "{\"name\":\"nolimit\"}]}},"
       "{\"metadata\":{\"namespace\":\"ns\",\"name\":\"pod-b\"},\"spec\":{"
       "\"containers\":[{\"name\":\"big\",\"resources\":{\"limits\":{\"memory\":"
-      "\"1Gi\"}}}]}}]}";
+      "\"1Gi\"}}}]}},"
+      "{\"metadata\":{\"namespace\":\"ns\",\"name\":\"pod-emptyip\"},"
+      "\"status\":{\"podIP\":\"\"},\"spec\":{\"containers\":[{\"name\":\"app\","
+      "\"resources\":{\"limits\":{\"memory\":\"1Mi\"}}}]}}]}";
   int result = kubelet_refresh_pod_limits(source);
   assert(result == 0);
 
@@ -343,13 +368,18 @@ static void test_stats(kubelet_source_t *source) {
       "18446744073709551615}}]},"
       // pod-c has no cached limit, so its container must be skipped.
       "{\"podRef\":{\"namespace\":\"ns\",\"name\":\"pod-c\"},\"containers\":["
-      "{\"name\":\"app\",\"memory\":{\"workingSetBytes\":42}}]}]}";
+      "{\"name\":\"app\",\"memory\":{\"workingSetBytes\":42}}]},"
+      // pod-emptyip has a cached limit and an empty podIP.
+      "{\"podRef\":{\"namespace\":\"ns\",\"name\":\"pod-emptyip\"},"
+      "\"containers\":[{\"name\":\"app\",\"memory\":{\"workingSetBytes\":1}}]}]"
+      "}";
   pressured_memory_sample_t samples[8] = {0};
   int count = 0;
   assert(collect_from_node(source, "node-a", samples, &count, 8) == 0);
   // Null and string workingSetBytes are not numbers, so those containers and
-  // pod-c (no cached limit) are skipped; only int, float and big remain.
-  assert(count == 3);
+  // pod-c (no cached limit) are skipped; int, float, big and pod-emptyip's app
+  // remain.
+  assert(count == 4);
 
   assert(strcmp(samples[0].container_name, "int") == 0);
   assert(samples[0].usage_bytes == 500);
@@ -364,6 +394,11 @@ static void test_stats(kubelet_source_t *source) {
   assert(strcmp(samples[2].container_name, "big") == 0);
   assert(samples[2].usage_bytes == 9223372036854775807ULL);
   assert(samples[2].limit_bytes == 1073741824ULL);
+
+  // A pod whose podIP is the empty string keeps pod_ip NULL on its sample.
+  assert(strcmp(samples[3].pod_name, "pod-emptyip") == 0);
+  assert(strcmp(samples[3].container_name, "app") == 0);
+  assert(samples[3].pod_ip == NULL);
 
   // The sample borrows the pod cache's annotations rather than copying them,
   // and kubelet samples carry no pod UID.
@@ -431,7 +466,11 @@ static void test_pod_limits(kubelet_source_t *source) {
       "{\"name\":\"none\"}]}},"
       "{\"metadata\":{\"namespace\":\"ns\",\"name\":\"pod-noip\"},\"spec\":{"
       "\"containers\":[{\"name\":\"app\",\"resources\":{\"limits\":{\"memory\":"
-      "\"2Mi\"}}}]}}]}";
+      "\"2Mi\"}}}]}},"
+      // An explicitly empty podIP reads as absent, like a missing one.
+      "{\"metadata\":{\"namespace\":\"ns\",\"name\":\"pod-emptyip\"},"
+      "\"status\":{\"podIP\":\"\"},\"spec\":{\"containers\":[{\"name\":\"app\","
+      "\"resources\":{\"limits\":{\"memory\":\"2Mi\"}}}]}}]}";
   int result = kubelet_refresh_pod_limits(source);
   assert(result == 0);
 
@@ -471,6 +510,12 @@ static void test_pod_limits(kubelet_source_t *source) {
   assert(noip->annotations == NULL);
   assert(noip->annotations_count == 0);
   assert(noip->pod_ip == NULL);
+
+  // An empty pod IP is stored as NULL, not as an empty string.
+  pod_limit_t *emptyip = lookup_pod_info(source, "ns", "pod-emptyip", "app");
+  assert(emptyip != NULL);
+  assert(emptyip->limit_bytes == 2 * 1048576);
+  assert(emptyip->pod_ip == NULL);
 
   // JSON null and wrong types behave as missing: a null namespace is skipped,
   // null/non-string annotations read as "", a null podIP is empty and a
@@ -1008,6 +1053,61 @@ static const char *cycles_route(const char *path) {
   return "{\"items\":[]}";
 }
 
+// A cycle-3-like response with longer names. Three pods keep the cycle arena
+// under one chunk per collect; without a reset the strings would need a second
+// chunk long before the twentieth collect.
+#define GROWN_PODS 3
+static char grown_name[450];
+static char grown_node_name[250];
+static char grown_stats[8192];
+static char grown_pods[8192];
+static char grown_nodes[1024];
+
+static const char *grown_route(const char *path) {
+  if (strstr(path, "/stats/summary"))
+    return grown_stats;
+  if (strstr(path, "/nodes"))
+    return grown_nodes;
+  if (strstr(path, "/pods"))
+    return grown_pods;
+  return "{\"items\":[]}";
+}
+
+static void build_grown_fixtures(void) {
+  memset(grown_name, 'p', sizeof(grown_name) - 1);
+  grown_name[sizeof(grown_name) - 1] = '\0';
+  memset(grown_node_name, 'n', sizeof(grown_node_name) - 1);
+  grown_node_name[sizeof(grown_node_name) - 1] = '\0';
+
+  snprintf(grown_nodes, sizeof(grown_nodes),
+           "{\"items\":[{\"metadata\":{\"name\":\"%s\"},\"status\":"
+           "{\"addresses\":[{\"type\":\"InternalIP\",\"address\":"
+           "\"10.0.0.9\"}]}}]}",
+           grown_node_name);
+
+  size_t used =
+      (size_t)snprintf(grown_stats, sizeof(grown_stats), "{\"pods\":[");
+  for (int i = 0; i < GROWN_PODS; i++) {
+    used += (size_t)snprintf(
+        grown_stats + used, sizeof(grown_stats) - used,
+        "%s{\"podRef\":{\"namespace\":\"shop\",\"name\":\"%s\"},\"containers\":"
+        "[{\"name\":\"app\",\"memory\":{\"workingSetBytes\":600000}}]}",
+        i ? "," : "", grown_name);
+  }
+  snprintf(grown_stats + used, sizeof(grown_stats) - used, "]}");
+
+  used = (size_t)snprintf(grown_pods, sizeof(grown_pods), "{\"items\":[");
+  for (int i = 0; i < GROWN_PODS; i++) {
+    used += (size_t)snprintf(
+        grown_pods + used, sizeof(grown_pods) - used,
+        "%s{\"metadata\":{\"namespace\":\"shop\",\"name\":\"%s\"},\"spec\":{"
+        "\"containers\":[{\"name\":\"app\",\"resources\":{\"limits\":"
+        "{\"memory\":\"1Mi\"}}}]}}",
+        i ? "," : "", grown_name);
+  }
+  snprintf(grown_pods + used, sizeof(grown_pods) - used, "]}");
+}
+
 // Pins the sample strings and pod cache across several collection cycles so a
 // later lifetime change that leaves a dangling pointer is caught here.
 static void test_cycles(kubelet_source_t *source) {
@@ -1061,6 +1161,29 @@ static void test_cycles(kubelet_source_t *source) {
       }
     }
   }
+  // Repeating the third cycle's workload must not grow the cycle arena: each
+  // collect resets it, so its capacity after the twentieth run matches the
+  // second. The grown names make a missing reset outgrow the first chunk.
+  build_grown_fixtures();
+  route = grown_route;
+  cycle = 3;
+  size_t capacity = 0;
+  for (int i = 0; i < 20; i++) {
+    int count = 0;
+    pressured_memory_sample_t *samples = kubelet_collect(source, &count);
+    assert(samples);
+    assert(count == GROWN_PODS);
+    for (int j = 0; j < count; j++) {
+      assert(strcmp(samples[j].namespace, "shop") == 0);
+      assert(strcmp(samples[j].pod_name, grown_name) == 0);
+      assert(strcmp(samples[j].container_name, "app") == 0);
+      assert(strcmp(samples[j].node_name, grown_node_name) == 0);
+    }
+    if (i == 1)
+      capacity = arena_capacity(&source->cycle);
+  }
+  assert(arena_capacity(&source->cycle) == capacity);
+
   route = NULL;
   event_generator_free(gen);
 }

@@ -19,6 +19,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+// struct cgroup_source and its cycle arena are private to cgroup.c; include it
+// the way test_kubelet.c includes kubelet.c so the tests can inspect them.
+#include "cgroup.c"
+
 static int tests_passed = 0;
 static int tests_total = 0;
 
@@ -346,27 +350,127 @@ TEST(collect_samples) {
   int count = 0;
   pressured_memory_sample_t *samples = cgroup_collect(source, &count);
 
-  // Should find at least the container
+  // Should find exactly the container.
   printf("(found %d samples) ", count);
   assert(samples != NULL);
-  if (count > 0) {
-    // Sample strings live in the source's cycle arena and stay readable.
-    assert(samples[0].namespace != NULL && samples[0].namespace[0] != '\0');
-    assert(samples[0].pod_name != NULL && samples[0].pod_name[0] != '\0');
-    assert(samples[0].container_name != NULL &&
-           samples[0].container_name[0] != '\0');
-    assert(samples[0].node_name != NULL &&
-           strcmp(samples[0].node_name, "localhost") == 0);
-  }
+  assert(count == 1);
+  // Sample strings live in the source's cycle arena and stay readable.
+  assert(samples[0].namespace != NULL && samples[0].namespace[0] != '\0');
+  assert(samples[0].pod_name != NULL && samples[0].pod_name[0] != '\0');
+  assert(samples[0].container_name != NULL &&
+         samples[0].container_name[0] != '\0');
+  assert(samples[0].node_name != NULL &&
+         strcmp(samples[0].node_name, "localhost") == 0);
 
   // A second collect resets the cycle and must still work; the first cycle's
   // samples are not used after this.
   int second_count = 0;
   pressured_memory_sample_t *second = cgroup_collect(source, &second_count);
   assert(second != NULL);
-  if (second_count > 0)
-    assert(second[0].namespace != NULL && second[0].namespace[0] != '\0');
+  assert(second_count == 1);
+  assert(second[0].namespace != NULL && second[0].namespace[0] != '\0');
 
+  cgroup_source_free(source);
+}
+
+// A single discovered pod: with no container scopes the pod-level reading is
+// used, and with scopes each container becomes a sample. Repeating a layout
+// must reuse the cycle arena rather than grow it.
+TEST(collect_single_pod) {
+  char base[512], pod[1024], container[1024], file[1100];
+  snprintf(base, sizeof(base), "%s/single", test_dir);
+  create_dir(base);
+  snprintf(pod, sizeof(pod), "%s/kubepods.slice", base);
+  create_dir(pod);
+  snprintf(pod, sizeof(pod), "%s/kubepods.slice/kubepods-burstable.slice",
+           base);
+  create_dir(pod);
+  snprintf(pod, sizeof(pod),
+           "%s/kubepods.slice/kubepods-burstable.slice/"
+           "kubepods-burstable-podabc123_def456.slice",
+           base);
+  create_dir(pod);
+  snprintf(file, sizeof(file), "%s/memory.current", pod);
+  create_file(file, "1000000\n");
+  snprintf(file, sizeof(file), "%s/memory.max", pod);
+  create_file(file, "10000000\n");
+
+  // A pod name larger than a standard arena chunk gives the cycle arena an
+  // oversize chunk: if cgroup_collect did not reset the cycle each time, those
+  // chunks would accumulate and the capacity would grow.
+  static char long_pod_name[33000];
+  memset(long_pod_name, 'p', sizeof(long_pod_name) - 1);
+  long_pod_name[sizeof(long_pod_name) - 1] = '\0';
+
+  assert(setenv("POD_UID", "abc123-def456", 1) == 0);
+  assert(setenv("POD_NAMESPACE", "shop", 1) == 0);
+  assert(setenv("POD_NAME", long_pod_name, 1) == 0);
+  unsetenv("CONTAINER_NAME");
+
+  cgroup_source_t *source = cgroup_source_new(base);
+  assert(source != NULL);
+  assert(cgroup_source_get_discovered_path(source) != NULL);
+
+  // Fallback path: no container scopes, so the pod-level reading is used.
+  size_t capacity = 0;
+  for (int i = 0; i < 3; i++) {
+    int count = 0;
+    pressured_memory_sample_t *samples = cgroup_collect(source, &count);
+    assert(samples != NULL);
+    assert(count == 1);
+    assert(strcmp(samples[0].namespace, "shop") == 0);
+    assert(strcmp(samples[0].pod_name, long_pod_name) == 0);
+    assert(strcmp(samples[0].container_name, "main") == 0);
+    assert(strcmp(samples[0].node_name, "localhost") == 0);
+    assert(samples[0].pod_uid != NULL);
+    assert(strcmp(samples[0].pod_uid, "abc123-def456") == 0);
+    if (i == 1)
+      capacity = arena_capacity(&source->cycle);
+  }
+  assert(arena_capacity(&source->cycle) == capacity);
+
+  // Per-container path: one scope per runtime, each with its own files.
+  snprintf(container, sizeof(container), "%s/cri-containerd-0123abcd.scope",
+           pod);
+  create_dir(container);
+  snprintf(file, sizeof(file), "%s/memory.current", container);
+  create_file(file, "4000000\n");
+  snprintf(file, sizeof(file), "%s/memory.max", container);
+  create_file(file, "8000000\n");
+  snprintf(container, sizeof(container), "%s/docker-feedbeef.scope", pod);
+  create_dir(container);
+  snprintf(file, sizeof(file), "%s/memory.current", container);
+  create_file(file, "4000000\n");
+  snprintf(file, sizeof(file), "%s/memory.max", container);
+  create_file(file, "8000000\n");
+
+  capacity = 0;
+  for (int i = 0; i < 3; i++) {
+    int count = 0;
+    pressured_memory_sample_t *samples = cgroup_collect(source, &count);
+    assert(samples != NULL);
+    assert(count == 2);
+    int saw_containerd = 0, saw_docker = 0;
+    for (int j = 0; j < count; j++) {
+      assert(strcmp(samples[j].namespace, "shop") == 0);
+      assert(strcmp(samples[j].pod_name, long_pod_name) == 0);
+      assert(strcmp(samples[j].node_name, "localhost") == 0);
+      assert(samples[j].pod_uid != NULL);
+      assert(strcmp(samples[j].pod_uid, "abc123-def456") == 0);
+      if (strcmp(samples[j].container_name, "0123abcd") == 0)
+        saw_containerd = 1;
+      if (strcmp(samples[j].container_name, "feedbeef") == 0)
+        saw_docker = 1;
+    }
+    assert(saw_containerd && saw_docker);
+    if (i == 1)
+      capacity = arena_capacity(&source->cycle);
+  }
+  assert(arena_capacity(&source->cycle) == capacity);
+
+  unsetenv("POD_UID");
+  unsetenv("POD_NAMESPACE");
+  unsetenv("POD_NAME");
   cgroup_source_free(source);
 }
 
@@ -404,6 +508,7 @@ int main(void) {
   printf("\nIntegration:\n");
   RUN_TEST(source_creation_default);
   RUN_TEST(collect_samples);
+  RUN_TEST(collect_single_pod);
 
   cleanup_test_dir();
 
