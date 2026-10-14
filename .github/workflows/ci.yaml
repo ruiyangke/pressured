@@ -25,7 +25,6 @@ jobs:
             cmake \
             pkgconfig \
             curl-dev \
-            json-c-dev \
             lua5.4-dev \
             openssl-dev
 

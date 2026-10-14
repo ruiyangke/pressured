@@ -2,7 +2,6 @@
 #include "internal.h"
 #include "plugin_manager.h"
 #include <assert.h>
-#include <json-c/json.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -92,22 +91,19 @@ int main(int argc, char **argv) {
     assert(!ns && !pod && !container);
   } else if (strcmp(argv[1], "lua_script") == 0 ||
              strcmp(argv[1], "lua_scripts_dir") == 0) {
-    struct json_object *root = json_object_new_object();
-    struct json_object *plugins = json_object_new_object();
-    struct json_object *lua = json_object_new_object();
-    json_object_object_add(root, "plugins", plugins);
-    json_object_object_add(plugins, "lua", lua);
-    json_object_object_add(lua, argv[1] + 4, json_object_new_string(value));
+    /* value is a long path of ordinary path characters, so no JSON escaping
+     * is needed */
+    char json[PATH_MAX + 64];
+    snprintf(json, sizeof(json), "{\"plugins\":{\"lua\":{\"%s\":\"%s\"}}}",
+             argv[1] + 4, value);
     service_registry_t *registry = service_registry_new();
     assert(registry);
     plugin_manager_t *manager = plugin_manager_new(registry);
     assert(manager);
-    assert(plugin_manager_load(manager, "plugins/lua.so",
-                               json_object_to_json_string(root)) == 0);
+    assert(plugin_manager_load(manager, "plugins/lua.so", json) == 0);
     assert(plugin_manager_count(manager) == 0);
     plugin_manager_free(manager);
     service_registry_free(registry);
-    json_object_put(root);
   } else if (strcmp(argv[1], "ca") == 0) {
     http_opts_t opts = {.ca_path = value};
     assert(http_client_new(&opts) == NULL);

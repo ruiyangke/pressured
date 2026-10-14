@@ -3,7 +3,7 @@ FROM alpine:3.24 AS builder
 
 RUN apk add --no-cache \
     build-base cmake ninja pkgconfig wget \
-    mbedtls-dev zlib-dev json-c-dev lua5.4-dev
+    mbedtls-dev zlib-dev lua5.4-dev
 
 # Build curl with mbedTLS (Alpine's curl uses OpenSSL)
 ARG CURL_VERSION=8.22.0
@@ -47,7 +47,7 @@ RUN PKG_CONFIG_PATH=/usr/local/lib/pkgconfig \
 # Runtime stage - extract only needed libraries
 FROM alpine:3.24 AS runtime
 
-RUN apk add --no-cache mbedtls json-c lua5.4-libs zlib ca-certificates
+RUN apk add --no-cache mbedtls lua5.4-libs zlib ca-certificates
 
 # Stage libraries with symlinks preserved (COPY dereferences symlinks with globs)
 RUN mkdir -p /staged/lib /staged/usr/lib /staged/usr/local/lib
@@ -60,7 +60,6 @@ RUN cp -a /tmp/curl-lib/libcurl.so* /staged/usr/local/lib/ && \
           /usr/lib/libmbedx509.so* \
           /usr/lib/libmbedcrypto.so* \
           /usr/lib/libtfpsacrypto.so* \
-          /usr/lib/libjson-c.so* \
           /usr/lib/libz.so* \
           /staged/usr/lib/ && \
     cp -a /usr/lib/lua5.4/liblua-5.4.so* /staged/usr/lib/

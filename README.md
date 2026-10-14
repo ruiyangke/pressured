@@ -70,7 +70,7 @@ helm install pressured charts/pressured \
 
 ### From Source
 
-Prerequisites: CMake 3.16+, C11 compiler, libcurl, json-c, lua5.4, OpenSSL or mbedTLS
+Prerequisites: CMake 3.16+, C11 compiler, libcurl, lua5.4, OpenSSL or mbedTLS. JSON parsing uses the vendored yyjson (`third_party/yyjson`, MIT).
 
 ```bash
 # Build
@@ -389,7 +389,7 @@ rules:
 
 - CMake 3.16+
 - C11 compiler
-- libcurl, json-c, lua5.4, zlib
+- libcurl, lua5.4, zlib (JSON parsing uses the vendored yyjson, `third_party/yyjson`, MIT)
 - OpenSSL or mbedTLS (for S3 signing)
 
 ### Build

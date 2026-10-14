@@ -22,7 +22,6 @@ set_property(CACHE TLS_BACKEND PROPERTY STRINGS "openssl" "mbedtls")
 # Find dependencies
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(CURL REQUIRED libcurl)
-pkg_check_modules(JSON_C REQUIRED json-c)
 pkg_check_modules(LUA REQUIRED lua5.4)
 pkg_check_modules(ZLIB REQUIRED zlib)
 
@@ -49,7 +48,6 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CURL_INCLUDE_DIRS}
-    ${JSON_C_INCLUDE_DIRS}
     ${LUA_INCLUDE_DIRS}
     ${CRYPTO_INCLUDE_DIRS}
 )
@@ -57,7 +55,6 @@ include_directories(
 # Link directories (needed for Alpine where libs are in non-standard locations)
 link_directories(
     ${CURL_LIBRARY_DIRS}
-    ${JSON_C_LIBRARY_DIRS}
     ${LUA_LIBRARY_DIRS}
     ${CRYPTO_LIBRARY_DIRS}
 )
@@ -95,7 +92,6 @@ set_target_properties(pressured_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(pressured_core
     yyjson
     ${CURL_LIBRARIES}
-    ${JSON_C_LIBRARIES}
     pthread
     dl
     m
@@ -207,11 +203,9 @@ set_target_properties(storage_local PROPERTIES
 
 target_include_directories(storage_local PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${JSON_C_INCLUDE_DIRS}
 )
 
 target_link_libraries(storage_local
-    ${JSON_C_LIBRARIES}
     yyjson
 )
 
@@ -249,13 +243,11 @@ set_target_properties(storage_s3 PROPERTIES
 target_include_directories(storage_s3 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/plugins/storage
-    ${JSON_C_INCLUDE_DIRS}
     ${CURL_INCLUDE_DIRS}
     ${CRYPTO_INCLUDE_DIRS}
 )
 
 target_link_libraries(storage_s3
-    ${JSON_C_LIBRARIES}
     ${CURL_LIBRARIES}
     ${CRYPTO_LIBRARIES}
     yyjson
@@ -278,13 +270,11 @@ target_include_directories(test_s3_credentials PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/plugins/storage
-    ${JSON_C_INCLUDE_DIRS}
     ${CURL_INCLUDE_DIRS}
     ${CRYPTO_INCLUDE_DIRS}
 )
 target_link_libraries(test_s3_credentials
     pressured_core
-    ${JSON_C_LIBRARIES}
     ${CURL_LIBRARIES}
     ${CRYPTO_LIBRARIES}
     yyjson

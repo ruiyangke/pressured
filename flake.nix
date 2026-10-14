@@ -24,7 +24,6 @@
             # C libraries
             curl
             openssl
-            json_c
             lua5_4
             zlib
 

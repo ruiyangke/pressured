@@ -54,7 +54,7 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake ninja-build pkg-config \
-    libcurl4-openssl-dev libjson-c-dev liblua5.4-dev libssl-dev zlib1g-dev \
+    libcurl4-openssl-dev liblua5.4-dev libssl-dev zlib1g-dev \
     valgrind ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
