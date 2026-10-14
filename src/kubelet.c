@@ -91,6 +91,7 @@ struct kubelet_source {
 
   // HTTP client
   CURL *curl;
+  struct curl_slist *auth_headers; // Rebuilt when the token changes
 };
 
 // HTTP response buffer
@@ -162,6 +163,9 @@ static void reload_token(kubelet_source_t *source) {
   }
   if (strcmp(source->token, token) == 0)
     return;
+  // The cached header carries the old token, so rebuild it on next use.
+  curl_slist_free_all(source->auth_headers);
+  source->auth_headers = NULL;
   bool had_token = source->token[0] != '\0';
   if (buffer_copy(source->token, sizeof(source->token), token,
                   "service account token") != 0)
@@ -237,6 +241,7 @@ void kubelet_source_free(kubelet_source_t *source) {
       free(source->seen_events[i].uid);
     if (source->curl)
       curl_easy_cleanup(source->curl);
+    curl_slist_free_all(source->auth_headers);
     free(source);
   }
 }
@@ -261,7 +266,6 @@ static char *api_request(kubelet_source_t *source, const char *path) {
     return NULL;
 
   http_buffer_t buf = {0};
-  struct curl_slist *headers = NULL;
 
   curl_easy_reset(source->curl);
   curl_easy_setopt(source->curl, CURLOPT_URL, url);
@@ -274,12 +278,17 @@ static char *api_request(kubelet_source_t *source, const char *path) {
     reload_token(source);
 
   if (source->token[0]) {
-    char auth_header[MAX_TOKEN + 32];
-    if (buffer_format(auth_header, sizeof(auth_header), "authorization header",
-                      "Authorization: Bearer %s", source->token) != 0)
-      return NULL;
-    headers = curl_slist_append(headers, auth_header);
-    curl_easy_setopt(source->curl, CURLOPT_HTTPHEADER, headers);
+    if (!source->auth_headers) {
+      char auth_header[MAX_TOKEN + 32];
+      if (buffer_format(auth_header, sizeof(auth_header),
+                        "authorization header", "Authorization: Bearer %s",
+                        source->token) != 0)
+        return NULL;
+      source->auth_headers = curl_slist_append(NULL, auth_header);
+      if (!source->auth_headers)
+        return NULL;
+    }
+    curl_easy_setopt(source->curl, CURLOPT_HTTPHEADER, source->auth_headers);
   }
 
   if (source->ca_cert_path[0]) {
@@ -289,7 +298,6 @@ static char *api_request(kubelet_source_t *source, const char *path) {
   }
 
   CURLcode res = curl_easy_perform(source->curl);
-  curl_slist_free_all(headers);
 
   if (res != CURLE_OK) {
     log_error("API request failed: %s", curl_easy_strerror(res));

@@ -840,6 +840,47 @@ static void test_token(kubelet_source_t *source) {
   assert(result == 0);
 }
 
+// The cached authorization list is built once per token and reused until the
+// token is rotated.
+static void test_auth_headers(kubelet_source_t *source) {
+  char path[PATH_MAX] = "./token-auth-XXXXXX";
+  int fd = mkstemp(path);
+  assert(fd >= 0);
+  assert(close(fd) == 0);
+  assert(buffer_copy(source->token_path, sizeof(source->token_path), path,
+                     "test token path") == 0);
+
+  write_token(path, "first-token");
+  reload_token(source);
+  assert(strcmp(source->token, "first-token") == 0);
+  assert(source->auth_headers == NULL);
+
+  char *response = api_request(source, "/api/v1/pods");
+  assert(response);
+  free(response);
+  struct curl_slist *cached = source->auth_headers;
+  assert(cached && strstr(cached->data, "first-token"));
+
+  response = api_request(source, "/api/v1/pods");
+  assert(response);
+  free(response);
+  assert(source->auth_headers == cached);
+
+  // A new token invalidates the list; the next request rebuilds it.
+  write_token(path, "second-token");
+  reload_token(source);
+  assert(source->auth_headers == NULL);
+
+  response = api_request(source, "/api/v1/pods");
+  assert(response);
+  free(response);
+  assert(source->auth_headers);
+  assert(strstr(source->auth_headers->data, "second-token"));
+  assert(strstr(source->auth_headers->data, "first-token") == NULL);
+
+  assert(unlink(path) == 0);
+}
+
 // Looks up an annotation value by key; order in the array does not matter.
 static const char *annotation_value(const pressured_memory_sample_t *sample,
                                     const char *key) {
@@ -954,6 +995,8 @@ int main(int argc, char **argv) {
   assert(source);
   if (strcmp(argv[1], "token") == 0)
     test_token(source);
+  else if (strcmp(argv[1], "auth") == 0)
+    test_auth_headers(source);
   else if (strcmp(argv[1], "dedupe") == 0)
     test_dedupe(source);
   else if (strcmp(argv[1], "cache") == 0)
