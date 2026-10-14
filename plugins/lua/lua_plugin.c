@@ -76,6 +76,8 @@ static void timeout_hook(lua_State *L, lua_Debug *ar) {
 // Only the outer call starts a budget; stream callbacks share its deadline.
 static int budget_pcall(lua_State *L, int nargs, int nresults) {
   lua_budget_t *budget = *(lua_budget_t **)lua_getextraspace(L);
+  if (budget->timeout_ms <= 0) // No limit configured
+    return lua_pcall(L, nargs, nresults, 0);
   budget->deadline_ns = monotonic_ns() + (int64_t)budget->timeout_ms * 1000000;
   budget->active = 1;
   lua_sethook(L, timeout_hook, LUA_MASKCOUNT, 1000);

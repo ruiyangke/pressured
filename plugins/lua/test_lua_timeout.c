@@ -173,6 +173,11 @@ int main(int argc, char **argv) {
                  "local t=os.clock(); "
                  "while os.clock()-t < 0.05 do end; "
                  "log.info('SECOND_OK'); return 'ok' end");
+  } else if (strcmp(test, "unlimited") == 0) {
+    snprintf(code, sizeof(code),
+             "function on_event(e,c) local t=os.clock(); "
+             "while os.clock()-t < 0.05 do end; "
+             "log.info('UNLIMITED_OK'); return 'ok' end");
   } else if (strcmp(test, "order") == 0) {
     key = "scripts_dir";
     value = dir;
@@ -252,7 +257,10 @@ int main(int argc, char **argv) {
   struct json_object *lua = json_object_new_object();
   json_object_object_add(root, "plugins", plugins);
   json_object_object_add(plugins, "lua", lua);
-  json_object_object_add(lua, "timeout_ms", json_object_new_int(200));
+  // timeout_ms 0 disables the limit
+  json_object_object_add(
+      lua, "timeout_ms",
+      json_object_new_int(strcmp(test, "unlimited") == 0 ? 0 : 200));
   json_object_object_add(lua, key, json_object_new_string(value));
   service_registry_t *sr = service_registry_new();
   assert(sr);
@@ -312,7 +320,8 @@ int main(int argc, char **argv) {
     assert(strstr(output, "[dispatcher] a.lua error:"));
     assert(strstr(output, "SECOND_OK"));
   } else if (!load_timeout) {
-    const char *marker = strcmp(test, "order") == 0      ? "ORDER_OK"
+    const char *marker = strcmp(test, "unlimited") == 0  ? "UNLIMITED_OK"
+                         : strcmp(test, "order") == 0    ? "ORDER_OK"
                          : strcmp(test, "fetch") == 0    ? "FETCH_OK"
                          : strcmp(test, "download") == 0 ? "DOWNLOAD_OK"
                          : strcmp(test, "stream") == 0   ? "STREAM_OK"
