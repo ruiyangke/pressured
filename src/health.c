@@ -28,14 +28,25 @@ int health_write(const char *path, time_t now) {
   if (fd < 0) {
     return -1;
   }
-  FILE *file = fdopen(fd, "w");
-  if (!file) {
-    close(fd);
-    unlink(temporary);
-    return -1;
+  char text[32];
+  int length = snprintf(text, sizeof(text), "%jd\n", (intmax_t)now);
+  int result = 0;
+  if (length < 0 || (size_t)length >= sizeof(text)) {
+    result = -1;
+  } else {
+    size_t written = 0;
+    while (written < (size_t)length) {
+      ssize_t size = write(fd, text + written, (size_t)length - written);
+      if (size < 0 && errno == EINTR)
+        continue;
+      if (size <= 0) {
+        result = -1;
+        break;
+      }
+      written += (size_t)size;
+    }
   }
-  int result = fprintf(file, "%jd\n", (intmax_t)now) < 0 ? -1 : 0;
-  if (fclose(file) != 0)
+  if (close(fd) != 0)
     result = -1;
   if (result == 0 && rename(temporary, path) != 0)
     result = -1;
