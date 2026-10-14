@@ -95,22 +95,6 @@ static int run_script(lua_State *L, const char *source, int is_file) {
   return status == LUA_OK ? budget_pcall(L, 0, 0) : status;
 }
 
-// Return the value of `key` in `obj` when it is present and a JSON `type`.
-// A missing key or a JSON null returns NULL so the caller keeps its default; a
-// key of any other type also returns NULL, after one warning naming it.
-static yyjson_val *lua_config_value(yyjson_val *obj, const char *key,
-                                    const char *type,
-                                    bool (*is_type)(const yyjson_val *)) {
-  yyjson_val *val = yyjson_obj_get(obj, key);
-  if (!val || yyjson_is_null(val))
-    return NULL;
-  if (!is_type(val)) {
-    log_warn("lua plugin: plugins.lua.%s must be a %s, ignoring it", key, type);
-    return NULL;
-  }
-  return val;
-}
-
 // Parse plugin config from plugins.lua section of full config JSON
 static int parse_plugin_config(pressured_plugin_ctx_t *ctx,
                                const char *config_json) {
@@ -128,8 +112,8 @@ static int parse_plugin_config(pressured_plugin_ctx_t *ctx,
   yyjson_val *lua_cfg = yyjson_obj_get(
       yyjson_obj_get(yyjson_doc_get_root(doc), "plugins"), "lua");
 
-  yyjson_val *val =
-      lua_config_value(lua_cfg, "script", "string", yyjson_is_str);
+  yyjson_val *val = pj_config_value(lua_cfg, "plugins.lua", "script", "string",
+                                    yyjson_is_str);
   if (val) {
     if (buffer_copy(ctx->cfg.script, sizeof(ctx->cfg.script),
                     yyjson_get_str(val), "Lua script path") != 0) {
@@ -137,7 +121,8 @@ static int parse_plugin_config(pressured_plugin_ctx_t *ctx,
       return -1;
     }
   }
-  val = lua_config_value(lua_cfg, "scripts_dir", "string", yyjson_is_str);
+  val = pj_config_value(lua_cfg, "plugins.lua", "scripts_dir", "string",
+                        yyjson_is_str);
   if (val) {
     if (buffer_copy(ctx->cfg.scripts_dir, sizeof(ctx->cfg.scripts_dir),
                     yyjson_get_str(val), "Lua scripts_dir path") != 0) {
@@ -145,10 +130,12 @@ static int parse_plugin_config(pressured_plugin_ctx_t *ctx,
       return -1;
     }
   }
-  val = lua_config_value(lua_cfg, "inline_script", "string", yyjson_is_str);
+  val = pj_config_value(lua_cfg, "plugins.lua", "inline_script", "string",
+                        yyjson_is_str);
   if (val)
     ctx->cfg.inline_script = strdup(yyjson_get_str(val));
-  val = lua_config_value(lua_cfg, "timeout_ms", "number", yyjson_is_num);
+  val = pj_config_value(lua_cfg, "plugins.lua", "timeout_ms", "number",
+                        yyjson_is_num);
   if (val)
     pj_int(val, &ctx->cfg.timeout_ms);
 

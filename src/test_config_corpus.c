@@ -5,7 +5,7 @@
  * parsing (plugin_is_disabled()) under the vendored yyjson reader. Assertions
  * describe what the code does, not what the JSON spec says.
  *
- * Every case below parses without crashing. No case is omitted for crashing.
+ * Every case below must load without crashing.
  *
  * plugin_is_disabled() is static, so include the production file to call it
  * directly (same approach as test_kubelet.c including kubelet.c).

@@ -3,8 +3,9 @@
 
 // Helpers over the vendored yyjson reader. Call sites use yyjson's own
 // accessors (yyjson_obj_get, yyjson_get_str, yyjson_arr_foreach, ...); this
-// header adds only what yyjson lacks: parse errors that name the document, and
-// reading any JSON number as an integer (yyjson_get_int returns 0 for a real).
+// header adds only what yyjson lacks: parse errors that name the document,
+// typed config lookups that warn about wrong types, and reading any JSON number
+// as an integer (yyjson_get_int returns 0 for a real).
 
 #include "log.h"
 #include "yyjson.h"
@@ -39,6 +40,24 @@ static inline yyjson_doc *pj_parse(const char *data, size_t len,
   if (!doc)
     log_warn("failed to parse %s: %s at byte %zu", what, err.msg, err.pos);
   return doc;
+}
+
+// Config value of `key` in `obj` when `is_type` accepts it. A missing key or a
+// JSON null returns NULL silently so the caller keeps its default (Helm renders
+// unset values as null); any other type returns NULL after one warning naming
+// `section`.`key` and the expected `type` ("" for a top-level key).
+static inline yyjson_val *pj_config_value(yyjson_val *obj, const char *section,
+                                          const char *key, const char *type,
+                                          bool (*is_type)(const yyjson_val *)) {
+  yyjson_val *val = yyjson_obj_get(obj, key);
+  if (!val || yyjson_is_null(val))
+    return NULL;
+  if (!is_type(val)) {
+    log_warn("config: %s%s%s must be a %s, ignoring it", section,
+             section[0] ? "." : "", key, type);
+    return NULL;
+  }
+  return val;
 }
 
 // Any JSON number as an int64_t: integers as-is (an unsigned value above
