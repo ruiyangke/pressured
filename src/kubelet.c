@@ -327,10 +327,8 @@ static int kubelet_refresh_nodes(kubelet_source_t *source) {
       pj_parse(response, strlen(response), PJ_READ_API, "nodes response");
   free(response);
 
-  if (!doc) {
-    log_error("failed to parse nodes response");
+  if (!doc)
     return -1;
-  }
 
   yyjson_val *root = yyjson_doc_get_root(doc);
   yyjson_val *items = yyjson_obj_get(root, "items");
@@ -360,16 +358,14 @@ static int kubelet_refresh_nodes(kubelet_source_t *source) {
       // Get node address (prefer InternalIP)
       yyjson_val *addresses =
           yyjson_obj_get(yyjson_obj_get(node, "status"), "addresses");
-      if (yyjson_is_arr(addresses)) {
-        size_t addr_idx, addr_max;
-        yyjson_val *addr;
-        yyjson_arr_foreach(addresses, addr_idx, addr_max, addr) {
-          const char *type = yyjson_get_str(yyjson_obj_get(addr, "type"));
-          const char *address = yyjson_get_str(yyjson_obj_get(addr, "address"));
-          if (type && address && strcmp(type, "InternalIP") == 0) {
-            strncpy(ni->address, address, sizeof(ni->address) - 1);
-            break;
-          }
+      size_t addr_idx, addr_max;
+      yyjson_val *addr;
+      yyjson_arr_foreach(addresses, addr_idx, addr_max, addr) {
+        const char *type = yyjson_get_str(yyjson_obj_get(addr, "type"));
+        const char *address = yyjson_get_str(yyjson_obj_get(addr, "address"));
+        if (type && address && strcmp(type, "InternalIP") == 0) {
+          strncpy(ni->address, address, sizeof(ni->address) - 1);
+          break;
         }
       }
 
@@ -513,10 +509,8 @@ static int kubelet_refresh_pod_limits(kubelet_source_t *source) {
       pj_parse(response, strlen(response), PJ_READ_API, "pods response");
   free(response);
 
-  if (!doc) {
-    log_error("failed to parse pods response");
+  if (!doc)
     return -1;
-  }
 
   yyjson_val *root = yyjson_doc_get_root(doc);
   yyjson_val *items = yyjson_obj_get(root, "items");
@@ -555,24 +549,16 @@ static int kubelet_refresh_pod_limits(kubelet_source_t *source) {
           yyjson_obj_get(yyjson_obj_get(pod, "status"), "podIP"));
 
       yyjson_val *containers = yyjson_obj_get(spec, "containers");
-      if (!yyjson_is_arr(containers))
-        continue;
-
-      size_t container_count = yyjson_arr_size(containers);
-      if (container_count == 0)
+      if (yyjson_arr_size(containers) == 0)
         continue;
 
       // Parse pod annotations into array (only if we have containers to store
       // them)
-      pressured_annotation_t *pod_annotations = NULL;
       int pod_annotations_count = 0;
-      yyjson_val *annotations_obj = yyjson_obj_get(metadata, "annotations");
-      if (annotations_obj) {
-        pod_annotations =
-            parse_annotations(annotations_obj, &pod_annotations_count);
-        if (pod_annotations_count < 0)
-          goto failed;
-      }
+      pressured_annotation_t *pod_annotations = parse_annotations(
+          yyjson_obj_get(metadata, "annotations"), &pod_annotations_count);
+      if (pod_annotations_count < 0)
+        goto failed;
 
       int annotations_consumed = 0; // Track if first container took ownership
 
@@ -584,12 +570,10 @@ static int kubelet_refresh_pod_limits(kubelet_source_t *source) {
         if (!container_name)
           continue;
 
-        uint64_t limit = UINT64_MAX;
         yyjson_val *limits =
             yyjson_obj_get(yyjson_obj_get(container, "resources"), "limits");
-        yyjson_val *mem_limit = yyjson_obj_get(limits, "memory");
-        if (mem_limit)
-          limit = parse_quantity(yyjson_get_str(mem_limit));
+        uint64_t limit =
+            parse_quantity(yyjson_get_str(yyjson_obj_get(limits, "memory")));
 
         // Add to cache
         if (source->pod_limit_count >= source->pod_limit_capacity) {
@@ -724,14 +708,13 @@ static int collect_from_node(kubelet_source_t *source, const char *node_name,
     return -1;
   }
 
-  yyjson_doc *doc =
-      pj_parse(response, strlen(response), PJ_READ_API, "stats response");
+  char what[320];
+  snprintf(what, sizeof(what), "stats response from %s", node_name);
+  yyjson_doc *doc = pj_parse(response, strlen(response), PJ_READ_API, what);
   free(response);
 
-  if (!doc) {
-    log_error("failed to parse stats response from %s", node_name);
+  if (!doc)
     return -1;
-  }
 
   yyjson_val *root = yyjson_doc_get_root(doc);
   yyjson_val *pods_array = yyjson_obj_get(root, "pods");
@@ -748,8 +731,6 @@ static int collect_from_node(kubelet_source_t *source, const char *node_name,
 
     yyjson_val *pod_ref = yyjson_obj_get(pod, "podRef");
     yyjson_val *containers_array = yyjson_obj_get(pod, "containers");
-    if (!yyjson_is_obj(pod_ref) || !yyjson_is_arr(containers_array))
-      continue;
 
     const char *ns = yyjson_get_str(yyjson_obj_get(pod_ref, "namespace"));
     const char *pod_name = yyjson_get_str(yyjson_obj_get(pod_ref, "name"));
@@ -775,12 +756,10 @@ static int collect_from_node(kubelet_source_t *source, const char *node_name,
         continue;
 
       yyjson_val *memory_obj = yyjson_obj_get(container, "memory");
-      if (!yyjson_is_obj(memory_obj))
-        continue;
-
       int64_t working_set;
       if (!pj_int64(yyjson_obj_get(memory_obj, "workingSetBytes"),
-                    &working_set))
+                    &working_set) ||
+          working_set < 0)
         continue;
 
       uint64_t usage = (uint64_t)working_set;
@@ -946,10 +925,8 @@ static int collect_oom_events(kubelet_source_t *source,
       pj_parse(response, strlen(response), PJ_READ_API, "events response");
   free(response);
 
-  if (!doc) {
-    log_warn("failed to parse events response");
+  if (!doc)
     return 0;
-  }
 
   yyjson_val *root = yyjson_doc_get_root(doc);
   yyjson_val *items = yyjson_obj_get(root, "items");
@@ -958,7 +935,7 @@ static int collect_oom_events(kubelet_source_t *source,
     return 0;
   }
 
-  log_debug("found %d OOMKilling events", (int)yyjson_arr_size(items));
+  log_debug("found %zu OOMKilling events", yyjson_arr_size(items));
 
   size_t event_idx, event_max;
   yyjson_val *event;
@@ -971,8 +948,6 @@ static int collect_oom_events(kubelet_source_t *source,
 
     yyjson_val *metadata = yyjson_obj_get(event, "metadata");
     yyjson_val *involved_object = yyjson_obj_get(event, "involvedObject");
-    if (!yyjson_is_obj(metadata) || !yyjson_is_obj(involved_object))
-      continue;
 
     // Get event UID for deduplication
     const char *uid = yyjson_get_str(yyjson_obj_get(metadata, "uid"));
@@ -996,12 +971,11 @@ static int collect_oom_events(kubelet_source_t *source,
       continue; // Only care about Pod events
 
     // Get container name from fieldPath (e.g., "spec.containers{app}")
+    char container_buf[256];
     const char *container_name = "unknown";
     const char *field_path =
         yyjson_get_str(yyjson_obj_get(involved_object, "fieldPath"));
     if (field_path) {
-      // Parse "spec.containers{container_name}"
-      static char container_buf[256];
       const char *start = strchr(field_path, '{');
       const char *end = strchr(field_path, '}');
       if (start && end && end > start + 1) {
@@ -1107,10 +1081,8 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
       pj_parse(response, strlen(response), PJ_READ_API, "pods response");
   free(response);
 
-  if (!doc) {
-    log_warn("failed to parse pods response for OOM status check");
+  if (!doc)
     return 0;
-  }
 
   yyjson_val *root = yyjson_doc_get_root(doc);
   yyjson_val *items = yyjson_obj_get(root, "items");
@@ -1128,8 +1100,6 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
     yyjson_val *metadata = yyjson_obj_get(pod, "metadata");
     yyjson_val *status = yyjson_obj_get(pod, "status");
     yyjson_val *spec = yyjson_obj_get(pod, "spec"); // Optional
-    if (!yyjson_is_obj(metadata) || !yyjson_is_obj(status))
-      continue;
 
     // Get pod info
     const char *ns = yyjson_get_str(yyjson_obj_get(metadata, "namespace"));
@@ -1144,8 +1114,6 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
     // Check containerStatuses for OOM kills
     yyjson_val *container_statuses =
         yyjson_obj_get(status, "containerStatuses");
-    if (!yyjson_is_arr(container_statuses))
-      continue;
 
     size_t cs_idx, cs_max;
     yyjson_val *cs;
@@ -1160,8 +1128,6 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
       // Check lastState.terminated.reason == "OOMKilled"
       yyjson_val *terminated =
           yyjson_obj_get(yyjson_obj_get(cs, "lastState"), "terminated");
-      if (!yyjson_is_obj(terminated))
-        continue;
 
       const char *reason = yyjson_get_str(yyjson_obj_get(terminated, "reason"));
       if (!reason || strcmp(reason, "OOMKilled") != 0)

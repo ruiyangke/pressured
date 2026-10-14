@@ -242,6 +242,27 @@ static void test_nodes(kubelet_source_t *source) {
   assert(result == 0);
   assert(strcmp(source->nodes[0].name, "node-f") == 0);
   assert(source->nodes[0].address[0] == '\0');
+
+  // Only the first MAX_NODES nodes are kept.
+  size_t capacity = 64 * 1024;
+  char *many = malloc(capacity);
+  assert(many);
+  size_t used = (size_t)snprintf(many, capacity, "{\"items\":[");
+  for (int i = 0; i < MAX_NODES + 2; i++) {
+    int written =
+        snprintf(many + used, capacity - used,
+                 "%s{\"metadata\":{\"name\":\"n%d\"}}", i ? "," : "", i);
+    assert(written > 0 && (size_t)written < capacity - used);
+    used += (size_t)written;
+  }
+  int closing = snprintf(many + used, capacity - used, "]}");
+  assert(closing > 0 && (size_t)closing < capacity - used);
+  fixture_response = many;
+  result = kubelet_refresh_nodes(source);
+  assert(result == 0);
+  assert(source->node_count == MAX_NODES);
+  free(many);
+  fixture_response = "{\"items\":[]}";
 }
 
 static void test_stats(kubelet_source_t *source) {
@@ -300,6 +321,34 @@ static void test_stats(kubelet_source_t *source) {
 
   for (int i = 0; i < count; i++)
     pressured_memory_sample_free(&samples[i]);
+
+  // max_count caps collection even when more containers qualify.
+  fixture_response =
+      "{\"pods\":[{\"podRef\":{\"namespace\":\"ns\",\"name\":\"pod-a\"},"
+      "\"containers\":["
+      "{\"name\":\"int\",\"memory\":{\"workingSetBytes\":1}},"
+      "{\"name\":\"float\",\"memory\":{\"workingSetBytes\":2}}]}]}";
+  pressured_memory_sample_t limited[1] = {0};
+  count = 0;
+  assert(collect_from_node(source, "node-a", limited, &count, 1) == 0);
+  assert(count == 1);
+  pressured_memory_sample_free(&limited[0]);
+
+  // A pod with null containers is skipped, a negative working set is skipped,
+  // and the next qualifying container is still collected.
+  fixture_response =
+      "{\"pods\":[{\"podRef\":{\"namespace\":\"ns\",\"name\":\"pod-a\"},"
+      "\"containers\":null},"
+      "{\"podRef\":{\"namespace\":\"ns\",\"name\":\"pod-a\"},\"containers\":["
+      "{\"name\":\"int\",\"memory\":{\"workingSetBytes\":-5}},"
+      "{\"name\":\"float\",\"memory\":{\"workingSetBytes\":7}}]}]}";
+  pressured_memory_sample_t edge[2] = {0};
+  count = 0;
+  assert(collect_from_node(source, "node-a", edge, &count, 2) == 0);
+  assert(count == 1);
+  assert(strcmp(edge[0].container_name, "float") == 0);
+  assert(edge[0].usage_bytes == 7);
+  pressured_memory_sample_free(&edge[0]);
 }
 
 static void test_pod_limits(kubelet_source_t *source) {
@@ -452,6 +501,19 @@ static void test_age(kubelet_source_t *source) {
     assert(oom_event_is_old(yyjson_doc_get_root(doc), now) == (bool)!recent);
     yyjson_doc_free(doc);
   }
+
+  // A full samples array stops both OOM collectors before they add anything.
+  fixture_response =
+      "{\"items\":[{\"metadata\":{\"uid\":\"limit\"},\"involvedObject\":{"
+      "\"kind\":\"Pod\",\"namespace\":\"ns\",\"name\":\"pod\","
+      "\"fieldPath\":\"spec.containers{app}\"}}]}";
+  pressured_memory_sample_t full = {
+      .namespace = "ns", .pod_name = "pod", .container_name = "app"};
+  int full_count = 2;
+  assert(collect_oom_events(source, &full, &full_count, 2) == 0);
+  assert(full_count == 2);
+  assert(collect_oom_from_pod_status(source, &full, &full_count, 2) == 0);
+  assert(full_count == 2);
 }
 
 static void format_timestamp(char *buffer, size_t size, time_t when,
@@ -547,6 +609,7 @@ static void test_pod_status_oom(kubelet_source_t *source) {
   count = 0;
   assert(collect_oom_from_pod_status(source, samples, &count, 4) == 1);
   assert(count == 1);
+  assert(is_event_seen(source, "7:uid-str:app:0"));
   pressured_memory_sample_free(&samples[0]);
 
   // A null uid, a null container name and a null reason are each treated as
@@ -569,8 +632,10 @@ static void test_pod_status_oom(kubelet_source_t *source) {
       "\"OOMKilled\"}}}]}}]}";
   memset(samples, 0, sizeof(samples));
   count = 0;
+  int seen = source->seen_event_count;
   assert(collect_oom_from_pod_status(source, samples, &count, 4) == 1);
   assert(count == 1);
+  assert(source->seen_event_count == seen + 1);
   assert(strcmp(samples[0].container_name, "app") == 0);
   pressured_memory_sample_free(&samples[0]);
 }
