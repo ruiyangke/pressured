@@ -353,6 +353,9 @@ static int kubelet_refresh_nodes(kubelet_source_t *source) {
 
       node_info_t *ni = &source->nodes[source->node_count];
       strncpy(ni->name, name, sizeof(ni->name) - 1);
+      // The slot is reused across cycles; clear any address from the previous
+      // node so a node with no InternalIP does not keep a stale one.
+      ni->address[0] = '\0';
 
       // Get node address (prefer InternalIP)
       yyjson_val *addresses =

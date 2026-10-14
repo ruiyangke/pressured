@@ -201,8 +201,7 @@ static void test_nodes(kubelet_source_t *source) {
       "{\"metadata\":{\"name\":\"node-a\"},\"status\":{\"addresses\":["
       "{\"type\":\"ExternalIP\",\"address\":\"10.0.0.1\"},"
       "{\"type\":\"InternalIP\",\"address\":\"192.168.1.1\"}]}},"
-      // No InternalIP: the address stays empty because the node array is
-      // freshly zeroed and a missing InternalIP is never cleared explicitly.
+      // No InternalIP: the address stays empty.
       "{\"metadata\":{\"name\":\"node-b\"},\"status\":{\"addresses\":["
       "{\"type\":\"ExternalIP\",\"address\":\"10.0.0.2\"}]}},"
       // No addresses at all.
@@ -229,6 +228,20 @@ static void test_nodes(kubelet_source_t *source) {
   assert(source->node_count == 1);
   assert(strcmp(source->nodes[0].name, "node-d") == 0);
   assert(strcmp(source->nodes[0].address, "2.2.2.2") == 0);
+
+  // Reusing the source across cycles must clear a stale address: a later node
+  // without an InternalIP must not keep the previous node's address.
+  fixture_response = "{\"items\":[{\"metadata\":{\"name\":\"node-e\"},"
+                     "\"status\":{\"addresses\":["
+                     "{\"type\":\"InternalIP\",\"address\":\"10.9.9.9\"}]}}]}";
+  result = kubelet_refresh_nodes(source);
+  assert(result == 0);
+  assert(strcmp(source->nodes[0].address, "10.9.9.9") == 0);
+  fixture_response = "{\"items\":[{\"metadata\":{\"name\":\"node-f\"}}]}";
+  result = kubelet_refresh_nodes(source);
+  assert(result == 0);
+  assert(strcmp(source->nodes[0].name, "node-f") == 0);
+  assert(source->nodes[0].address[0] == '\0');
 }
 
 static void test_stats(kubelet_source_t *source) {
