@@ -84,6 +84,7 @@ add_library(pressured_core STATIC
     src/plugin.c
     src/http.c
     src/service_registry.c
+    src/arena.c
 )
 
 # Enable Position Independent Code for static library (needed when linking into shared libs)
@@ -135,6 +136,10 @@ add_test(NAME test_config_corpus COMMAND test_config_corpus)
 add_executable(test_pjson src/test_pjson.c)
 target_link_libraries(test_pjson pressured_core)
 add_test(NAME test_pjson COMMAND test_pjson)
+
+add_executable(test_arena src/test_arena.c)
+target_link_libraries(test_arena pressured_core)
+add_test(NAME test_arena COMMAND test_arena)
 
 # The probe form used by the Helm chart (--health-check=N) and the
 # space-separated form, against the real binary
