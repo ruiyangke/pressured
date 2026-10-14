@@ -191,6 +191,32 @@ int main(int argc, char **argv) {
                i, i + 1, i, i + 1);
       write_script(dir, name, code);
     }
+  } else if (strncmp(test, "handlers_", 9) == 0) {
+    key = "scripts_dir";
+    value = dir;
+    write_script(dir, "a.lua",
+                 "function on_event(e,c) "
+                 "assert(e.order==nil); e.order=1; "
+                 "_pressured_handlers=42; return 'FIRST_OK' end");
+    if (strcmp(test, "handlers_reassigned") == 0) {
+      write_script(dir, "b.lua",
+                   "_pressured_handlers=42; "
+                   "function on_event(e,c) assert(e.order==1); "
+                   "return 'SECOND_OK' end");
+    } else if (strcmp(test, "handlers_reassigned_after_load") == 0) {
+      write_script(dir, "b.lua",
+                   "function on_event(e,c) assert(e.order==1); "
+                   "return 'SECOND_OK' end");
+    } else {
+      assert(strcmp(test, "handlers_junk") == 0);
+      write_script(dir, "b.lua",
+                   "table.insert(_pressured_handlers,42); "
+                   "table.insert(_pressured_handlers,{name='bad.lua',"
+                   "func=setmetatable({}, {__call=function() "
+                   "log.info('BAD_CALLED') end})}); "
+                   "function on_event(e,c) assert(e.order==1); "
+                   "return 'SECOND_OK' end");
+    }
   } else if (load_timeout) {
     snprintf(code, sizeof(code), "while true do end");
     if (strcmp(test, "load_file") == 0) {
@@ -294,6 +320,8 @@ int main(int argc, char **argv) {
       assert(now_ms() - start < 100);
     } else {
       assert(rc == 0);
+      if (strncmp(test, "handlers_", 9) == 0)
+        assert(action->on_event(action, &event, 1) == 0);
     }
     service_ref_release(&ref);
   }
@@ -319,6 +347,36 @@ int main(int argc, char **argv) {
   else if (strcmp(test, "dispatch") == 0) {
     assert(strstr(output, "[dispatcher] a.lua error:"));
     assert(strstr(output, "SECOND_OK"));
+  } else if (strncmp(test, "handlers_", 9) == 0) {
+    const char *first = output;
+    for (int i = 0; i < 2; i++) {
+      first = strstr(first, "[dispatcher] a.lua returned: FIRST_OK");
+      assert(first);
+      const char *second =
+          strstr(first, "[dispatcher] b.lua returned: SECOND_OK");
+      assert(second);
+      first = second + 1;
+    }
+    if (strcmp(test, "handlers_junk") == 0) {
+      const char *entry_error = output;
+      const char *func_error = output;
+      for (int i = 0; i < 2; i++) {
+        entry_error = strstr(entry_error,
+                             "[dispatcher] ? error: handler #2 is not a table");
+        func_error = strstr(
+            func_error, "[dispatcher] bad.lua error: func is not a function");
+        assert(entry_error && func_error);
+        entry_error++;
+        func_error++;
+      }
+      assert(!strstr(entry_error,
+                     "[dispatcher] ? error: handler #2 is not a table"));
+      assert(!strstr(func_error,
+                     "[dispatcher] bad.lua error: func is not a function"));
+      assert(!strstr(output, "BAD_CALLED"));
+    } else {
+      assert(!strstr(output, "[dispatcher] ? error:"));
+    }
   } else if (!load_timeout) {
     const char *marker = strcmp(test, "unlimited") == 0  ? "UNLIMITED_OK"
                          : strcmp(test, "order") == 0    ? "ORDER_OK"

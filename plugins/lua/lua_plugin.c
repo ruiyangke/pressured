@@ -65,6 +65,8 @@ int lua_budget_remaining(lua_State *L) {
   return (int)((remaining + 999999) / 1000000);
 }
 
+// Lua skips hooks inside __gc finalizers, so a nonreturning finalizer cannot be
+// interrupted.
 static void timeout_hook(lua_State *L, lua_Debug *ar) {
   (void)ar;
   if (lua_budget_remaining(L) < 0) {
@@ -127,15 +129,18 @@ static void parse_plugin_config(pressured_plugin_ctx_t *ctx,
   json_object_put(root);
 }
 
-// Initialize the handlers registry table
-static void init_handlers_registry(lua_State *L) {
+// Retain the handlers table even if a script replaces its global alias.
+static int init_handlers_registry(lua_State *L) {
   lua_newtable(L);
+  lua_pushvalue(L, -1);
   lua_setglobal(L, "_pressured_handlers");
+  return luaL_ref(L, LUA_REGISTRYINDEX);
 }
 
 // Capture current on_event (if any) into the handlers registry
 // Call this AFTER loading each script
-static void capture_handler(lua_State *L, const char *script_name) {
+static void capture_handler(lua_State *L, int handlers_ref,
+                            const char *script_name) {
   lua_getglobal(L, "on_event");
   if (!lua_isfunction(L, -1)) {
     lua_pop(L, 1);
@@ -143,7 +148,7 @@ static void capture_handler(lua_State *L, const char *script_name) {
   }
 
   // Get the handlers table
-  lua_getglobal(L, "_pressured_handlers");
+  lua_rawgeti(L, LUA_REGISTRYINDEX, handlers_ref);
   int idx = (int)lua_rawlen(L, -1) + 1;
 
   // Store handler with metadata: {func=on_event, name=script_name}
@@ -153,8 +158,8 @@ static void capture_handler(lua_State *L, const char *script_name) {
   lua_pushstring(L, script_name);
   lua_setfield(L, -2, "name");
 
-  lua_rawseti(L, -2, idx); // _pressured_handlers[idx] = {func=..., name=...}
-  lua_pop(L, 1);           // Pop _pressured_handlers
+  lua_rawseti(L, -2, idx); // handlers[idx] = {func=..., name=...}
+  lua_pop(L, 1);           // Pop handlers table
 
   // Clear the global on_event to avoid confusion
   lua_pushnil(L);
@@ -178,7 +183,8 @@ static int lua_filename(const struct dirent *entry) {
 
 // Load all .lua files from a directory into Lua state
 // Returns: number of files loaded, -1 on error
-static int load_scripts_from_dir(lua_State *L, const char *dir_path) {
+static int load_scripts_from_dir(lua_State *L, const char *dir_path,
+                                 int *handlers_ref) {
   struct dirent **entries = NULL;
   int count = scandir(dir_path, &entries, lua_filename, filename_compare);
   if (count < 0) {
@@ -186,7 +192,7 @@ static int load_scripts_from_dir(lua_State *L, const char *dir_path) {
     return -1;
   }
 
-  init_handlers_registry(L);
+  *handlers_ref = init_handlers_registry(L);
   int loaded = 0;
   for (int i = 0; i < count; i++) {
     char path[PATH_MAX];
@@ -203,7 +209,7 @@ static int load_scripts_from_dir(lua_State *L, const char *dir_path) {
     }
     log_info("lua plugin: loaded %s", path);
     loaded++;
-    capture_handler(L, entries[i]->d_name);
+    capture_handler(L, *handlers_ref, entries[i]->d_name);
   }
   for (int i = 0; i < count; i++)
     free(entries[i]);
@@ -225,6 +231,7 @@ typedef struct {
   lua_State *L;
   lua_budget_t budget;
   int dispatcher;
+  int handlers_ref;
   char *script_path;
   char *inline_script;
   http_client_t *http_client;
@@ -384,16 +391,27 @@ static int lua_on_event(action_t *a, const pressured_event_t *event,
   lua_setfield(L, ctx_idx, "dry_run");
 
   if (la->dispatcher) {
-    lua_getglobal(L, "_pressured_handlers");
+    lua_rawgeti(L, LUA_REGISTRYINDEX, la->handlers_ref);
     int handlers = lua_gettop(L);
     size_t count = lua_rawlen(L, handlers);
     for (size_t i = 1; i <= count; i++) {
       lua_rawgeti(L, handlers, i);
+      if (!lua_istable(L, -1)) {
+        log_error("[dispatcher] ? error: handler #%zu is not a table", i);
+        lua_settop(L, handlers);
+        continue;
+      }
       lua_pushliteral(L, "name");
       lua_rawget(L, -2);
       const char *name = lua_tostring(L, -1);
       lua_pushliteral(L, "func");
       lua_rawget(L, -3);
+      if (!lua_isfunction(L, -1)) {
+        log_error("[dispatcher] %s error: func is not a function",
+                  name ? name : "?");
+        lua_settop(L, handlers);
+        continue;
+      }
       lua_pushvalue(L, event_idx);
       lua_pushvalue(L, ctx_idx);
       int status = budget_pcall(L, 2, 1);
@@ -443,6 +461,7 @@ static lua_action_t *lua_action_create(pressured_plugin_ctx_t *ctx) {
   // Initialize embedded vtable
   a->base.on_event = lua_on_event;
   a->ctx = ctx;
+  a->handlers_ref = LUA_NOREF;
 
   // Create HTTP client
   http_opts_t http_opts = {.timeout_ms = 30000, .connect_timeout_ms = 10000};
@@ -490,7 +509,7 @@ static lua_action_t *lua_action_create(pressured_plugin_ctx_t *ctx) {
   } else if (scripts_dir) {
     a->dispatcher = 1;
     // Load all .lua files from directory
-    int loaded = load_scripts_from_dir(a->L, scripts_dir);
+    int loaded = load_scripts_from_dir(a->L, scripts_dir, &a->handlers_ref);
     if (loaded < 0) {
       goto fail;
     }
@@ -525,7 +544,10 @@ static lua_action_t *lua_action_create(pressured_plugin_ctx_t *ctx) {
   }
 
   // Verify at least one handler exists.
-  lua_getglobal(a->L, a->dispatcher ? "_pressured_handlers" : "on_event");
+  if (a->dispatcher)
+    lua_rawgeti(a->L, LUA_REGISTRYINDEX, a->handlers_ref);
+  else
+    lua_getglobal(a->L, "on_event");
   if (a->dispatcher ? lua_rawlen(a->L, -1) == 0 : !lua_isfunction(a->L, -1)) {
     log_error("lua plugin: script must define 'on_event' function");
     lua_pop(a->L, 1);
