@@ -1,13 +1,13 @@
 # Build stage - curl with mbedTLS instead of OpenSSL
-FROM alpine:3.23 AS builder
+FROM alpine:3.24 AS builder
 
 RUN apk add --no-cache \
     build-base cmake ninja pkgconfig wget \
     mbedtls-dev zlib-dev json-c-dev lua5.4-dev
 
 # Build curl with mbedTLS (Alpine's curl uses OpenSSL)
-ARG CURL_VERSION=8.17.0
-ARG CURL_SHA256=e8e74cdeefe5fb78b3ae6e90cd542babf788fa9480029cfcee6fd9ced42b7910
+ARG CURL_VERSION=8.22.0
+ARG CURL_SHA256=d54dd598bf05927a726deb38df31c6a255ba83ff1de57c5d1464dac3ed8f44a1
 RUN wget -q https://curl.se/download/curl-${CURL_VERSION}.tar.gz && \
     echo "${CURL_SHA256}  curl-${CURL_VERSION}.tar.gz" | sha256sum -c - && \
     tar xzf curl-${CURL_VERSION}.tar.gz && \
@@ -16,8 +16,8 @@ RUN wget -q https://curl.se/download/curl-${CURL_VERSION}.tar.gz && \
         --prefix=/usr/local \
         --with-mbedtls \
         --without-openssl --without-gnutls --without-wolfssl \
-        --without-bearssl --without-rustls \
-        --without-ngtcp2 --without-nghttp3 --without-quiche --without-msh3 \
+        --without-rustls \
+        --without-ngtcp2 --without-nghttp3 --without-quiche \
         --without-libidn2 --without-libpsl --without-brotli --without-zstd \
         --disable-ldap --disable-ldaps --disable-rtsp --disable-dict \
         --disable-telnet --disable-tftp --disable-pop3 --disable-imap \
@@ -45,7 +45,7 @@ RUN PKG_CONFIG_PATH=/usr/local/lib/pkgconfig \
     strip build/pressured build/plugins/*.so
 
 # Runtime stage - extract only needed libraries
-FROM alpine:3.23 AS runtime
+FROM alpine:3.24 AS runtime
 
 RUN apk add --no-cache mbedtls json-c lua5.4-libs zlib ca-certificates
 
@@ -59,6 +59,7 @@ RUN cp -a /tmp/curl-lib/libcurl.so* /staged/usr/local/lib/ && \
     cp -a /usr/lib/libmbedtls.so* \
           /usr/lib/libmbedx509.so* \
           /usr/lib/libmbedcrypto.so* \
+          /usr/lib/libtfpsacrypto.so* \
           /usr/lib/libjson-c.so* \
           /usr/lib/libz.so* \
           /staged/usr/lib/ && \
