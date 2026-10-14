@@ -79,7 +79,7 @@ void event_generator_free(event_generator_t *gen);
 pressured_event_t *event_generator_process(event_generator_t *gen,
                                            pressured_memory_sample_t *samples,
                                            int sample_count, int *event_count);
-void event_generator_events_free(pressured_event_t *events, int count);
+void event_generator_events_clear(pressured_event_t *events, int count);
 pressured_severity_t event_generator_get_severity(event_generator_t *gen,
                                                   const char *namespace,
                                                   const char *pod_name,

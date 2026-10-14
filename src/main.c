@@ -11,6 +11,9 @@
 #include <string.h>
 #include <unistd.h>
 
+// Maximum number of action services dispatched to per event.
+#define MAX_ACTIONS 16
+
 static volatile int running = 1;
 
 static void signal_handler(int sig) {
@@ -233,37 +236,43 @@ int main(int argc, char *argv[]) {
                        event->sample.usage_percent, event->sample.usage_bytes,
                        event->sample.limit_bytes);
 
-        // Dispatch to ALL action services
+        // Dispatch to action services (up to MAX_ACTIONS, on the stack)
         size_t action_count = service_registry_count(registry, "action");
         if (action_count > 0) {
-          service_ref_t *refs = calloc(action_count, sizeof(service_ref_t));
-          if (refs) {
-            size_t acquired = service_registry_acquire_all(registry, "action",
-                                                           refs, action_count);
+          service_ref_t refs[MAX_ACTIONS];
+          size_t dispatch_count = action_count;
+          if (dispatch_count > MAX_ACTIONS) {
+            log_error("too many action services: %zu registered, dispatching "
+                      "to first %d (%zu skipped)",
+                      action_count, MAX_ACTIONS, dispatch_count - MAX_ACTIONS);
+            dispatch_count = MAX_ACTIONS;
+          }
+          size_t acquired = service_registry_acquire_all(registry, "action",
+                                                         refs, dispatch_count);
+          if (acquired > dispatch_count)
+            acquired = dispatch_count;
 
-            for (size_t j = 0; j < acquired; j++) {
-              if (service_ref_valid(&refs[j])) {
-                action_t *action = (action_t *)refs[j].instance;
-                if (action && action->on_event) {
-                  action->on_event(action, event, config->dry_run);
-                }
-                service_ref_release(&refs[j]);
+          for (size_t j = 0; j < acquired; j++) {
+            if (service_ref_valid(&refs[j])) {
+              action_t *action = (action_t *)refs[j].instance;
+              if (action && action->on_event) {
+                action->on_event(action, event, config->dry_run);
               }
+              service_ref_release(&refs[j]);
             }
-            free(refs);
           }
         }
       }
 
-      event_generator_events_free(events, event_count);
+      event_generator_events_clear(events, event_count);
     }
 
-    // Free samples (both sources return the same type)
+    // Free sample contents; the source owns the samples array and reuses it
+    // until the next collection or until the source is freed.
     if (samples) {
       for (int i = 0; i < sample_count; i++) {
         pressured_memory_sample_free(&samples[i]);
       }
-      free(samples);
     }
 
     // Sleep until next poll

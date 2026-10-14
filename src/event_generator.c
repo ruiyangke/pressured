@@ -34,6 +34,10 @@ struct event_generator {
   int state_count;
   int state_capacity;
   uint64_t current_cycle; // Incremented each process() call for pruning
+
+  // Reused per-cycle events buffer (owned by the generator)
+  pressured_event_t *events;
+  int event_capacity;
 };
 
 event_generator_t *event_generator_new(double warn_percent,
@@ -60,6 +64,10 @@ event_generator_t *event_generator_new(double warn_percent,
     return NULL;
   }
 
+  // Events buffer starts empty and grows on demand.
+  gen->events = NULL;
+  gen->event_capacity = 0;
+
   log_info("event_generator initialized warn=%.0f%% critical=%.0f%% "
            "hysteresis=%.0f%% "
            "cooldown=%ds",
@@ -71,6 +79,7 @@ event_generator_t *event_generator_new(double warn_percent,
 
 void event_generator_free(event_generator_t *gen) {
   if (gen) {
+    free(gen->events);
     free(gen->states);
     free(gen);
   }
@@ -276,13 +285,23 @@ pressured_event_t *event_generator_process(event_generator_t *gen,
   // Increment cycle counter for state tracking
   gen->current_cycle++;
 
-  // Allocate max possible events (2x for both pressure and OOM kill events)
-  pressured_event_t *events =
-      calloc(sample_count * 2, sizeof(pressured_event_t));
-  if (!events) {
-    log_error("failed to allocate events array");
-    return NULL;
+  // Reuse the growable events buffer, growing only when this cycle needs more
+  // room (2x for both pressure and OOM kill events).
+  int needed = sample_count * 2;
+  if (needed > gen->event_capacity) {
+    pressured_event_t *grown =
+        realloc(gen->events, (size_t)needed * sizeof(pressured_event_t));
+    if (!grown) {
+      log_error("failed to grow events array");
+      return NULL;
+    }
+    gen->events = grown;
+    gen->event_capacity = needed;
   }
+  // Zero the slots this cycle may use; the caller has already cleared the
+  // previous cycle's event contents.
+  memset(gen->events, 0, (size_t)needed * sizeof(pressured_event_t));
+  pressured_event_t *events = gen->events;
 
   time_t now = time(NULL);
 
@@ -374,12 +393,13 @@ pressured_event_t *event_generator_process(event_generator_t *gen,
   return events;
 }
 
-void event_generator_events_free(pressured_event_t *events, int count) {
+// Free the contents of each event. The events array itself is owned by the
+// generator (see event_generator_free) and must not be freed here.
+void event_generator_events_clear(pressured_event_t *events, int count) {
   if (events) {
     for (int i = 0; i < count; i++) {
       pressured_event_free(&events[i]);
     }
-    free(events);
   }
 }
 

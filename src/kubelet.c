@@ -63,6 +63,9 @@ struct kubelet_source {
   int pod_limit_count;
   int pod_limit_capacity;
 
+  // Reused per-cycle samples buffer (owned by the source)
+  pressured_memory_sample_t *samples;
+
   // OOM event tracking (to deduplicate K8s events)
   oom_event_seen_t seen_events[MAX_OOM_EVENTS];
   int seen_event_count;
@@ -165,6 +168,14 @@ kubelet_source_t *kubelet_source_new(void) {
     return NULL;
   }
 
+  // Allocate the per-cycle samples buffer once; kubelet_collect() reuses it.
+  source->samples = calloc(MAX_PODS, sizeof(pressured_memory_sample_t));
+  if (!source->samples) {
+    free(source->pod_limits);
+    free(source);
+    return NULL;
+  }
+
   // Try in-cluster config first
   const char *k8s_host = getenv("KUBERNETES_SERVICE_HOST");
   const char *k8s_port = getenv("KUBERNETES_SERVICE_PORT");
@@ -227,6 +238,7 @@ void kubelet_source_free(kubelet_source_t *source) {
                        source->pod_limits[i].annotations_count);
     }
     free(source->pod_limits);
+    free(source->samples);
     for (int i = 0; i < source->seen_event_count; i++)
       free(source->seen_events[i].uid);
     if (source->curl)
@@ -1313,12 +1325,10 @@ pressured_memory_sample_t *kubelet_collect(kubelet_source_t *source,
     log_warn("failed to refresh pod limits, using cached list");
   }
 
-  pressured_memory_sample_t *samples =
-      calloc(MAX_PODS, sizeof(pressured_memory_sample_t));
-  if (!samples) {
-    log_error("failed to allocate samples array");
-    return NULL;
-  }
+  // Reuse the buffer owned by the source and clear it for this cycle. It stays
+  // valid until the next kubelet_collect() or kubelet_source_free().
+  pressured_memory_sample_t *samples = source->samples;
+  memset(samples, 0, MAX_PODS * sizeof(pressured_memory_sample_t));
 
   // Collect memory usage samples from kubelet stats
   int successful_nodes = 0;

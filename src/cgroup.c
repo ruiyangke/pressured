@@ -44,6 +44,7 @@ struct cgroup_source {
   char discovered_path[PATH_MAX]; // Auto-discovered pod/container path
   cgroup_version_t version;
   bool collection_healthy;
+  pressured_memory_sample_t *samples; // Reused per-cycle buffer (owned here)
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -631,6 +632,13 @@ cgroup_source_t *cgroup_source_new(const char *cgroup_path) {
   if (!source)
     return NULL;
 
+  // Allocate the per-cycle samples buffer once; cgroup_collect() reuses it.
+  source->samples = calloc(MAX_CONTAINERS, sizeof(pressured_memory_sample_t));
+  if (!source->samples) {
+    free(source);
+    return NULL;
+  }
+
   // Default base path
   if (buffer_copy(source->base_path, sizeof(source->base_path),
                   cgroup_path && cgroup_path[0] ? cgroup_path
@@ -694,6 +702,7 @@ cgroup_source_t *cgroup_source_new(const char *cgroup_path) {
 
 void cgroup_source_free(cgroup_source_t *source) {
   if (source) {
+    free(source->samples);
     free(source);
   }
 }
@@ -788,12 +797,10 @@ pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count) {
   *count = 0;
   source->collection_healthy = false;
 
-  pressured_memory_sample_t *samples =
-      calloc(MAX_CONTAINERS, sizeof(pressured_memory_sample_t));
-  if (!samples) {
-    log_error("cgroup: failed to allocate samples array");
-    return NULL;
-  }
+  // Reuse the buffer owned by the source and clear it for this cycle. It stays
+  // valid until the next cgroup_collect() or cgroup_source_free().
+  pressured_memory_sample_t *samples = source->samples;
+  memset(samples, 0, MAX_CONTAINERS * sizeof(pressured_memory_sample_t));
 
   // If we have a discovered path (single pod mode), collect from container
   // cgroups within it
@@ -943,12 +950,13 @@ bool cgroup_collect_healthy(const cgroup_source_t *source) {
   return source && source->collection_healthy;
 }
 
+// Free the contents of each sample. The samples array itself is owned by the
+// cgroup source (see cgroup_source_free) and must not be freed here.
 void cgroup_samples_free(pressured_memory_sample_t *samples, int count) {
   if (samples) {
     for (int i = 0; i < count; i++) {
       pressured_memory_sample_free(&samples[i]);
     }
-    free(samples);
   }
 }
 

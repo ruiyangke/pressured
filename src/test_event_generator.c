@@ -37,7 +37,7 @@ static int process(event_generator_t *gen, double usage_percent,
     if (events[i].event_type == type)
       matching++;
   }
-  event_generator_events_free(events, event_count);
+  event_generator_events_clear(events, event_count);
   return matching;
 }
 
@@ -110,6 +110,65 @@ static void test_memory_pressure_still_reported(void) {
   printf("ok\n");
 }
 
+// The events buffer is reused across calls: a second call with the same sample
+// count must return the same buffer.
+static void test_process_reuses_buffer(void) {
+  printf("  event_generator_process reuses its buffer... ");
+  event_generator_t *gen = event_generator_new(0.8, 0.9, 0.05, 60, false);
+  assert(gen);
+
+  pressured_memory_sample_t sample = make_sample(0.95, 0);
+  int event_count = 0;
+  pressured_event_t *first =
+      event_generator_process(gen, &sample, 1, &event_count);
+  assert(first != NULL);
+  assert(event_count == 1);
+  event_generator_events_clear(first, event_count);
+
+  pressured_event_t *second =
+      event_generator_process(gen, &sample, 1, &event_count);
+  assert(second == first);
+  event_generator_events_clear(second, event_count);
+
+  event_generator_free(gen);
+  printf("ok\n");
+}
+
+// A larger sample count must grow the reused buffer while still producing the
+// expected events.
+static void test_process_grows_buffer(void) {
+  printf("  event_generator_process grows for more samples... ");
+  event_generator_t *gen = event_generator_new(0.8, 0.9, 0.05, 60, false);
+  assert(gen);
+
+  pressured_memory_sample_t solo = make_sample(0.95, 0);
+  int event_count = 0;
+  pressured_event_t *single =
+      event_generator_process(gen, &solo, 1, &event_count);
+  assert(single != NULL);
+  assert(event_count == 1);
+  event_generator_events_clear(single, event_count);
+
+  pressured_memory_sample_t samples[8];
+  char names[8][16];
+  for (int i = 0; i < 8; i++) {
+    snprintf(names[i], sizeof(names[i]), "app-%d", i);
+    samples[i] = make_sample(0.95, 0);
+    samples[i].container_name = names[i];
+  }
+
+  pressured_event_t *grown =
+      event_generator_process(gen, samples, 8, &event_count);
+  assert(grown != NULL);
+  assert(event_count == 8);
+  for (int i = 0; i < event_count; i++)
+    assert(grown[i].event_type == EVENT_TYPE_MEMORY_PRESSURE);
+  event_generator_events_clear(grown, event_count);
+
+  event_generator_free(gen);
+  printf("ok\n");
+}
+
 int main(void) {
   log_init(LOG_WARN);
 
@@ -120,6 +179,8 @@ int main(void) {
   test_cgroup_ignores_historical_count();
   test_cgroup_reports_first_oom();
   test_memory_pressure_still_reported();
+  test_process_reuses_buffer();
+  test_process_grows_buffer();
 
   printf("\nAll event generator tests passed\n");
   return 0;
