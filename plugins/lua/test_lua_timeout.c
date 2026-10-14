@@ -264,7 +264,7 @@ int main(int argc, char **argv) {
                    "return 'SECOND_OK' end");
     }
   } else if (strcmp(test, "config_types") == 0) {
-    // Characterizes json_to_lua(): pins the Lua type each JSON value becomes.
+    // Pins json_to_lua(): the Lua type each JSON value becomes.
     // JSON null becomes nil, and empty arrays/objects both become empty tables.
     snprintf(
         code, sizeof(code),
@@ -289,6 +289,7 @@ int main(int argc, char **argv) {
         "assert(type(cfg.empty_obj)=='table' and next(cfg.empty_obj)==nil); "
         "assert(type(cfg.empty_arr)=='table' and #cfg.empty_arr==0); "
         "assert(type(cfg.unicode)=='string' and cfg.unicode=='\\xc3\\xa9'); "
+        "assert(cfg['k\\0ey']==7); "
         "assert(type(cfg.huge)=='number' and math.type(cfg.huge)=='integer' "
         "and cfg.huge==math.maxinteger); "
         "assert(type(cfg.nul)=='string' and #cfg.nul==3); "
@@ -380,11 +381,14 @@ int main(int argc, char **argv) {
              server.port, call);
   }
 
+  // timeout_ms is written as a real so the plugin must read any JSON number
+  // kind, not only integers.
   char config[16384];
   size_t off = 0;
-  off += (size_t)snprintf(config + off, sizeof(config) - off,
-                          "{\"plugins\":{\"lua\":{\"timeout_ms\":%d,\"%s\":\"",
-                          strcmp(test, "unlimited") == 0 ? 0 : 200, key);
+  off +=
+      (size_t)snprintf(config + off, sizeof(config) - off,
+                       "{\"plugins\":{\"lua\":{\"timeout_ms\":%d.0,\"%s\":\"",
+                       strcmp(test, "unlimited") == 0 ? 0 : 200, key);
   json_escape(config, sizeof(config), &off, value);
   off += (size_t)snprintf(config + off, sizeof(config) - off, "\"");
   if (strcmp(test, "config_types") == 0) {
@@ -397,7 +401,7 @@ int main(int argc, char **argv) {
                             "\"nested\":{\"inner\":\"x\",\"num\":7},"
                             "\"mixed\":[1,2.5,\"three\",true],"
                             "\"empty_obj\":{},\"empty_arr\":[],"
-                            "\"unicode\":\"\\u00e9\","
+                            "\"unicode\":\"\\u00e9\",\"k\\u0000ey\":7,"
                             "/* comment */"
                             "\"huge\":18446744073709551615,"
                             "\"nul\":\"a\\u0000b\","

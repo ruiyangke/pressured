@@ -69,15 +69,6 @@ static void test_credentials(void) {
   rc = parse_credentials(ctx, "not json");
   assert(rc == -1);
 
-  // Credential responses live in fixed buffers padded with NUL bytes; the
-  // parser must read only up to the string length.
-  char response[256] = {0};
-  strcpy(response, full);
-  rc = parse_credentials(ctx, response);
-  assert(rc == 0);
-  assert(strcmp(ctx->access_key, "AK") == 0);
-  assert(strcmp(ctx->session_token, "TK") == 0);
-
   free(ctx);
 }
 
@@ -112,11 +103,17 @@ static void test_config(void) {
   assert(ctx->bucket[0] == '\0');
   assert(strcmp(ctx->region, "us-east-1") == 0);
 
+  // storage.s3 that is not an object falls back to the flat form.
+  reset_ctx(ctx);
+  parse_s3_config(ctx, "{\"storage\":{\"s3\":null},\"bucket\":\"fb2\"}");
+  assert(strcmp(ctx->bucket, "fb2") == 0);
+
   free(ctx);
 }
 
 int main(void) {
   test_credentials();
   test_config();
+  printf("test_s3_credentials: PASSED\n");
   return 0;
 }

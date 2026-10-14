@@ -1,11 +1,11 @@
 /*
- * Config Corpus Characterization Tests
+ * Config Parsing Tests
  *
- * Pins the behavior of pressured_config_load() and of plugin enable/disable
- * parsing (plugin_is_disabled()) under the vendored yyjson reader. Assertions
- * describe what the code does, not what the JSON spec says.
- *
- * Every case below must load without crashing.
+ * Pins how pressured_config_load() and plugin_is_disabled() read config files:
+ * the lax syntax a hand-written file may use (comments, trailing commas, single
+ * quotes, bytes after the document), typed fields (a missing, null or
+ * wrong-typed key keeps its default) and plugin enable flags (only the JSON
+ * value false disables a plugin). Every case must load without crashing.
  *
  * plugin_is_disabled() is static, so include the production file to call it
  * directly (same approach as test_kubelet.c including kubelet.c).
