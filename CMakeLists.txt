@@ -133,7 +133,7 @@ add_test(NAME test_health_check_cli
 
 add_executable(test_kubelet src/test_kubelet.c)
 target_link_libraries(test_kubelet pressured_core)
-foreach(case dedupe cache age collection series timestamps pod_timestamps token)
+foreach(case dedupe cache nodes stats pod_limits pod_oom age collection series timestamps pod_timestamps token)
     add_test(NAME test_kubelet_${case} COMMAND test_kubelet ${case})
 endforeach()
 

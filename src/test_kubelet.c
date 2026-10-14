@@ -194,6 +194,151 @@ static void test_cache(kubelet_source_t *source) {
   assert(lookup_pod_info(source, "ns", "pod", "app") == NULL);
 }
 
+static void test_nodes(kubelet_source_t *source) {
+  fixture_response =
+      "{\"items\":["
+      // ExternalIP listed before InternalIP: InternalIP must win.
+      "{\"metadata\":{\"name\":\"node-a\"},\"status\":{\"addresses\":["
+      "{\"type\":\"ExternalIP\",\"address\":\"10.0.0.1\"},"
+      "{\"type\":\"InternalIP\",\"address\":\"192.168.1.1\"}]}},"
+      // No InternalIP: the address stays empty because the node array is
+      // freshly zeroed and a missing InternalIP is never cleared explicitly.
+      "{\"metadata\":{\"name\":\"node-b\"},\"status\":{\"addresses\":["
+      "{\"type\":\"ExternalIP\",\"address\":\"10.0.0.2\"}]}},"
+      // No addresses at all.
+      "{\"metadata\":{\"name\":\"node-c\"}}]}";
+  int result = kubelet_refresh_nodes(source);
+  assert(result == 0);
+  assert(source->node_count == 3);
+  assert(strcmp(source->nodes[0].name, "node-a") == 0);
+  assert(strcmp(source->nodes[0].address, "192.168.1.1") == 0);
+  assert(strcmp(source->nodes[1].name, "node-b") == 0);
+  assert(source->nodes[1].address[0] == '\0');
+  assert(strcmp(source->nodes[2].name, "node-c") == 0);
+  assert(source->nodes[2].address[0] == '\0');
+}
+
+static void test_stats(kubelet_source_t *source) {
+  // Cache limits for the containers the stats response will reference.
+  fixture_response =
+      "{\"items\":["
+      "{\"metadata\":{\"namespace\":\"ns\",\"name\":\"pod-a\"},\"spec\":{"
+      "\"containers\":["
+      "{\"name\":\"int\",\"resources\":{\"limits\":{\"memory\":\"1Mi\"}}},"
+      "{\"name\":\"float\",\"resources\":{\"limits\":{\"memory\":\"1Mi\"}}},"
+      "{\"name\":\"missing\",\"resources\":{\"limits\":{\"memory\":\"1Mi\"}}},"
+      "{\"name\":\"nolimit\"}]}},"
+      "{\"metadata\":{\"namespace\":\"ns\",\"name\":\"pod-b\"},\"spec\":{"
+      "\"containers\":[{\"name\":\"big\",\"resources\":{\"limits\":{\"memory\":"
+      "\"1Gi\"}}}]}}]}";
+  int result = kubelet_refresh_pod_limits(source);
+  assert(result == 0);
+
+  fixture_response =
+      "{\"pods\":["
+      "{\"podRef\":{\"namespace\":\"ns\",\"name\":\"pod-a\"},\"containers\":["
+      "{\"name\":\"int\",\"memory\":{\"workingSetBytes\":500}},"
+      "{\"name\":\"float\",\"memory\":{\"workingSetBytes\":1048576.0}},"
+      "{\"name\":\"missing\",\"memory\":{}},"
+      "{\"name\":\"nolimit\",\"memory\":{\"workingSetBytes\":777}}]},"
+      "{\"podRef\":{\"namespace\":\"ns\",\"name\":\"pod-b\"},\"containers\":["
+      "{\"name\":\"big\",\"memory\":{\"workingSetBytes\":"
+      "18446744073709551615}}]},"
+      // pod-c has no cached limit, so its container must be skipped.
+      "{\"podRef\":{\"namespace\":\"ns\",\"name\":\"pod-c\"},\"containers\":["
+      "{\"name\":\"app\",\"memory\":{\"workingSetBytes\":42}}]}]}";
+  pressured_memory_sample_t samples[8] = {0};
+  int count = 0;
+  assert(collect_from_node(source, "node-a", samples, &count, 8) == 0);
+  assert(count == 3);
+
+  assert(strcmp(samples[0].container_name, "int") == 0);
+  assert(samples[0].usage_bytes == 500);
+  assert(samples[0].limit_bytes == 1048576);
+  assert(strcmp(samples[0].node_name, "node-a") == 0);
+
+  // A JSON float is truncated to its integer value (1048576.0 -> 1048576).
+  assert(strcmp(samples[1].container_name, "float") == 0);
+  assert(samples[1].usage_bytes == 1048576);
+
+  // An out-of-range integer clamps to INT64_MAX under json-c.
+  assert(strcmp(samples[2].container_name, "big") == 0);
+  assert(samples[2].usage_bytes == 9223372036854775807ULL);
+  assert(samples[2].limit_bytes == 1073741824ULL);
+
+  for (int i = 0; i < count; i++)
+    pressured_memory_sample_free(&samples[i]);
+}
+
+static void test_pod_limits(kubelet_source_t *source) {
+  // parse_annotations yields nothing for NULL or an empty object.
+  int annotation_count = 7;
+  pressured_annotation_t *parsed = parse_annotations(NULL, &annotation_count);
+  assert(parsed == NULL);
+  assert(annotation_count == 0);
+  struct json_object *empty = json_tokener_parse("{}");
+  assert(empty);
+  parsed = parse_annotations(empty, &annotation_count);
+  assert(parsed == NULL);
+  assert(annotation_count == 0);
+  json_object_put(empty);
+
+  fixture_response =
+      "{\"items\":["
+      "{\"metadata\":{\"namespace\":\"ns\",\"name\":\"pod-units\","
+      "\"annotations\":{\"a\":\"1\",\"b\":\"2\"}},"
+      "\"status\":{\"podIP\":\"10.1.2.3\"},\"spec\":{\"containers\":["
+      "{\"name\":\"mi\",\"resources\":{\"limits\":{\"memory\":\"1Mi\"}}},"
+      "{\"name\":\"gi\",\"resources\":{\"limits\":{\"memory\":\"1Gi\"}}},"
+      "{\"name\":\"ki\",\"resources\":{\"limits\":{\"memory\":\"1Ki\"}}},"
+      "{\"name\":\"m\",\"resources\":{\"limits\":{\"memory\":\"1M\"}}},"
+      "{\"name\":\"bytes\",\"resources\":{\"limits\":{\"memory\":"
+      "\"1048576\"}}},"
+      "{\"name\":\"none\"}]}},"
+      "{\"metadata\":{\"namespace\":\"ns\",\"name\":\"pod-noip\"},\"spec\":{"
+      "\"containers\":[{\"name\":\"app\",\"resources\":{\"limits\":{\"memory\":"
+      "\"2Mi\"}}}]}}]}";
+  int result = kubelet_refresh_pod_limits(source);
+  assert(result == 0);
+
+  const struct {
+    const char *container;
+    uint64_t bytes;
+  } cases[] = {
+      {"mi", 1048576}, {"gi", 1073741824}, {"ki", 1024},
+      {"m", 1000000},  {"bytes", 1048576}, {"none", UINT64_MAX},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    pod_limit_t *pod =
+        lookup_pod_info(source, "ns", "pod-units", cases[i].container);
+    assert(pod != NULL);
+    assert(pod->limit_bytes == cases[i].bytes);
+    assert(strcmp(pod->pod_ip, "10.1.2.3") == 0);
+  }
+
+  pod_limit_t *annotated = lookup_pod_info(source, "ns", "pod-units", "mi");
+  assert(annotated->annotations != NULL);
+  assert(annotated->annotations_count == 2);
+  int saw_a = 0, saw_b = 0;
+  for (int i = 0; i < annotated->annotations_count; i++) {
+    if (strcmp(annotated->annotations[i].key, "a") == 0 &&
+        strcmp(annotated->annotations[i].value, "1") == 0)
+      saw_a = 1;
+    if (strcmp(annotated->annotations[i].key, "b") == 0 &&
+        strcmp(annotated->annotations[i].value, "2") == 0)
+      saw_b = 1;
+  }
+  assert(saw_a && saw_b);
+
+  // No annotations and no pod IP.
+  pod_limit_t *noip = lookup_pod_info(source, "ns", "pod-noip", "app");
+  assert(noip != NULL);
+  assert(noip->limit_bytes == 2 * 1048576);
+  assert(noip->annotations == NULL);
+  assert(noip->annotations_count == 0);
+  assert(noip->pod_ip[0] == '\0');
+}
+
 static void test_age(kubelet_source_t *source) {
   const char *fields[] = {"lastTimestamp", "eventTime", "firstTimestamp"};
   for (int f = 0; f < 3; f++) {
@@ -255,6 +400,63 @@ static void test_series(void) {
     assert(oom_event_is_old(event, now));
     json_object_put(event);
   }
+}
+
+static void test_pod_status_oom(kubelet_source_t *source) {
+  // Cache a limit so the OOM path can build a sample without an existing one.
+  fixture_response =
+      "{\"items\":[{\"metadata\":{\"namespace\":\"ns\",\"name\":\"pod\"},"
+      "\"spec\":{\"containers\":[{\"name\":\"app\",\"resources\":{\"limits\":"
+      "{\"memory\":\"1Mi\"}}}]}}]}";
+  int result = kubelet_refresh_pod_limits(source);
+  assert(result == 0);
+
+  char finished[64];
+  format_timestamp(finished, sizeof(finished), time(NULL) - 30, "Z");
+  const char *format =
+      "{\"items\":[{\"metadata\":{\"namespace\":\"ns\",\"name\":\"pod\","
+      "\"uid\":\"%s\"},\"spec\":{\"nodeName\":\"node-a\"},"
+      "\"status\":{\"containerStatuses\":[{\"name\":\"app\","
+      "\"restartCount\":%s,\"lastState\":{\"terminated\":{\"reason\":"
+      "\"OOMKilled\",\"finishedAt\":\"%s\"}}}]}}]}";
+  char fixture[2048];
+  pressured_memory_sample_t samples[4] = {0};
+  int count;
+
+  // restartCount as an integer creates one OOM sample.
+  snprintf(fixture, sizeof(fixture), format, "uid-int", "1", finished);
+  fixture_response = fixture;
+  count = 0;
+  assert(collect_oom_from_pod_status(source, samples, &count, 4) == 1);
+  assert(count == 1);
+  assert(strcmp(samples[0].container_name, "app") == 0);
+  assert(strcmp(samples[0].node_name, "node-a") == 0);
+  assert(samples[0].oom_kill_count == 1);
+  assert(samples[0].usage_bytes == 0);
+  assert(samples[0].limit_bytes == 1048576);
+  pressured_memory_sample_free(&samples[0]);
+
+  // The same UID and restart count is deduplicated.
+  memset(samples, 0, sizeof(samples));
+  count = 0;
+  assert(collect_oom_from_pod_status(source, samples, &count, 4) == 0);
+  assert(count == 0);
+
+  // A different restart count is a new event.
+  snprintf(fixture, sizeof(fixture), format, "uid-int", "2", finished);
+  memset(samples, 0, sizeof(samples));
+  count = 0;
+  assert(collect_oom_from_pod_status(source, samples, &count, 4) == 1);
+  assert(count == 1);
+  pressured_memory_sample_free(&samples[0]);
+
+  // A string restartCount is still read as its numeric value under json-c.
+  snprintf(fixture, sizeof(fixture), format, "uid-str", "\"1\"", finished);
+  memset(samples, 0, sizeof(samples));
+  count = 0;
+  assert(collect_oom_from_pod_status(source, samples, &count, 4) == 1);
+  assert(count == 1);
+  pressured_memory_sample_free(&samples[0]);
 }
 
 static void test_timestamps(kubelet_source_t *source, bool pod_status) {
@@ -419,6 +621,14 @@ int main(int argc, char **argv) {
     test_dedupe(source);
   else if (strcmp(argv[1], "cache") == 0)
     test_cache(source);
+  else if (strcmp(argv[1], "nodes") == 0)
+    test_nodes(source);
+  else if (strcmp(argv[1], "stats") == 0)
+    test_stats(source);
+  else if (strcmp(argv[1], "pod_limits") == 0)
+    test_pod_limits(source);
+  else if (strcmp(argv[1], "pod_oom") == 0)
+    test_pod_status_oom(source);
   else if (strcmp(argv[1], "age") == 0)
     test_age(source);
   else if (strcmp(argv[1], "series") == 0)
