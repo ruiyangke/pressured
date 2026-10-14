@@ -38,7 +38,6 @@ static int process(event_generator_t *gen, double usage_percent,
     if (events[i].event_type == type)
       matching++;
   }
-  event_generator_events_clear(events, event_count);
   return matching;
 }
 
@@ -132,14 +131,12 @@ static void test_process_reuses_buffer(void) {
       event_generator_process(gen, samples, 8, &event_count);
   assert(first != NULL);
   assert(event_count == 8);
-  event_generator_events_clear(first, event_count);
 
   pressured_memory_sample_t solo = make_sample(0.95, 0);
   pressured_event_t *second =
       event_generator_process(gen, &solo, 1, &event_count);
   assert(second == first);
   assert(event_count == 1);
-  event_generator_events_clear(second, event_count);
 
   event_generator_free(gen);
   printf("ok\n");
@@ -158,7 +155,6 @@ static void test_process_grows_buffer(void) {
       event_generator_process(gen, &solo, 1, &event_count);
   assert(single != NULL);
   assert(event_count == 1);
-  event_generator_events_clear(single, event_count);
 
   pressured_memory_sample_t samples[8];
   char names[8][16];
@@ -176,7 +172,40 @@ static void test_process_grows_buffer(void) {
     assert(grown[i].event_type == EVENT_TYPE_MEMORY_PRESSURE);
     assert(strcmp(grown[i].sample.container_name, names[i]) == 0);
   }
-  event_generator_events_clear(grown, event_count);
+
+  event_generator_free(gen);
+  printf("ok\n");
+}
+
+// Events share their source sample's strings and annotations instead of
+// copying them.
+static void test_event_shares_sample_data(void) {
+  printf("  event shares its source sample's data... ");
+  event_generator_t *gen = event_generator_new(0.8, 0.9, 0.05, 60, false);
+  assert(gen);
+
+  pressured_annotation_t annotations[] = {
+      {"pressured.io/warn-percent", "50"},
+      {"pressured.io/critical-percent", "60"},
+  };
+
+  pressured_memory_sample_t sample = make_sample(0.95, 0);
+  sample.namespace = "shared-ns";
+  sample.pod_name = "shared-pod";
+  sample.container_name = "shared-container";
+  sample.annotations = annotations;
+  sample.annotations_count = 2;
+
+  int event_count = 0;
+  pressured_event_t *events =
+      event_generator_process(gen, &sample, 1, &event_count);
+  assert(event_count == 1);
+  assert(events[0].event_type == EVENT_TYPE_MEMORY_PRESSURE);
+  assert(events[0].sample.namespace == sample.namespace);
+  assert(events[0].sample.pod_name == sample.pod_name);
+  assert(events[0].sample.container_name == sample.container_name);
+  assert(events[0].sample.annotations == sample.annotations);
+  assert(events[0].sample.annotations_count == sample.annotations_count);
 
   event_generator_free(gen);
   printf("ok\n");
@@ -194,6 +223,7 @@ int main(void) {
   test_memory_pressure_still_reported();
   test_process_reuses_buffer();
   test_process_grows_buffer();
+  test_event_shares_sample_data();
 
   printf("\nAll event generator tests passed\n");
   return 0;

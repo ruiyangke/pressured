@@ -71,9 +71,9 @@ static int run_lua_test(const char *name, const char *script) {
 
   // Create test event
   pressured_event_t event = {0};
-  event.sample.namespace = strdup("test-ns");
-  event.sample.pod_name = strdup("test-pod");
-  event.sample.container_name = strdup("test-container");
+  event.sample.namespace = "test-ns";
+  event.sample.pod_name = "test-pod";
+  event.sample.container_name = "test-container";
   event.sample.usage_bytes = 85 * 1024 * 1024;
   event.sample.limit_bytes = 100 * 1024 * 1024;
   event.sample.usage_percent = 0.85;
@@ -94,7 +94,6 @@ static int run_lua_test(const char *name, const char *script) {
     }
   }
 
-  pressured_event_free(&event);
   service_registry_free(sr);
   plugin_manager_free(test_pm);
 

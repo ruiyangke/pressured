@@ -271,8 +271,6 @@ int main(int argc, char *argv[]) {
           }
         }
       }
-
-      event_generator_events_clear(events, event_count);
     }
 
     // Free sample contents; the source owns the samples array and reuses it

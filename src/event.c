@@ -44,9 +44,3 @@ void pressured_memory_sample_free(pressured_memory_sample_t *sample) {
     }
   }
 }
-
-void pressured_event_free(pressured_event_t *event) {
-  if (event) {
-    pressured_memory_sample_free(&event->sample);
-  }
-}

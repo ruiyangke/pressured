@@ -235,44 +235,6 @@ calculate_severity(const event_generator_t *gen, double usage_percent,
   return SEVERITY_OK;
 }
 
-// Helper to copy annotations array
-static pressured_annotation_t *
-copy_annotations(const pressured_annotation_t *src, int count) {
-  if (!src || count == 0)
-    return NULL;
-
-  pressured_annotation_t *dst = calloc(count, sizeof(pressured_annotation_t));
-  if (!dst)
-    return NULL;
-
-  for (int i = 0; i < count; i++) {
-    dst[i].key = src[i].key ? strdup(src[i].key) : NULL;
-    dst[i].value = src[i].value ? strdup(src[i].value) : NULL;
-  }
-
-  return dst;
-}
-
-// Helper to copy sample data into an event
-static void copy_sample_to_event(pressured_event_t *event,
-                                 pressured_memory_sample_t *sample) {
-  event->sample.namespace = strdup(sample->namespace);
-  event->sample.pod_name = strdup(sample->pod_name);
-  event->sample.pod_uid = sample->pod_uid ? strdup(sample->pod_uid) : NULL;
-  event->sample.container_name = strdup(sample->container_name);
-  event->sample.node_name =
-      sample->node_name ? strdup(sample->node_name) : NULL;
-  event->sample.pod_ip = sample->pod_ip ? strdup(sample->pod_ip) : NULL;
-  event->sample.annotations =
-      copy_annotations(sample->annotations, sample->annotations_count);
-  event->sample.annotations_count = sample->annotations_count;
-  event->sample.usage_bytes = sample->usage_bytes;
-  event->sample.limit_bytes = sample->limit_bytes;
-  event->sample.usage_percent = sample->usage_percent;
-  event->sample.oom_kill_count = sample->oom_kill_count;
-  event->sample.timestamp = sample->timestamp;
-}
-
 pressured_event_t *event_generator_process(event_generator_t *gen,
                                            pressured_memory_sample_t *samples,
                                            int sample_count, int *event_count) {
@@ -298,8 +260,8 @@ pressured_event_t *event_generator_process(event_generator_t *gen,
     gen->events = grown;
     gen->event_capacity = needed;
   }
-  // Zero the slots this cycle may use; the caller has already cleared the
-  // previous cycle's event contents.
+  // Zero the slots this cycle may use so unused slots never expose stale
+  // sample pointers.
   memset(gen->events, 0, (size_t)needed * sizeof(pressured_event_t));
   pressured_event_t *events = gen->events;
 
@@ -334,7 +296,7 @@ pressured_event_t *event_generator_process(event_generator_t *gen,
     if (new_oom_kill) {
       // Emit OOM killed event
       pressured_event_t *event = &events[*event_count];
-      copy_sample_to_event(event, sample);
+      event->sample = *sample;
       event->event_type = EVENT_TYPE_OOM_KILLED;
       event->severity = SEVERITY_CRITICAL; // OOM kills are always critical
       event->previous_severity = state->severity;
@@ -367,7 +329,7 @@ pressured_event_t *event_generator_process(event_generator_t *gen,
     if (new_severity > SEVERITY_OK && (severity_changed || !in_cooldown)) {
       // Emit memory pressure event
       pressured_event_t *event = &events[*event_count];
-      copy_sample_to_event(event, sample);
+      event->sample = *sample;
       event->event_type = EVENT_TYPE_MEMORY_PRESSURE;
       event->severity = new_severity;
       event->previous_severity = state->severity;
@@ -391,16 +353,6 @@ pressured_event_t *event_generator_process(event_generator_t *gen,
   prune_stale_states(gen);
 
   return events;
-}
-
-// Free the contents of each event. The events array itself is owned by the
-// generator (see event_generator_free) and must not be freed here.
-void event_generator_events_clear(pressured_event_t *events, int count) {
-  if (events) {
-    for (int i = 0; i < count; i++) {
-      pressured_event_free(&events[i]);
-    }
-  }
 }
 
 pressured_severity_t event_generator_get_severity(event_generator_t *gen,

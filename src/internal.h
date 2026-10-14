@@ -87,15 +87,13 @@ event_generator_t *event_generator_new(double warn_percent,
                                        bool oom_count_cumulative);
 void event_generator_free(event_generator_t *gen);
 // Ownership: the returned events array is owned by the generator and reused by
-// the next event_generator_process() call. The caller must call
-// event_generator_events_clear() before the next process call; it frees only
-// the events' contents. The caller must never free the array itself.
+// the next event_generator_process() call. Each event's sample shares the
+// strings and annotations of the input sample it came from, so the events are
+// valid only until those samples are freed or the next process call. The caller
+// must never free the array or the events' contents.
 pressured_event_t *event_generator_process(event_generator_t *gen,
                                            pressured_memory_sample_t *samples,
                                            int sample_count, int *event_count);
-// Frees the events' contents only. The array itself is owned by the generator
-// and must not be freed here.
-void event_generator_events_clear(pressured_event_t *events, int count);
 pressured_severity_t event_generator_get_severity(event_generator_t *gen,
                                                   const char *namespace,
                                                   const char *pod_name,

@@ -89,7 +89,6 @@ char *pressured_config_load_json(
 void pressured_config_free(pressured_config_t *config);
 
 void pressured_memory_sample_free(pressured_memory_sample_t *sample);
-void pressured_event_free(pressured_event_t *event);
 
 const char *pressured_severity_str(pressured_severity_t severity);
 const char *pressured_event_type_str(pressured_event_type_t event_type);
