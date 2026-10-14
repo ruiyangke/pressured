@@ -19,6 +19,7 @@ typedef struct {
   pressured_severity_t severity;
   time_t last_event_time;
   uint64_t last_oom_kill_count; // Track OOM kill counter to detect new kills
+  bool oom_baseline_set;        // Cumulative mode: first sample seen
   uint64_t last_seen_cycle;     // Cycle number when container was last seen
 } container_state_t;
 
@@ -27,6 +28,7 @@ struct event_generator {
   double critical_percent;
   double hysteresis_percent;
   int cooldown_seconds;
+  bool oom_count_cumulative; // See event_generator_new()
 
   container_state_t *states;
   int state_count;
@@ -37,7 +39,8 @@ struct event_generator {
 event_generator_t *event_generator_new(double warn_percent,
                                        double critical_percent,
                                        double hysteresis_percent,
-                                       int cooldown_seconds) {
+                                       int cooldown_seconds,
+                                       bool oom_count_cumulative) {
   event_generator_t *gen = malloc(sizeof(event_generator_t));
   if (!gen)
     return NULL;
@@ -46,6 +49,7 @@ event_generator_t *event_generator_new(double warn_percent,
   gen->critical_percent = critical_percent;
   gen->hysteresis_percent = hysteresis_percent;
   gen->cooldown_seconds = cooldown_seconds;
+  gen->oom_count_cumulative = oom_count_cumulative;
 
   gen->state_capacity = 64;
   gen->state_count = 0;
@@ -112,6 +116,7 @@ static container_state_t *find_or_create_state(event_generator_t *gen,
   state->severity = SEVERITY_OK;
   state->last_event_time = 0;
   state->last_oom_kill_count = 0; // Will be initialized on first sample
+  state->oom_baseline_set = false;
   state->last_seen_cycle = gen->current_cycle;
 
   return state;
@@ -293,13 +298,21 @@ pressured_event_t *event_generator_process(event_generator_t *gen,
     state->last_seen_cycle = gen->current_cycle;
 
     // Check for OOM kill events first (highest priority)
-    // An increase in oom_kill_count means a new OOM kill occurred
-    bool is_new_container =
-        (state->last_oom_kill_count == 0 && sample->oom_kill_count > 0);
-    bool oom_kill_increased =
-        (sample->oom_kill_count > state->last_oom_kill_count);
+    bool new_oom_kill;
+    if (gen->oom_count_cumulative) {
+      // cgroup memory.events oom_kill is a cumulative counter: an increase
+      // means a new OOM kill. The first sample for a container only sets the
+      // baseline, so kills from before we started watching aren't reported.
+      new_oom_kill = state->oom_baseline_set &&
+                     sample->oom_kill_count > state->last_oom_kill_count;
+      state->oom_baseline_set = true;
+    } else {
+      // The kubelet source reports each OOM kill once, in the cycle it is
+      // detected, with oom_kill_count = 1
+      new_oom_kill = sample->oom_kill_count > 0;
+    }
 
-    if (oom_kill_increased && !is_new_container) {
+    if (new_oom_kill) {
       // Emit OOM killed event
       pressured_event_t *event = &events[*event_count];
       copy_sample_to_event(event, sample);

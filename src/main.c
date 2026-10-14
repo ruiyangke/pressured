@@ -125,7 +125,8 @@ int main(int argc, char *argv[]) {
 
   event_generator_t *event_gen =
       event_generator_new(config->warn_percent, config->critical_percent,
-                          config->hysteresis_percent, config->cooldown_seconds);
+                          config->hysteresis_percent, config->cooldown_seconds,
+                          config->source_mode == SOURCE_MODE_CGROUP);
   if (!event_gen) {
     log_error("failed to create event generator");
     if (cgroup_source)

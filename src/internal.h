@@ -60,7 +60,8 @@ typedef struct event_generator event_generator_t;
 event_generator_t *event_generator_new(double warn_percent,
                                        double critical_percent,
                                        double hysteresis_percent,
-                                       int cooldown_seconds);
+                                       int cooldown_seconds,
+                                       bool oom_count_cumulative);
 void event_generator_free(event_generator_t *gen);
 pressured_event_t *event_generator_process(event_generator_t *gen,
                                            pressured_memory_sample_t *samples,

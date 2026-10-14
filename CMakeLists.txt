@@ -113,6 +113,10 @@ add_executable(test_service_registry src/test_service_registry.c)
 target_link_libraries(test_service_registry pressured_core)
 add_test(NAME test_service_registry COMMAND test_service_registry)
 
+add_executable(test_event_generator src/test_event_generator.c)
+target_link_libraries(test_event_generator pressured_core)
+add_test(NAME test_event_generator COMMAND test_event_generator)
+
 # Lua plugin shared library
 add_library(pressured_plugin_lua SHARED
     plugins/lua/lua_plugin.c
