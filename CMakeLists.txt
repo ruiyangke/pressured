@@ -63,6 +63,12 @@ link_directories(
 )
 
 # Core library (no Lua dependency - Lua is in the plugin)
+# Vendored JSON parser (third_party/yyjson): built without our warning flags
+add_library(yyjson STATIC third_party/yyjson/yyjson.c)
+set_target_properties(yyjson PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(yyjson PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/yyjson)
+target_compile_options(yyjson PRIVATE -w)
+
 add_library(pressured_core STATIC
     src/health.c
     src/config.c
@@ -80,6 +86,7 @@ add_library(pressured_core STATIC
 set_target_properties(pressured_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_link_libraries(pressured_core
+    yyjson
     ${CURL_LIBRARIES}
     ${JSON_C_LIBRARIES}
     pthread
@@ -190,6 +197,7 @@ target_include_directories(storage_local PRIVATE
 
 target_link_libraries(storage_local
     ${JSON_C_LIBRARIES}
+    yyjson
 )
 
 # Storage plugin test
@@ -235,6 +243,7 @@ target_link_libraries(storage_s3
     ${JSON_C_LIBRARIES}
     ${CURL_LIBRARIES}
     ${CRYPTO_LIBRARIES}
+    yyjson
 )
 
 # AWS SigV4 signing unit tests
