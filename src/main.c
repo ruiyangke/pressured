@@ -239,12 +239,20 @@ int main(int argc, char *argv[]) {
         // Dispatch to action services (up to MAX_ACTIONS, on the stack)
         size_t action_count = service_registry_count(registry, "action");
         if (action_count > 0) {
-          service_ref_t refs[MAX_ACTIONS];
+          // Zero-initialize: service_registry_acquire_all can count a
+          // transient service whose create() returned NULL without writing its
+          // slot, leaving it uninitialized.
+          service_ref_t refs[MAX_ACTIONS] = {0};
           size_t dispatch_count = action_count;
           if (dispatch_count > MAX_ACTIONS) {
-            log_error("too many action services: %zu registered, dispatching "
-                      "to first %d (%zu skipped)",
-                      action_count, MAX_ACTIONS, dispatch_count - MAX_ACTIONS);
+            static bool warned_too_many_actions = false;
+            if (!warned_too_many_actions) {
+              log_error("too many action services: %zu registered, dispatching "
+                        "to first %d (%zu skipped)",
+                        action_count, MAX_ACTIONS,
+                        dispatch_count - MAX_ACTIONS);
+              warned_too_many_actions = true;
+            }
             dispatch_count = MAX_ACTIONS;
           }
           size_t acquired = service_registry_acquire_all(registry, "action",

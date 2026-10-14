@@ -65,6 +65,7 @@ struct kubelet_source {
 
   // Reused per-cycle samples buffer (owned by the source)
   pressured_memory_sample_t *samples;
+  int sample_count; // Entries written by the previous collect
 
   // OOM event tracking (to deduplicate K8s events)
   oom_event_seen_t seen_events[MAX_OOM_EVENTS];
@@ -1325,10 +1326,12 @@ pressured_memory_sample_t *kubelet_collect(kubelet_source_t *source,
     log_warn("failed to refresh pod limits, using cached list");
   }
 
-  // Reuse the buffer owned by the source and clear it for this cycle. It stays
-  // valid until the next kubelet_collect() or kubelet_source_free().
+  // Reuse the buffer owned by the source and clear only the entries the
+  // previous cycle wrote; the rest are still zero from the initial calloc. It
+  // stays valid until the next kubelet_collect() or kubelet_source_free().
   pressured_memory_sample_t *samples = source->samples;
-  memset(samples, 0, MAX_PODS * sizeof(pressured_memory_sample_t));
+  memset(samples, 0,
+         (size_t)source->sample_count * sizeof(pressured_memory_sample_t));
 
   // Collect memory usage samples from kubelet stats
   int successful_nodes = 0;
@@ -1360,6 +1363,7 @@ pressured_memory_sample_t *kubelet_collect(kubelet_source_t *source,
   }
 
   log_debug("collected %d samples from %d nodes", *count, source->node_count);
+  source->sample_count = *count;
   return samples;
 }
 

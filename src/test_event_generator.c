@@ -11,6 +11,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static pressured_memory_sample_t make_sample(double usage_percent,
                                              uint64_t oom_kill_count) {
@@ -110,24 +111,34 @@ static void test_memory_pressure_still_reported(void) {
   printf("ok\n");
 }
 
-// The events buffer is reused across calls: a second call with the same sample
-// count must return the same buffer.
+// The events buffer is reused across calls: a later call that needs less room
+// must return the same buffer instead of allocating a smaller one. A per-call
+// calloc of a smaller size would normally return a different block.
 static void test_process_reuses_buffer(void) {
   printf("  event_generator_process reuses its buffer... ");
   event_generator_t *gen = event_generator_new(0.8, 0.9, 0.05, 60, false);
   assert(gen);
 
-  pressured_memory_sample_t sample = make_sample(0.95, 0);
+  pressured_memory_sample_t samples[8];
+  char names[8][16];
+  for (int i = 0; i < 8; i++) {
+    snprintf(names[i], sizeof(names[i]), "app-%d", i);
+    samples[i] = make_sample(0.95, 0);
+    samples[i].container_name = names[i];
+  }
+
   int event_count = 0;
   pressured_event_t *first =
-      event_generator_process(gen, &sample, 1, &event_count);
+      event_generator_process(gen, samples, 8, &event_count);
   assert(first != NULL);
-  assert(event_count == 1);
+  assert(event_count == 8);
   event_generator_events_clear(first, event_count);
 
+  pressured_memory_sample_t solo = make_sample(0.95, 0);
   pressured_event_t *second =
-      event_generator_process(gen, &sample, 1, &event_count);
+      event_generator_process(gen, &solo, 1, &event_count);
   assert(second == first);
+  assert(event_count == 1);
   event_generator_events_clear(second, event_count);
 
   event_generator_free(gen);
@@ -161,8 +172,10 @@ static void test_process_grows_buffer(void) {
       event_generator_process(gen, samples, 8, &event_count);
   assert(grown != NULL);
   assert(event_count == 8);
-  for (int i = 0; i < event_count; i++)
+  for (int i = 0; i < event_count; i++) {
     assert(grown[i].event_type == EVENT_TYPE_MEMORY_PRESSURE);
+    assert(strcmp(grown[i].sample.container_name, names[i]) == 0);
+  }
   event_generator_events_clear(grown, event_count);
 
   event_generator_free(gen);

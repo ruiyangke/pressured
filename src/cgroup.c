@@ -45,6 +45,7 @@ struct cgroup_source {
   cgroup_version_t version;
   bool collection_healthy;
   pressured_memory_sample_t *samples; // Reused per-cycle buffer (owned here)
+  int sample_count;                   // Entries written by the previous collect
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -644,14 +645,14 @@ cgroup_source_t *cgroup_source_new(const char *cgroup_path) {
                   cgroup_path && cgroup_path[0] ? cgroup_path
                                                 : "/sys/fs/cgroup",
                   "cgroup base path") != 0) {
-    free(source);
+    cgroup_source_free(source);
     return NULL;
   }
 
   // Detect cgroup version
   source->version = detect_cgroup_version(source->base_path);
   if (source->version == CGROUP_ERROR) {
-    free(source);
+    cgroup_source_free(source);
     return NULL;
   }
 
@@ -661,14 +662,14 @@ cgroup_source_t *cgroup_source_new(const char *cgroup_path) {
     if (discover_pod_cgroup_by_uid(source->base_path, pod_uid,
                                    source->discovered_path,
                                    sizeof(source->discovered_path)) < 0) {
-      free(source);
+      cgroup_source_free(source);
       return NULL;
     }
     if (source->discovered_path[0]) {
       // Re-detect version at discovered path
       source->version = detect_cgroup_version(source->discovered_path);
       if (source->version == CGROUP_ERROR) {
-        free(source);
+        cgroup_source_free(source);
         return NULL;
       }
     }
@@ -678,13 +679,13 @@ cgroup_source_t *cgroup_source_new(const char *cgroup_path) {
   if (!source->discovered_path[0]) {
     if (discover_self_cgroup(source->base_path, source->discovered_path,
                              sizeof(source->discovered_path)) < 0) {
-      free(source);
+      cgroup_source_free(source);
       return NULL;
     }
     if (source->discovered_path[0]) {
       source->version = detect_cgroup_version(source->discovered_path);
       if (source->version == CGROUP_ERROR) {
-        free(source);
+        cgroup_source_free(source);
         return NULL;
       }
     }
@@ -797,10 +798,12 @@ pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count) {
   *count = 0;
   source->collection_healthy = false;
 
-  // Reuse the buffer owned by the source and clear it for this cycle. It stays
-  // valid until the next cgroup_collect() or cgroup_source_free().
+  // Reuse the buffer owned by the source and clear only the entries the
+  // previous cycle wrote; the rest are still zero from the initial calloc. It
+  // stays valid until the next cgroup_collect() or cgroup_source_free().
   pressured_memory_sample_t *samples = source->samples;
-  memset(samples, 0, MAX_CONTAINERS * sizeof(pressured_memory_sample_t));
+  memset(samples, 0,
+         (size_t)source->sample_count * sizeof(pressured_memory_sample_t));
 
   // If we have a discovered path (single pod mode), collect from container
   // cgroups within it
@@ -833,6 +836,7 @@ pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count) {
             free(ns);
             free(pod);
             free(pod_container);
+            source->sample_count = *count;
             cgroup_samples_free(samples, *count);
             *count = 0;
             source->collection_healthy = false;
@@ -935,6 +939,7 @@ pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count) {
         find_container_cgroups(source->base_path, source->version, samples,
                                count, MAX_CONTAINERS, &memory_read);
     if (result == -2) {
+      source->sample_count = *count;
       cgroup_samples_free(samples, *count);
       *count = 0;
       return NULL;
@@ -943,6 +948,7 @@ pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count) {
   }
 
   log_debug("cgroup: collected %d samples", *count);
+  source->sample_count = *count;
   return samples;
 }
 
