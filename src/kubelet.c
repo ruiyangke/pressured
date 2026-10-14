@@ -947,15 +947,13 @@ static int collect_oom_events(kubelet_source_t *source,
       }
     }
 
-    // Mark as seen before creating sample
-    mark_event_seen(source, uid);
-
     // Try to find existing sample from kubelet stats (preferred - has real
     // usage)
     pressured_memory_sample_t *existing =
         find_existing_sample(samples, *count, ns, pod_name, container_name);
     if (existing) {
       // Just mark existing sample as OOM killed, keep real usage data
+      mark_event_seen(source, uid);
       existing->oom_kill_count = 1;
       new_events++;
       log_info("OOM killed event: ns=%s pod=%s container=%s (updated existing "
@@ -987,6 +985,9 @@ static int collect_oom_events(kubelet_source_t *source,
         arena_strdup(&source->cycle, container_name);
     if (!sampled_namespace || !sampled_pod || !sampled_container)
       continue;
+    // The strings now exist, so the kill is reportable; marking it seen before
+    // this point would drop it for good if the arena was out of memory.
+    mark_event_seen(source, uid);
     sample->namespace = sampled_namespace;
     sample->pod_name = sampled_pod;
     sample->container_name = sampled_container;
@@ -1131,14 +1132,13 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
       if (is_event_seen(source, unique_id))
         continue;
 
-      mark_event_seen(source, unique_id);
-
       // Try to find existing sample from kubelet stats (preferred - has real
       // usage)
       pressured_memory_sample_t *existing =
           find_existing_sample(samples, *count, ns, pod_name, container_name);
       if (existing) {
         // Just mark existing sample as OOM killed, keep real usage data
+        mark_event_seen(source, unique_id);
         existing->oom_kill_count = 1;
         new_events++;
         log_info("OOM killed (from pod status): ns=%s pod=%s container=%s "
@@ -1169,6 +1169,10 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
           arena_strdup(&source->cycle, container_name);
       if (!sampled_namespace || !sampled_pod || !sampled_container)
         continue;
+      // The strings now exist, so the kill is reportable; marking it seen
+      // before this point would drop it for good if the arena was out of
+      // memory.
+      mark_event_seen(source, unique_id);
       sample->namespace = sampled_namespace;
       sample->pod_name = sampled_pod;
       sample->container_name = sampled_container;

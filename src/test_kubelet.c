@@ -512,6 +512,83 @@ static void test_pod_limits(kubelet_source_t *source) {
   assert(saw_k && saw_n && saw_t);
 }
 
+// An OOM kill whose pod is not in the cache yet is not marked seen, so it is
+// reported once a refresh caches the pod, and only once.
+static void test_oom_retry(kubelet_source_t *source) {
+  fixture_response = "{\"items\":[]}";
+  int result = kubelet_refresh_pod_limits(source);
+  assert(result == 0);
+
+  char timestamp[64], event[512];
+  time_t when = time(NULL) - 30;
+  struct tm tm;
+  gmtime_r(&when, &tm);
+  strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &tm);
+  snprintf(event, sizeof(event),
+           "{\"items\":[{\"metadata\":{\"uid\":\"late-1\"},"
+           "\"lastTimestamp\":\"%s\",\"involvedObject\":{\"kind\":\"Pod\","
+           "\"namespace\":\"ns\",\"name\":\"late\","
+           "\"fieldPath\":\"spec.containers{app}\"}}]}",
+           timestamp);
+  pressured_memory_sample_t samples[2] = {0};
+  int count = 0;
+  fixture_response = event;
+  assert(collect_oom_events(source, samples, &count, 2) == 0);
+  assert(count == 0);
+  assert(!is_event_seen(source, "late-1"));
+
+  fixture_response =
+      "{\"items\":[{\"metadata\":{\"namespace\":\"ns\",\"name\":\"late\"},"
+      "\"spec\":{\"containers\":[{\"name\":\"app\",\"resources\":{"
+      "\"limits\":{\"memory\":\"1Mi\"}}}]}}]}";
+  result = kubelet_refresh_pod_limits(source);
+  assert(result == 0);
+  fixture_response = event;
+  assert(collect_oom_events(source, samples, &count, 2) == 1);
+  assert(count == 1);
+  assert(strcmp(samples[0].pod_name, "late") == 0);
+  assert(samples[0].oom_kill_count == 1);
+  assert(is_event_seen(source, "late-1"));
+  assert(collect_oom_events(source, samples, &count, 2) == 0);
+  assert(count == 1);
+
+  // The same holds for a kill found in pod status.
+  fixture_response = "{\"items\":[]}";
+  result = kubelet_refresh_pod_limits(source);
+  assert(result == 0);
+  char status[1024];
+  snprintf(status, sizeof(status),
+           "{\"items\":[{\"metadata\":{\"namespace\":\"ns\",\"name\":"
+           "\"late2\",\"uid\":\"uid-late2\"},\"status\":{"
+           "\"containerStatuses\":[{\"name\":\"app\",\"restartCount\":1,"
+           "\"lastState\":{\"terminated\":{\"reason\":\"OOMKilled\","
+           "\"finishedAt\":\"%s\"}}}]}}]}",
+           timestamp);
+  pressured_memory_sample_t status_samples[2] = {0};
+  int status_count = 0;
+  fixture_response = status;
+  assert(collect_oom_from_pod_status(source, status_samples, &status_count,
+                                     2) == 0);
+  assert(status_count == 0);
+  assert(!is_event_seen(source, "9:uid-late2:app:1"));
+
+  fixture_response =
+      "{\"items\":[{\"metadata\":{\"namespace\":\"ns\",\"name\":\"late2\"},"
+      "\"spec\":{\"containers\":[{\"name\":\"app\",\"resources\":{"
+      "\"limits\":{\"memory\":\"1Mi\"}}}]}}]}";
+  result = kubelet_refresh_pod_limits(source);
+  assert(result == 0);
+  fixture_response = status;
+  assert(collect_oom_from_pod_status(source, status_samples, &status_count,
+                                     2) == 1);
+  assert(status_count == 1);
+  assert(strcmp(status_samples[0].pod_name, "late2") == 0);
+  assert(is_event_seen(source, "9:uid-late2:app:1"));
+  assert(collect_oom_from_pod_status(source, status_samples, &status_count,
+                                     2) == 0);
+  assert(status_count == 1);
+}
+
 static void test_age(kubelet_source_t *source) {
   const char *fields[] = {"lastTimestamp", "eventTime", "firstTimestamp"};
   for (int f = 0; f < 3; f++) {
@@ -1011,6 +1088,8 @@ int main(int argc, char **argv) {
     test_pod_status_oom(source);
   else if (strcmp(argv[1], "age") == 0)
     test_age(source);
+  else if (strcmp(argv[1], "oom_retry") == 0)
+    test_oom_retry(source);
   else if (strcmp(argv[1], "series") == 0)
     test_series();
   else if (strcmp(argv[1], "timestamps") == 0)

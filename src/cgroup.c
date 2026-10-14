@@ -765,22 +765,29 @@ static int find_container_cgroups(const char *base_path,
 
         char *ns = NULL, *pod = NULL, *container = NULL;
         if (cgroup_parse_container_info(path, &ns, &pod, &container) == 0) {
-          pressured_memory_sample_t *sample = &samples[*count];
-          sample->namespace = arena_strdup(arena, ns);
-          sample->pod_name = arena_strdup(arena, pod);
-          sample->pod_uid = NULL; // Not available in cluster mode scan
-          sample->container_name = arena_strdup(arena, container);
-          sample->node_name = "localhost";
-          sample->usage_bytes = usage;
-          sample->limit_bytes = limit;
-          sample->usage_percent = (double)usage / (double)limit;
-          sample->timestamp = time(NULL);
+          // A sample whose strings could not all be stored is dropped, the
+          // same rule kubelet.c applies: never count half a sample.
+          const char *sampled_namespace = arena_strdup(arena, ns);
+          const char *sampled_pod = arena_strdup(arena, pod);
+          const char *sampled_container = arena_strdup(arena, container);
+          if (sampled_namespace && sampled_pod && sampled_container) {
+            pressured_memory_sample_t *sample = &samples[*count];
+            sample->namespace = sampled_namespace;
+            sample->pod_name = sampled_pod;
+            sample->pod_uid = NULL; // Not available in cluster mode scan
+            sample->container_name = sampled_container;
+            sample->node_name = "localhost";
+            sample->usage_bytes = usage;
+            sample->limit_bytes = limit;
+            sample->usage_percent = (double)usage / (double)limit;
+            sample->timestamp = time(NULL);
 
-          log_debug(
-              "cgroup: found container ns=%s pod=%s container=%s usage=%.1f%%",
-              ns, pod, container, sample->usage_percent * 100.0);
+            log_debug("cgroup: found container ns=%s pod=%s container=%s "
+                      "usage=%.1f%%",
+                      ns, pod, container, sample->usage_percent * 100.0);
 
-          (*count)++;
+            (*count)++;
+          }
         }
         free(ns);
         free(pod);
@@ -868,16 +875,29 @@ pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count) {
                                       &container_id);
           const char *container = container_id ? container_id : entry->d_name;
 
-          pressured_memory_sample_t *sample = &samples[*count];
-          sample->namespace = ns ? arena_strdup(&source->cycle, ns) : "default";
-          sample->pod_name =
+          // A sample whose strings could not all be stored is dropped, the
+          // same rule kubelet.c applies: never count half a sample.
+          const char *sampled_namespace =
+              ns ? arena_strdup(&source->cycle, ns) : "default";
+          const char *sampled_pod =
               pod ? arena_strdup(&source->cycle, pod) : "unknown";
           // Get pod_uid from environment variable
           const char *env_pod_uid = getenv("POD_UID");
-          sample->pod_uid = env_pod_uid && env_pod_uid[0]
-                                ? arena_strdup(&source->cycle, env_pod_uid)
-                                : NULL;
-          sample->container_name = arena_strdup(&source->cycle, container);
+          const char *sampled_pod_uid =
+              env_pod_uid && env_pod_uid[0]
+                  ? arena_strdup(&source->cycle, env_pod_uid)
+                  : NULL;
+          const char *sampled_container =
+              arena_strdup(&source->cycle, container);
+          free(container_id);
+          if (!sampled_namespace || !sampled_pod || !sampled_container)
+            continue;
+
+          pressured_memory_sample_t *sample = &samples[*count];
+          sample->namespace = sampled_namespace;
+          sample->pod_name = sampled_pod;
+          sample->pod_uid = sampled_pod_uid;
+          sample->container_name = sampled_container;
           sample->node_name = "localhost";
           sample->usage_bytes = usage;
           sample->limit_bytes = limit;
@@ -890,10 +910,9 @@ pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count) {
 
           log_debug(
               "cgroup: container %s usage=%.1f%% (%lu/%lu bytes) oom_kills=%lu",
-              container, sample->usage_percent * 100.0, usage, limit,
+              sampled_container, sample->usage_percent * 100.0, usage, limit,
               sample->oom_kill_count);
 
-          free(container_id);
           (*count)++;
         }
       }
@@ -916,31 +935,42 @@ pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count) {
         cgroup_parse_container_info(source->discovered_path, &ns, &pod,
                                     &pod_container);
 
-        pressured_memory_sample_t *sample = &samples[0];
-        sample->namespace = ns ? arena_strdup(&source->cycle, ns) : "default";
-        sample->pod_name = pod ? arena_strdup(&source->cycle, pod) : "unknown";
+        // A sample whose strings could not all be stored is dropped, the same
+        // rule kubelet.c applies: never count half a sample.
+        const char *sampled_namespace =
+            ns ? arena_strdup(&source->cycle, ns) : "default";
+        const char *sampled_pod =
+            pod ? arena_strdup(&source->cycle, pod) : "unknown";
         // Get pod_uid from environment variable
         const char *env_pod_uid = getenv("POD_UID");
-        sample->pod_uid = env_pod_uid && env_pod_uid[0]
-                              ? arena_strdup(&source->cycle, env_pod_uid)
-                              : NULL;
-        sample->container_name =
+        const char *sampled_pod_uid =
+            env_pod_uid && env_pod_uid[0]
+                ? arena_strdup(&source->cycle, env_pod_uid)
+                : NULL;
+        const char *sampled_container =
             pod_container ? arena_strdup(&source->cycle, pod_container)
                           : "main";
-        sample->node_name = "localhost";
-        sample->usage_bytes = usage;
-        sample->limit_bytes = limit;
-        sample->usage_percent = (double)usage / (double)limit;
-        sample->oom_kill_count =
-            cgroup_read_oom_kill_count(source->discovered_path);
-        sample->timestamp = time(NULL);
+        if (sampled_namespace && sampled_pod && sampled_container) {
+          pressured_memory_sample_t *sample = &samples[0];
+          sample->namespace = sampled_namespace;
+          sample->pod_name = sampled_pod;
+          sample->pod_uid = sampled_pod_uid;
+          sample->container_name = sampled_container;
+          sample->node_name = "localhost";
+          sample->usage_bytes = usage;
+          sample->limit_bytes = limit;
+          sample->usage_percent = (double)usage / (double)limit;
+          sample->oom_kill_count =
+              cgroup_read_oom_kill_count(source->discovered_path);
+          sample->timestamp = time(NULL);
 
-        log_debug("cgroup: single-pod fallback mode usage=%.1f%% (%lu/%lu "
-                  "bytes) oom_kills=%lu",
-                  sample->usage_percent * 100.0, usage, limit,
-                  sample->oom_kill_count);
+          log_debug("cgroup: single-pod fallback mode usage=%.1f%% (%lu/%lu "
+                    "bytes) oom_kills=%lu",
+                    sample->usage_percent * 100.0, usage, limit,
+                    sample->oom_kill_count);
 
-        *count = 1;
+          *count = 1;
+        }
         free(ns);
         free(pod);
         free(pod_container);
