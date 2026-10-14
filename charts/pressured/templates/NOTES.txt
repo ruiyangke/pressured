@@ -85,12 +85,14 @@ Persistent Volume: {{ .Values.persistence.size }}
 {{- else if eq .Values.storage.backend "s3" }}
 Bucket: s3://{{ .Values.storage.s3.bucket }}/{{ .Values.storage.s3.prefix }}
 Region: {{ .Values.storage.s3.region }}
-{{- if .Values.storage.s3.irsaRoleArn }}
-Credentials: IRSA ({{ .Values.storage.s3.irsaRoleArn }})
+{{- $irsaRole := .Values.storage.s3.irsaRoleArn | default (index (.Values.serviceAccount.annotations | default dict) "eks.amazonaws.com/role-arn") }}
+{{- if $irsaRole }}
+Credentials: IRSA ({{ $irsaRole }})
 {{- else if .Values.storage.s3.existingSecret }}
 Credentials: From secret '{{ .Values.storage.s3.existingSecret }}'
 {{- else }}
-⚠️  No credentials configured! Set storage.s3.irsaRoleArn (recommended) or storage.s3.existingSecret
+⚠️  No credentials configured! Set storage.s3.irsaRoleArn (recommended), the
+    serviceAccount annotation eks.amazonaws.com/role-arn, or storage.s3.existingSecret
 {{- end }}
 {{- else if eq .Values.storage.backend "gcs" }}
 Bucket: gs://{{ .Values.storage.gcs.bucket }}/{{ .Values.storage.gcs.prefix }}
