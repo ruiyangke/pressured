@@ -1122,18 +1122,16 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
 
       // Create unique ID for deduplication: pod_uid + container_name +
       // restart_count This ensures we only report each OOM kill once
-      char *unique_id = NULL;
-      if (asprintf(&unique_id, "%zu:%s:%s:%d", strlen(pod_uid), pod_uid,
-                   container_name, restart_count) < 0)
+      char unique_id[1024];
+      if (buffer_format(unique_id, sizeof(unique_id), "OOM event id",
+                        "%zu:%s:%s:%d", strlen(pod_uid), pod_uid,
+                        container_name, restart_count) != 0)
         continue;
 
-      if (is_event_seen(source, unique_id)) {
-        free(unique_id);
+      if (is_event_seen(source, unique_id))
         continue;
-      }
 
       mark_event_seen(source, unique_id);
-      free(unique_id);
 
       // Try to find existing sample from kubelet stats (preferred - has real
       // usage)
