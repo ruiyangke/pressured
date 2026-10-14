@@ -27,6 +27,8 @@ typedef struct {
   unsigned port;
   const char *mode;
   pthread_t thread;
+  char recorded[8192];
+  size_t recorded_len;
 } server_t;
 
 static void send_all(int fd, const void *data, size_t len) {
@@ -58,6 +60,14 @@ static void *serve(void *arg) {
       body = strstr(request, "\r\n\r\n");
     }
     body += 4;
+    // Record the request line and headers for assertions after the server
+    // stops.
+    size_t req_len = (size_t)(body - request);
+    if (s->recorded_len + req_len < sizeof(s->recorded)) {
+      memcpy(s->recorded + s->recorded_len, request, req_len);
+      s->recorded_len += req_len;
+      s->recorded[s->recorded_len] = '\0';
+    }
     if (strcmp(s->mode, "binary") == 0) {
       const char expected[] = {'a', '\0', 'b', '\0', 'c'};
       char *length = strstr(request, "Content-Length:");
@@ -266,6 +276,11 @@ int main(int argc, char **argv) {
                "assert(s.ok==false and s.error:find('too many headers')); "
                "local n=http.fetch('GET',url,{headers={'X-A: 1',42}}); "
                "assert(n.error and n.error:find('not a string')); "
+               "local ns=http.stream(url,function() return true end,"
+               "{headers={'X-A: 1',42}}); "
+               "assert(ns.ok==false and ns.error:find('not a string')); "
+               "local b=http.fetch('POST',url,{body=12345}); "
+               "assert(b.error and b.error:find('body must be a string')); "
                "local ok={} for i=1,64 do ok[i]='X-H'..i..': v' end; "
                "local f=http.fetch('GET',url,{headers=ok}); "
                "assert(not f.error and f.status==200); "
@@ -359,6 +374,9 @@ int main(int argc, char **argv) {
   }
   if (has_server)
     stop_server(&server);
+  // The "headers" case must have sent every header, including the last one.
+  if (strcmp(test, "headers") == 0)
+    assert(strstr(server.recorded, "X-H64: v"));
   service_registry_free(sr);
   plugin_manager_free(pm);
   json_object_put(root);

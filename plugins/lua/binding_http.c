@@ -32,6 +32,52 @@ static int budget_error(lua_State *L) {
   return 1;
 }
 
+// Push the http.fetch error result {status=0, error=message} and return 1.
+static int fetch_error(lua_State *L, const char *message) {
+  lua_newtable(L);
+  lua_pushinteger(L, 0);
+  lua_setfield(L, -2, "status");
+  lua_pushstring(L, message);
+  lua_setfield(L, -2, "error");
+  return 1;
+}
+
+// Push the http.stream error result {ok=false, error=message} and return 1.
+static int stream_error(lua_State *L, const char *message) {
+  lua_newtable(L);
+  lua_pushboolean(L, 0);
+  lua_setfield(L, -2, "ok");
+  lua_pushstring(L, message);
+  lua_setfield(L, -2, "error");
+  return 1;
+}
+
+/*
+ * Read an optional string option from the options table. Only real Lua strings
+ * are accepted; a number would be converted to a temporary copy that is then
+ * popped, leaving a dangling pointer. Returns 0 when the option is absent or
+ * nil, or 1 with *error set to a "<name> must be a string" message when it is
+ * present with another type.
+ */
+static int read_string_option(lua_State *L, int opts_index, const char *name,
+                              const char **dst, size_t *len,
+                              const char **error) {
+  lua_getfield(L, opts_index, name);
+  if (lua_isnil(L, -1)) {
+    lua_pop(L, 1);
+    return 0;
+  }
+  if (lua_type(L, -1) != LUA_TSTRING) {
+    lua_pop(L, 1);
+    lua_pushfstring(L, "%s must be a string", name);
+    *error = lua_tostring(L, -1);
+    return 1;
+  }
+  *dst = lua_tolstring(L, -1, len);
+  lua_pop(L, 1);
+  return 0;
+}
+
 /*
  * Copy the optional "headers" array from the options table at opts_index into
  * headers, which is NULL-terminated. Returns 0 on success (with headers[0]
@@ -53,9 +99,9 @@ static int collect_headers(lua_State *L, int opts_index, const char **headers,
     return 0;
   }
 
-  int header_count = lua_rawlen(L, -1);
+  size_t header_count = lua_rawlen(L, -1);
   if (header_count > MAX_REQUEST_HEADERS) {
-    log_error("lua_http: too many headers (%d > %d)", header_count,
+    log_error("lua_http: too many headers (%zu > %d)", header_count,
               MAX_REQUEST_HEADERS);
     lua_pushfstring(L, "too many headers (max %d)", MAX_REQUEST_HEADERS);
     *error = lua_tostring(L, -1);
@@ -63,12 +109,12 @@ static int collect_headers(lua_State *L, int opts_index, const char **headers,
     return -1;
   }
 
-  for (int i = 1; i <= header_count; i++) {
+  for (size_t i = 1; i <= header_count; i++) {
     lua_rawgeti(L, -1, i);
     if (lua_type(L, -1) != LUA_TSTRING) {
-      log_error("lua_http: header %d is not a string", i);
+      log_error("lua_http: header %d is not a string", (int)i);
       lua_pop(L, 1);
-      lua_pushfstring(L, "header %d is not a string", i);
+      lua_pushfstring(L, "header %d is not a string", (int)i);
       *error = lua_tostring(L, -1);
       lua_remove(L, -2);
       return -1;
@@ -95,26 +141,18 @@ static int lua_http_fetch(lua_State *L) {
   const char *error = NULL;
 
   if (lua_istable(L, 3)) {
-    lua_getfield(L, 3, "body");
-    if (lua_isstring(L, -1)) {
-      req.body = lua_tolstring(L, -1, &req.body_len);
+    if (read_string_option(L, 3, "body", &req.body, &req.body_len, &error) !=
+        0) {
+      return fetch_error(L, error);
     }
-    lua_pop(L, 1);
-
-    lua_getfield(L, 3, "content_type");
-    if (lua_isstring(L, -1)) {
-      req.content_type = lua_tostring(L, -1);
+    if (read_string_option(L, 3, "content_type", &req.content_type, NULL,
+                           &error) != 0) {
+      return fetch_error(L, error);
     }
-    lua_pop(L, 1);
   }
 
   if (collect_headers(L, 3, headers, &error) != 0) {
-    lua_newtable(L);
-    lua_pushinteger(L, 0);
-    lua_setfield(L, -2, "status");
-    lua_pushstring(L, error);
-    lua_setfield(L, -2, "error");
-    return 1;
+    return fetch_error(L, error);
   }
   if (headers[0]) {
     req.headers = headers;
@@ -237,32 +275,21 @@ static int lua_http_stream(lua_State *L) {
   const char *error = NULL;
 
   if (lua_istable(L, 3)) {
-    lua_getfield(L, 3, "method");
-    if (lua_isstring(L, -1)) {
-      method = lua_tostring(L, -1);
+    if (read_string_option(L, 3, "method", &method, NULL, &error) != 0) {
+      return stream_error(L, error);
     }
-    lua_pop(L, 1);
-
-    lua_getfield(L, 3, "body");
-    if (lua_isstring(L, -1)) {
-      req.body = lua_tolstring(L, -1, &req.body_len);
+    if (read_string_option(L, 3, "body", &req.body, &req.body_len, &error) !=
+        0) {
+      return stream_error(L, error);
     }
-    lua_pop(L, 1);
-
-    lua_getfield(L, 3, "content_type");
-    if (lua_isstring(L, -1)) {
-      req.content_type = lua_tostring(L, -1);
+    if (read_string_option(L, 3, "content_type", &req.content_type, NULL,
+                           &error) != 0) {
+      return stream_error(L, error);
     }
-    lua_pop(L, 1);
   }
 
   if (collect_headers(L, 3, headers, &error) != 0) {
-    lua_newtable(L);
-    lua_pushboolean(L, 0);
-    lua_setfield(L, -2, "ok");
-    lua_pushstring(L, error);
-    lua_setfield(L, -2, "error");
-    return 1;
+    return stream_error(L, error);
   }
   if (headers[0]) {
     req.headers = headers;
