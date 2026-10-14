@@ -1,0 +1,17 @@
+# Deferred findings
+
+Findings from reviews that are known and not fixed yet, each with what blocks it.
+Remove an entry in the same commit that fixes it.
+
+| Finding | Where | Blocker | Last considered |
+|---|---|---|---|
+| Collection counts as healthy when stats from at least one node succeed. With a namespace filter, the nodes running the selected workloads can all fail while an unrelated node succeeds, so the heartbeat stays fresh. | `src/kubelet.c` `kubelet_collect` | Needs a policy decision: requiring every node makes one flaky node restart pressured. | 2026-10-14 |
+| On clusters with node-problem-detector, the same OOM kill can be reported twice: once from the Events API (deduplicated by event UID) and once from pod status (deduplicated by pod UID + container + restart count). | `src/kubelet.c` `collect_oom_events`, `collect_oom_from_pod_status` | Needs a shared identity for one kill across both sources; not seen on clusters without node-problem-detector. | 2026-10-14 |
+| After a pressured restart, OOM kills that finished in the previous 5 minutes are reported again. | `src/kubelet.c` `collect_oom_from_pod_status` | Deliberate: dropping them instead would lose kills that happened while pressured was down. A persisted dedupe set would remove both problems. | 2026-10-14 |
+| The local storage plugin reads `storage.path` or `PRESSURED_STORAGE_PATH`, while the config file and the Helm chart describe `storage.local.path`. The chart works because it also sets the environment variable. | `plugins/storage/local_storage.c` plugin init | Needs a decision on the canonical key and a compatibility path for existing configs. | 2026-10-14 |
+| `slack_notify.lua` groups OOM kills by a workload name derived from the pod name (ReplicaSet hash and pod suffix stripped). Owner references would be exact. | `examples/lua-scripts/slack_notify.lua` `workload_name` | Needs the C side to pass owner references in the event. | 2026-10-14 |
+| A Lua `__gc` finalizer that never returns cannot be interrupted by `timeout_ms`: Lua does not run hooks inside finalizers. | `plugins/lua/lua_plugin.c` `timeout_hook` | Lua limitation; scripts are trusted configuration. | 2026-10-14 |
+| `pprof_dump.lua` records a capture attempt even when the profile endpoint fails, so a failing endpoint is retried at most once per `PPROF_INTERVAL_SECONDS`. | `examples/lua-scripts/pprof_dump.lua` `should_capture` | Deliberate, to avoid hammering a failing endpoint on every event. | 2026-10-14 |
+| No image is published for the chart's appVersion (or `latest`), so the chart only works with an explicit `image.tag` such as a `dev-<sha>` tag. | `charts/pressured/Chart.yaml`, `.github/workflows/release.yaml` | Needs a release: pushing a `v*` tag publishes semver images. | 2026-10-14 |
+| Dependabot PRs #10-#14 are superseded by the dependency update on main but still open. | GitHub | Needs a maintainer account to close them. | 2026-10-14 |
+| Dependabot has not run since 2026-03-09, so newer updates get no PRs. | GitHub repository settings | Needs a maintainer to check the Dependabot status page and resume updates. | 2026-10-14 |
