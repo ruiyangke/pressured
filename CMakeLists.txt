@@ -125,6 +125,10 @@ add_executable(test_event_generator src/test_event_generator.c)
 target_link_libraries(test_event_generator pressured_core)
 add_test(NAME test_event_generator COMMAND test_event_generator)
 
+add_executable(test_config_corpus src/test_config_corpus.c)
+target_link_libraries(test_config_corpus pressured_core)
+add_test(NAME test_config_corpus COMMAND test_config_corpus)
+
 # The probe form used by the Helm chart (--health-check=N) and the
 # space-separated form, against the real binary
 add_test(NAME test_health_check_cli
