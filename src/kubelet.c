@@ -6,7 +6,6 @@
 #include <ctype.h>
 #include <curl/curl.h>
 #include <errno.h>
-#include <json-c/json.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -722,39 +721,37 @@ static int collect_from_node(kubelet_source_t *source, const char *node_name,
     return -1;
   }
 
-  struct json_object *root = json_tokener_parse(response);
+  yyjson_doc *doc =
+      pj_parse(response, strlen(response), PJ_READ_API, "stats response");
   free(response);
 
-  if (!root) {
+  if (!doc) {
     log_error("failed to parse stats response from %s", node_name);
     return -1;
   }
 
-  struct json_object *pods_array;
-  if (!json_object_object_get_ex(root, "pods", &pods_array) ||
-      !json_object_is_type(pods_array, json_type_array)) {
-    json_object_put(root);
+  yyjson_val *root = yyjson_doc_get_root(doc);
+  yyjson_val *pods_array = yyjson_obj_get(root, "pods");
+  if (!yyjson_is_arr(pods_array)) {
+    yyjson_doc_free(doc);
     return -1;
   }
 
-  int pod_count = json_object_array_length(pods_array);
-  for (int i = 0; i < pod_count && *count < max_count; i++) {
-    struct json_object *pod = json_object_array_get_idx(pods_array, i);
-    struct json_object *pod_ref, *containers_array;
+  size_t pod_idx, pod_max;
+  yyjson_val *pod;
+  yyjson_arr_foreach(pods_array, pod_idx, pod_max, pod) {
+    if (*count >= max_count)
+      break;
 
-    if (!json_object_object_get_ex(pod, "podRef", &pod_ref))
-      continue;
-    if (!json_object_object_get_ex(pod, "containers", &containers_array))
-      continue;
-
-    struct json_object *ns_obj, *name_obj;
-    if (!json_object_object_get_ex(pod_ref, "namespace", &ns_obj))
-      continue;
-    if (!json_object_object_get_ex(pod_ref, "name", &name_obj))
+    yyjson_val *pod_ref = yyjson_obj_get(pod, "podRef");
+    yyjson_val *containers_array = yyjson_obj_get(pod, "containers");
+    if (!yyjson_is_obj(pod_ref) || !yyjson_is_arr(containers_array))
       continue;
 
-    const char *ns = json_object_get_string(ns_obj);
-    const char *pod_name = json_object_get_string(name_obj);
+    const char *ns = yyjson_get_str(yyjson_obj_get(pod_ref, "namespace"));
+    const char *pod_name = yyjson_get_str(yyjson_obj_get(pod_ref, "name"));
+    if (!ns || !pod_name)
+      continue;
 
     // Apply namespace filter
     if (source->namespace_filter && source->namespace_filter[0]) {
@@ -762,25 +759,28 @@ static int collect_from_node(kubelet_source_t *source, const char *node_name,
         continue;
     }
 
-    int container_count = json_object_array_length(containers_array);
-    for (int j = 0; j < container_count && *count < max_count; j++) {
-      struct json_object *container =
-          json_object_array_get_idx(containers_array, j);
-      struct json_object *container_name_obj, *memory_obj;
+    size_t container_idx, container_max;
+    yyjson_val *container;
+    yyjson_arr_foreach(containers_array, container_idx, container_max,
+                       container) {
+      if (*count >= max_count)
+        break;
 
-      if (!json_object_object_get_ex(container, "name", &container_name_obj))
-        continue;
-      if (!json_object_object_get_ex(container, "memory", &memory_obj))
-        continue;
-
-      const char *container_name = json_object_get_string(container_name_obj);
-
-      struct json_object *working_set_obj;
-      if (!json_object_object_get_ex(memory_obj, "workingSetBytes",
-                                     &working_set_obj))
+      const char *container_name =
+          yyjson_get_str(yyjson_obj_get(container, "name"));
+      if (!container_name)
         continue;
 
-      uint64_t usage = json_object_get_int64(working_set_obj);
+      yyjson_val *memory_obj = yyjson_obj_get(container, "memory");
+      if (!yyjson_is_obj(memory_obj))
+        continue;
+
+      int64_t working_set;
+      if (!pj_int64(yyjson_obj_get(memory_obj, "workingSetBytes"),
+                    &working_set))
+        continue;
+
+      uint64_t usage = (uint64_t)working_set;
       pod_limit_t *pod_info =
           lookup_pod_info(source, ns, pod_name, container_name);
 
@@ -810,7 +810,7 @@ static int collect_from_node(kubelet_source_t *source, const char *node_name,
     }
   }
 
-  json_object_put(root);
+  yyjson_doc_free(doc);
   return 0;
 }
 
@@ -896,17 +896,15 @@ static bool parse_rfc3339(const char *text, time_t *timestamp) {
   return true;
 }
 
-static bool oom_event_is_old(struct json_object *event, time_t now) {
-  struct json_object *series = NULL;
-  json_object_object_get_ex(event, "series", &series);
+static bool oom_event_is_old(yyjson_val *event, time_t now) {
+  yyjson_val *series = yyjson_obj_get(event, "series");
   const char *fields[] = {"lastObservedTime", "lastTimestamp", "eventTime",
                           "firstTimestamp"};
   for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
-    struct json_object *value;
-    if (!json_object_object_get_ex(i == 0 ? series : event, fields[i], &value))
-      continue;
+    const char *text =
+        yyjson_get_str(yyjson_obj_get(i == 0 ? series : event, fields[i]));
     time_t timestamp;
-    if (parse_rfc3339(json_object_get_string(value), &timestamp))
+    if (parse_rfc3339(text, &timestamp))
       return difftime(now, timestamp) > 300;
   }
   return false;
@@ -941,39 +939,42 @@ static int collect_oom_events(kubelet_source_t *source,
     return 0;
   }
 
-  struct json_object *root = json_tokener_parse(response);
+  yyjson_doc *doc =
+      pj_parse(response, strlen(response), PJ_READ_API, "events response");
   free(response);
 
-  if (!root) {
+  if (!doc) {
     log_warn("failed to parse events response");
     return 0;
   }
 
-  struct json_object *items;
-  if (!json_object_object_get_ex(root, "items", &items)) {
-    json_object_put(root);
+  yyjson_val *root = yyjson_doc_get_root(doc);
+  yyjson_val *items = yyjson_obj_get(root, "items");
+  if (!yyjson_is_arr(items)) {
+    yyjson_doc_free(doc);
     return 0;
   }
 
-  int event_count = json_object_array_length(items);
-  log_debug("found %d OOMKilling events", event_count);
+  log_debug("found %d OOMKilling events", (int)yyjson_arr_size(items));
 
-  for (int i = 0; i < event_count && *count < max_count; i++) {
-    struct json_object *event = json_object_array_get_idx(items, i);
+  size_t event_idx, event_max;
+  yyjson_val *event;
+  yyjson_arr_foreach(items, event_idx, event_max, event) {
+    if (*count >= max_count)
+      break;
+
     if (oom_event_is_old(event, time(NULL)))
       continue;
-    struct json_object *metadata, *involved_object;
 
-    if (!json_object_object_get_ex(event, "metadata", &metadata))
-      continue;
-    if (!json_object_object_get_ex(event, "involvedObject", &involved_object))
+    yyjson_val *metadata = yyjson_obj_get(event, "metadata");
+    yyjson_val *involved_object = yyjson_obj_get(event, "involvedObject");
+    if (!yyjson_is_obj(metadata) || !yyjson_is_obj(involved_object))
       continue;
 
     // Get event UID for deduplication
-    struct json_object *uid_obj;
-    if (!json_object_object_get_ex(metadata, "uid", &uid_obj))
+    const char *uid = yyjson_get_str(yyjson_obj_get(metadata, "uid"));
+    if (!uid)
       continue;
-    const char *uid = json_object_get_string(uid_obj);
 
     // Skip if we've already seen this event
     if (is_event_seen(source, uid)) {
@@ -981,27 +982,21 @@ static int collect_oom_events(kubelet_source_t *source,
     }
 
     // Get involved object details (the Pod)
-    struct json_object *kind_obj, *ns_obj, *name_obj;
-    if (!json_object_object_get_ex(involved_object, "kind", &kind_obj))
+    const char *kind = yyjson_get_str(yyjson_obj_get(involved_object, "kind"));
+    const char *ns =
+        yyjson_get_str(yyjson_obj_get(involved_object, "namespace"));
+    const char *pod_name =
+        yyjson_get_str(yyjson_obj_get(involved_object, "name"));
+    if (!kind || !ns || !pod_name)
       continue;
-    if (!json_object_object_get_ex(involved_object, "namespace", &ns_obj))
-      continue;
-    if (!json_object_object_get_ex(involved_object, "name", &name_obj))
-      continue;
-
-    const char *kind = json_object_get_string(kind_obj);
     if (strcmp(kind, "Pod") != 0)
       continue; // Only care about Pod events
 
-    const char *ns = json_object_get_string(ns_obj);
-    const char *pod_name = json_object_get_string(name_obj);
-
     // Get container name from fieldPath (e.g., "spec.containers{app}")
     const char *container_name = "unknown";
-    struct json_object *field_path_obj;
-    if (json_object_object_get_ex(involved_object, "fieldPath",
-                                  &field_path_obj)) {
-      const char *field_path = json_object_get_string(field_path_obj);
+    const char *field_path =
+        yyjson_get_str(yyjson_obj_get(involved_object, "fieldPath"));
+    if (field_path) {
       // Parse "spec.containers{container_name}"
       static char container_buf[256];
       const char *start = strchr(field_path, '{');
@@ -1073,7 +1068,7 @@ static int collect_oom_events(kubelet_source_t *source,
              ns, pod_name, container_name);
   }
 
-  json_object_put(root);
+  yyjson_doc_free(doc);
   return new_events;
 }
 
@@ -1105,90 +1100,73 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
     return 0;
   }
 
-  struct json_object *root = json_tokener_parse(response);
+  yyjson_doc *doc =
+      pj_parse(response, strlen(response), PJ_READ_API, "pods response");
   free(response);
 
-  if (!root) {
+  if (!doc) {
     log_warn("failed to parse pods response for OOM status check");
     return 0;
   }
 
-  struct json_object *items;
-  if (!json_object_object_get_ex(root, "items", &items)) {
-    json_object_put(root);
+  yyjson_val *root = yyjson_doc_get_root(doc);
+  yyjson_val *items = yyjson_obj_get(root, "items");
+  if (!yyjson_is_arr(items)) {
+    yyjson_doc_free(doc);
     return 0;
   }
 
-  int pod_count = json_object_array_length(items);
-  for (int i = 0; i < pod_count && *count < max_count; i++) {
-    struct json_object *pod = json_object_array_get_idx(items, i);
-    struct json_object *metadata, *status, *spec = NULL;
+  size_t pod_idx, pod_max;
+  yyjson_val *pod;
+  yyjson_arr_foreach(items, pod_idx, pod_max, pod) {
+    if (*count >= max_count)
+      break;
 
-    if (!json_object_object_get_ex(pod, "metadata", &metadata))
+    yyjson_val *metadata = yyjson_obj_get(pod, "metadata");
+    yyjson_val *status = yyjson_obj_get(pod, "status");
+    yyjson_val *spec = yyjson_obj_get(pod, "spec"); // Optional
+    if (!yyjson_is_obj(metadata) || !yyjson_is_obj(status))
       continue;
-    if (!json_object_object_get_ex(pod, "status", &status))
-      continue;
-    json_object_object_get_ex(pod, "spec", &spec); // Optional
 
     // Get pod info
-    struct json_object *ns_obj, *name_obj, *uid_obj;
-    if (!json_object_object_get_ex(metadata, "namespace", &ns_obj))
+    const char *ns = yyjson_get_str(yyjson_obj_get(metadata, "namespace"));
+    const char *pod_name = yyjson_get_str(yyjson_obj_get(metadata, "name"));
+    const char *pod_uid = yyjson_get_str(yyjson_obj_get(metadata, "uid"));
+    if (!ns || !pod_name || !pod_uid)
       continue;
-    if (!json_object_object_get_ex(metadata, "name", &name_obj))
-      continue;
-    if (!json_object_object_get_ex(metadata, "uid", &uid_obj))
-      continue;
-
-    const char *ns = json_object_get_string(ns_obj);
-    const char *pod_name = json_object_get_string(name_obj);
-    const char *pod_uid = json_object_get_string(uid_obj);
 
     // Get node name
-    const char *node_name = NULL;
-    if (spec) {
-      struct json_object *node_name_obj;
-      if (json_object_object_get_ex(spec, "nodeName", &node_name_obj)) {
-        node_name = json_object_get_string(node_name_obj);
-      }
-    }
+    const char *node_name = yyjson_get_str(yyjson_obj_get(spec, "nodeName"));
 
     // Check containerStatuses for OOM kills
-    struct json_object *container_statuses;
-    if (!json_object_object_get_ex(status, "containerStatuses",
-                                   &container_statuses))
+    yyjson_val *container_statuses =
+        yyjson_obj_get(status, "containerStatuses");
+    if (!yyjson_is_arr(container_statuses))
       continue;
 
-    int cs_count = json_object_array_length(container_statuses);
-    for (int j = 0; j < cs_count && *count < max_count; j++) {
-      struct json_object *cs = json_object_array_get_idx(container_statuses, j);
-      struct json_object *container_name_obj, *last_state, *restart_count_obj;
+    size_t cs_idx, cs_max;
+    yyjson_val *cs;
+    yyjson_arr_foreach(container_statuses, cs_idx, cs_max, cs) {
+      if (*count >= max_count)
+        break;
 
-      if (!json_object_object_get_ex(cs, "name", &container_name_obj))
+      const char *container_name = yyjson_get_str(yyjson_obj_get(cs, "name"));
+      if (!container_name)
         continue;
-      const char *container_name = json_object_get_string(container_name_obj);
 
       // Check lastState.terminated.reason == "OOMKilled"
-      if (!json_object_object_get_ex(cs, "lastState", &last_state))
+      yyjson_val *terminated =
+          yyjson_obj_get(yyjson_obj_get(cs, "lastState"), "terminated");
+      if (!yyjson_is_obj(terminated))
         continue;
 
-      struct json_object *terminated;
-      if (!json_object_object_get_ex(last_state, "terminated", &terminated))
-        continue;
-
-      struct json_object *reason_obj, *finished_at_obj;
-      if (!json_object_object_get_ex(terminated, "reason", &reason_obj))
-        continue;
-
-      const char *reason = json_object_get_string(reason_obj);
-      if (strcmp(reason, "OOMKilled") != 0)
+      const char *reason = yyjson_get_str(yyjson_obj_get(terminated, "reason"));
+      if (!reason || strcmp(reason, "OOMKilled") != 0)
         continue;
 
       // Get finishedAt timestamp - skip old OOM events on startup
-      const char *finished_at = NULL;
-      if (json_object_object_get_ex(terminated, "finishedAt",
-                                    &finished_at_obj)) {
-        finished_at = json_object_get_string(finished_at_obj);
-      }
+      const char *finished_at =
+          yyjson_get_str(yyjson_obj_get(terminated, "finishedAt"));
 
       // Skip OOM events older than 5 minutes to avoid false positives on
       // restart The lastState persists until the next container termination, so
@@ -1207,9 +1185,7 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
 
       // Get restart count
       int restart_count = 0;
-      if (json_object_object_get_ex(cs, "restartCount", &restart_count_obj)) {
-        restart_count = json_object_get_int(restart_count_obj);
-      }
+      pj_int(yyjson_obj_get(cs, "restartCount"), &restart_count);
 
       // Create unique ID for deduplication: pod_uid + container_name +
       // restart_count This ensures we only report each OOM kill once
@@ -1281,7 +1257,7 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
     }
   }
 
-  json_object_put(root);
+  yyjson_doc_free(doc);
   return new_events;
 }
 

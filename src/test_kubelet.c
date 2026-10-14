@@ -240,6 +240,8 @@ static void test_stats(kubelet_source_t *source) {
       "{\"name\":\"int\",\"resources\":{\"limits\":{\"memory\":\"1Mi\"}}},"
       "{\"name\":\"float\",\"resources\":{\"limits\":{\"memory\":\"1Mi\"}}},"
       "{\"name\":\"missing\",\"resources\":{\"limits\":{\"memory\":\"1Mi\"}}},"
+      "{\"name\":\"nullnum\",\"resources\":{\"limits\":{\"memory\":\"1Mi\"}}},"
+      "{\"name\":\"strnum\",\"resources\":{\"limits\":{\"memory\":\"1Mi\"}}},"
       "{\"name\":\"nolimit\"}]}},"
       "{\"metadata\":{\"namespace\":\"ns\",\"name\":\"pod-b\"},\"spec\":{"
       "\"containers\":[{\"name\":\"big\",\"resources\":{\"limits\":{\"memory\":"
@@ -253,6 +255,8 @@ static void test_stats(kubelet_source_t *source) {
       "{\"name\":\"int\",\"memory\":{\"workingSetBytes\":500}},"
       "{\"name\":\"float\",\"memory\":{\"workingSetBytes\":1048576.0}},"
       "{\"name\":\"missing\",\"memory\":{}},"
+      "{\"name\":\"nullnum\",\"memory\":{\"workingSetBytes\":null}},"
+      "{\"name\":\"strnum\",\"memory\":{\"workingSetBytes\":\"500\"}},"
       "{\"name\":\"nolimit\",\"memory\":{\"workingSetBytes\":777}}]},"
       "{\"podRef\":{\"namespace\":\"ns\",\"name\":\"pod-b\"},\"containers\":["
       "{\"name\":\"big\",\"memory\":{\"workingSetBytes\":"
@@ -263,6 +267,8 @@ static void test_stats(kubelet_source_t *source) {
   pressured_memory_sample_t samples[8] = {0};
   int count = 0;
   assert(collect_from_node(source, "node-a", samples, &count, 8) == 0);
+  // Null and string workingSetBytes are not numbers, so those containers and
+  // pod-c (no cached limit) are skipped; only int, float and big remain.
   assert(count == 3);
 
   assert(strcmp(samples[0].container_name, "int") == 0);
@@ -274,7 +280,7 @@ static void test_stats(kubelet_source_t *source) {
   assert(strcmp(samples[1].container_name, "float") == 0);
   assert(samples[1].usage_bytes == 1048576);
 
-  // An out-of-range integer clamps to INT64_MAX under json-c.
+  // An out-of-range integer clamps to INT64_MAX.
   assert(strcmp(samples[2].container_name, "big") == 0);
   assert(samples[2].usage_bytes == 9223372036854775807ULL);
   assert(samples[2].limit_bytes == 1073741824ULL);
@@ -414,6 +420,25 @@ static void test_age(kubelet_source_t *source) {
       assert(collect_oom_events(source, &sample, &count, 2) == 0);
     }
   }
+
+  // events.k8s.io events carry null lastTimestamp and firstTimestamp with a
+  // valid eventTime, which is then the only field that decides.
+  for (int recent = 0; recent < 2; recent++) {
+    time_t when = time(NULL) - (recent ? 30 : 600);
+    char timestamp[64], fixture[256];
+    struct tm tm;
+    gmtime_r(&when, &tm);
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    snprintf(fixture, sizeof(fixture),
+             "{\"lastTimestamp\":null,\"firstTimestamp\":null,"
+             "\"eventTime\":\"%s\"}",
+             timestamp);
+    yyjson_doc *doc = pj_parse(fixture, strlen(fixture), PJ_READ_API, "test");
+    assert(doc);
+    time_t now = time(NULL);
+    assert(oom_event_is_old(yyjson_doc_get_root(doc), now) == (bool)!recent);
+    yyjson_doc_free(doc);
+  }
 }
 
 static void format_timestamp(char *buffer, size_t size, time_t when,
@@ -437,20 +462,20 @@ static void test_series(void) {
              "\"lastTimestamp\":\"%s\",\"eventTime\":\"%s\","
              "\"firstTimestamp\":\"%s\"}",
              series_old ? old : recent, series_old ? recent : old, old, old);
-    struct json_object *event = json_tokener_parse(fixture);
-    assert(event);
-    assert(oom_event_is_old(event, now) == (bool)series_old);
-    json_object_put(event);
+    yyjson_doc *doc = pj_parse(fixture, strlen(fixture), PJ_READ_API, "test");
+    assert(doc);
+    assert(oom_event_is_old(yyjson_doc_get_root(doc), now) == (bool)series_old);
+    yyjson_doc_free(doc);
   }
   const char *fields[] = {"lastTimestamp", "eventTime", "firstTimestamp"};
   for (int i = 0; i < 3; i++) {
     snprintf(fixture, sizeof(fixture),
              "{\"series\":{\"lastObservedTime\":null},\"%s\":\"%s\"}",
              fields[i], old);
-    struct json_object *event = json_tokener_parse(fixture);
-    assert(event);
-    assert(oom_event_is_old(event, now));
-    json_object_put(event);
+    yyjson_doc *doc = pj_parse(fixture, strlen(fixture), PJ_READ_API, "test");
+    assert(doc);
+    assert(oom_event_is_old(yyjson_doc_get_root(doc), now));
+    yyjson_doc_free(doc);
   }
 }
 
@@ -502,12 +527,38 @@ static void test_pod_status_oom(kubelet_source_t *source) {
   assert(count == 1);
   pressured_memory_sample_free(&samples[0]);
 
-  // A string restartCount is still read as its numeric value under json-c.
+  // A string restartCount is not a number and counts as 0; the new UID is
+  // still reported once.
   snprintf(fixture, sizeof(fixture), format, "uid-str", "\"1\"", finished);
   memset(samples, 0, sizeof(samples));
   count = 0;
   assert(collect_oom_from_pod_status(source, samples, &count, 4) == 1);
   assert(count == 1);
+  pressured_memory_sample_free(&samples[0]);
+
+  // A null uid, a null container name and a null reason are each treated as
+  // missing, so only the well-formed pod produces a sample.
+  fixture_response =
+      "{\"items\":["
+      "{\"metadata\":{\"namespace\":\"ns\",\"name\":\"pod\",\"uid\":null},"
+      "\"status\":{\"containerStatuses\":[{\"name\":\"app\","
+      "\"lastState\":{\"terminated\":{\"reason\":\"OOMKilled\"}}}]}},"
+      "{\"metadata\":{\"namespace\":\"ns\",\"name\":\"pod\","
+      "\"uid\":\"uid-noname\"},\"status\":{\"containerStatuses\":["
+      "{\"name\":null,\"lastState\":{\"terminated\":{\"reason\":"
+      "\"OOMKilled\"}}}]}},"
+      "{\"metadata\":{\"namespace\":\"ns\",\"name\":\"pod\","
+      "\"uid\":\"uid-noreason\"},\"status\":{\"containerStatuses\":["
+      "{\"name\":\"app\",\"lastState\":{\"terminated\":{\"reason\":null}}}]}},"
+      "{\"metadata\":{\"namespace\":\"ns\",\"name\":\"pod\","
+      "\"uid\":\"uid-valid\"},\"status\":{\"containerStatuses\":["
+      "{\"name\":\"app\",\"lastState\":{\"terminated\":{\"reason\":"
+      "\"OOMKilled\"}}}]}}]}";
+  memset(samples, 0, sizeof(samples));
+  count = 0;
+  assert(collect_oom_from_pod_status(source, samples, &count, 4) == 1);
+  assert(count == 1);
+  assert(strcmp(samples[0].container_name, "app") == 0);
   pressured_memory_sample_free(&samples[0]);
 }
 
