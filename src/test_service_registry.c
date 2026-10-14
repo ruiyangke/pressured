@@ -283,11 +283,12 @@ static void test_eager_init(void) {
   service_ref_t ref = service_registry_acquire(sr, "test");
   assert(service_ref_valid(&ref));
   assert(factory_call_count == 1);
+  mock_service_t *instance = ref.instance;
   service_ref_release(&ref);
 
-  /* Cleanup */
-  free(((mock_service_t *)ref.instance)); /* No destructor registered */
+  /* Cleanup: no destructor registered, so free the instance here */
   service_registry_free(sr);
+  free(instance);
 
   printf("PASS\n");
 }
@@ -598,8 +599,9 @@ static void test_resize(void) {
         .priority = i,
     };
 
-    int rc = service_registry_register(sr, &metas[i], SERVICE_SCOPE_SINGLETON,
-                                       mock_factory, NULL, &values[i]);
+    int rc =
+        service_registry_register(sr, &metas[i], SERVICE_SCOPE_SINGLETON,
+                                  mock_factory, mock_destructor, &values[i]);
     assert(rc == 0);
   }
 
@@ -614,8 +616,6 @@ static void test_resize(void) {
     service_ref_release(&ref);
   }
 
-  /* Cleanup - no destructor registered, instances leak but that's ok for test
-   */
   service_registry_free(sr);
 
   printf("PASS\n");
