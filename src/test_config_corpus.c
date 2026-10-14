@@ -1,13 +1,11 @@
 /*
  * Config Corpus Characterization Tests
  *
- * Pins the CURRENT behavior of pressured_config_load() (json-c based) and of
- * plugin enable/disable parsing (plugin_is_disabled()) so a later JSON-library
- * swap can be diffed against it. Assertions describe what happens today, not
- * what the JSON spec says.
+ * Pins the behavior of pressured_config_load() and of plugin enable/disable
+ * parsing (plugin_is_disabled()) under the vendored yyjson reader. Assertions
+ * describe what the code does, not what the JSON spec says.
  *
- * Every case below parses without crashing under json-c 0.18. No case is
- * omitted for crashing.
+ * Every case below parses without crashing. No case is omitted for crashing.
  *
  * plugin_is_disabled() is static, so include the production file to call it
  * directly (same approach as test_kubelet.c including kubelet.c).
@@ -79,7 +77,7 @@ static void test_normal_config(void) {
 }
 
 static void test_comments(void) {
-  // json-c accepts // and /* */ comments by default.
+  // The config reader accepts // and /* */ comments.
   pressured_config_t *config =
       load_json("comments.json",
                 "{\n// line comment\n\"thresholds\":{\"warn_percent\":80},\n"
@@ -92,7 +90,7 @@ static void test_comments(void) {
 }
 
 static void test_trailing_comma(void) {
-  // json-c accepts trailing commas in objects.
+  // The config reader accepts trailing commas in objects.
   pressured_config_t *config =
       load_json("trailing_comma.json",
                 "{\"thresholds\":{\"warn_percent\":80,},\"dry_run\":true,}");
@@ -103,7 +101,7 @@ static void test_trailing_comma(void) {
 }
 
 static void test_single_quotes(void) {
-  // json-c accepts single-quoted strings by default.
+  // The config reader accepts single-quoted strings.
   pressured_config_t *config =
       load_json("single_quotes.json",
                 "{'thresholds':{'warn_percent':80},'dry_run':true}");
@@ -114,7 +112,7 @@ static void test_single_quotes(void) {
 }
 
 static void test_raw_newline_in_string(void) {
-  // json-c accepts a literal newline inside a string.
+  // A literal newline inside a string is passed through.
   pressured_config_t *config = load_json(
       "raw_newline.json", "{\"source\":{\"cgroup\":{\"path\":\"/a\nb\"}}}");
   assert(config);
@@ -134,7 +132,7 @@ static void test_latin1_byte_in_string(void) {
 }
 
 static void test_trailing_garbage(void) {
-  // json-c stops after the first value and ignores trailing bytes.
+  // The config reader stops after the first value and ignores trailing bytes.
   pressured_config_t *config =
       load_json("trailing_garbage.json", "{\"dry_run\":true} garbage");
   assert(config);
@@ -147,22 +145,31 @@ static void test_trailing_garbage(void) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void test_numbers_written_as_strings(void) {
-  // json-c converts numeric strings; digits are read until a non-digit.
+  // Numeric strings are not JSON numbers: both keys keep their defaults.
   pressured_config_t *config = load_json(
       "number_strings.json", "{\"thresholds\":{\"warn_percent\":\"80\"},"
                              "\"source\":{\"poll_interval_ms\":\"5000ms\"}}");
   assert(config);
-  assert(config->warn_percent == 0.80);
-  assert(config->poll_interval_ms == 5000);
+  assert(config->warn_percent == 0.70);
+  assert(config->poll_interval_ms == 1000);
   pressured_config_free(config);
 }
 
 static void test_float_where_int_expected(void) {
-  // json_object_get_int() truncates toward zero.
+  // pj_int truncates a real toward zero.
   pressured_config_t *config =
       load_json("float_int.json", "{\"source\":{\"poll_interval_ms\":1500.7}}");
   assert(config);
   assert(config->poll_interval_ms == 1500);
+  pressured_config_free(config);
+}
+
+static void test_thresholds_as_reals(void) {
+  // Thresholds accept reals, not just integers.
+  pressured_config_t *config = load_json(
+      "threshold_reals.json", "{\"thresholds\":{\"warn_percent\":80.5}}");
+  assert(config);
+  assert(config->warn_percent == 0.805);
   pressured_config_free(config);
 }
 
@@ -174,38 +181,50 @@ static void test_dry_run_true(void) {
 }
 
 static void test_dry_run_int_one(void) {
+  // A number is not a boolean: dry_run keeps its default.
   pressured_config_t *config = load_json("dry_one.json", "{\"dry_run\":1}");
   assert(config);
-  assert(config->dry_run == true);
+  assert(config->dry_run == false);
   pressured_config_free(config);
 }
 
 static void test_dry_run_string_false(void) {
-  // The string "false" is truthy: dry_run becomes true.
+  // A string is not a boolean: dry_run keeps its default.
   pressured_config_t *config =
       load_json("dry_str_false.json", "{\"dry_run\":\"false\"}");
   assert(config);
-  assert(config->dry_run == true);
+  assert(config->dry_run == false);
   pressured_config_free(config);
 }
 
 static void test_dry_run_null(void) {
-  // null is falsy: dry_run stays false.
+  // JSON null means unset: dry_run keeps its default.
   pressured_config_t *config = load_json("dry_null.json", "{\"dry_run\":null}");
   assert(config);
   assert(config->dry_run == false);
   pressured_config_free(config);
 }
 
+static void test_null_fields(void) {
+  // JSON null means unset for every field, and must not crash.
+  pressured_config_t *config =
+      load_json("null_fields.json", "{\"log_level\":null,\"source\":{\"mode\":"
+                                    "null,\"cgroup\":{\"path\":null}}}");
+  assert(config);
+  assert(config->source_mode == SOURCE_MODE_CGROUP);
+  assert(strcmp(config->cgroup_path, "/sys/fs/cgroup") == 0);
+  assert(config->log_level && strcmp(config->log_level, "info") == 0);
+  pressured_config_free(config);
+}
+
 static void test_digit_string_written_as_number(void) {
-  // String fields read via json_object_get_string() accept a JSON number and
-  // get its serialized digits.
+  // String fields only accept JSON strings: a number keeps the defaults.
   pressured_config_t *config = load_json(
       "digit_number.json", "{\"source\":{\"cgroup\":{\"path\":123456789012}},"
                            "\"log_level\":123456789012}");
   assert(config);
-  assert(strcmp(config->cgroup_path, "123456789012") == 0);
-  assert(config->log_level && strcmp(config->log_level, "123456789012") == 0);
+  assert(strcmp(config->cgroup_path, "/sys/fs/cgroup") == 0);
+  assert(config->log_level && strcmp(config->log_level, "info") == 0);
   pressured_config_free(config);
 }
 
@@ -214,27 +233,34 @@ static void test_digit_string_written_as_number(void) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void test_plugin_enabled_values(void) {
-  // Only an explicit boolean false (or a falsy JSON value) disables a plugin.
+  // Only the JSON value false disables a plugin.
   assert(plugin_is_disabled(
              "lua", "{\"plugins\":{\"lua\":{\"enabled\":false}}}") == 1);
+  // Numbers, strings, null and an absent field all leave it enabled.
   assert(plugin_is_disabled("lua", "{\"plugins\":{\"lua\":{\"enabled\":0}}}") ==
-         1);
+         0);
   assert(plugin_is_disabled("lua", "{\"plugins\":{\"lua\":{\"enabled\":1}}}") ==
          0);
-  // A non-empty string is truthy, even "false".
   assert(plugin_is_disabled(
              "lua", "{\"plugins\":{\"lua\":{\"enabled\":\"false\"}}}") == 0);
   assert(plugin_is_disabled(
              "lua", "{\"plugins\":{\"lua\":{\"enabled\":\"true\"}}}") == 0);
-  // null is falsy and therefore disables.
   assert(plugin_is_disabled("lua",
-                            "{\"plugins\":{\"lua\":{\"enabled\":null}}}") == 1);
-  // Absent field (and absent section) leave the plugin enabled.
+                            "{\"plugins\":{\"lua\":{\"enabled\":null}}}") == 0);
   assert(plugin_is_disabled("lua", "{\"plugins\":{\"lua\":{}}}") == 0);
   assert(plugin_is_disabled("lua", "{\"plugins\":{}}") == 0);
   assert(plugin_is_disabled("lua", "{}") == 0);
-  // No config at all means enabled.
+  // No config at all means enabled, as does an unparsable one.
   assert(plugin_is_disabled("lua", NULL) == 0);
+  assert(plugin_is_disabled("lua", "not json") == 0);
+}
+
+static void test_plugin_config_lax_syntax(void) {
+  // Comments and trailing commas in the plugin config are accepted.
+  assert(plugin_is_disabled(
+             "lua",
+             "{/*c*/\"plugins\":{\"lua\":{\"enabled\":false,},},} trailing") ==
+         1);
 }
 
 int main(void) {
@@ -253,12 +279,15 @@ int main(void) {
   test_trailing_garbage();
   test_numbers_written_as_strings();
   test_float_where_int_expected();
+  test_thresholds_as_reals();
   test_dry_run_true();
   test_dry_run_int_one();
   test_dry_run_string_false();
   test_dry_run_null();
+  test_null_fields();
   test_digit_string_written_as_number();
   test_plugin_enabled_values();
+  test_plugin_config_lax_syntax();
 
   int removed = rmdir(test_dir);
   assert(removed == 0);

@@ -1,10 +1,27 @@
 #include "fixed_buffer.h"
 #include "log.h"
+#include "pjson.h"
 #include "pressured.h"
-#include <json-c/json.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+// Return the value of `key` in `obj` when it is present and a JSON `type`.
+// A missing key or a JSON null returns NULL so the caller keeps its default
+// (Helm renders unset values as null); a key of any other type also returns
+// NULL, after one warning naming it.
+static yyjson_val *config_value(yyjson_val *obj, const char *key,
+                                const char *type,
+                                bool (*is_type)(const yyjson_val *)) {
+  yyjson_val *val = yyjson_obj_get(obj, key);
+  if (!val || yyjson_is_null(val))
+    return NULL;
+  if (!is_type(val)) {
+    log_warn("config: %s must be a %s, ignoring it", key, type);
+    return NULL;
+  }
+  return val;
+}
 
 pressured_config_t *pressured_config_load(const char *path) {
   pressured_config_t *config = calloc(1, sizeof(pressured_config_t));
@@ -33,91 +50,90 @@ pressured_config_t *pressured_config_load(const char *path) {
   }
 
   // Read JSON config file
-  struct json_object *root = json_object_from_file(path);
-  if (!root) {
+  char *text = pressured_config_load_json(path);
+  yyjson_doc *doc =
+      text ? pj_parse(text, strlen(text), PJ_READ_CONFIG, path) : NULL;
+  free(text);
+  if (!doc) {
     log_warn("failed to parse config file: %s", path);
     return config;
   }
 
-  struct json_object *obj;
+  yyjson_val *root = yyjson_doc_get_root(doc);
+  yyjson_val *source, *val;
+  int n;
 
   // Thresholds
-  if (json_object_object_get_ex(root, "thresholds", &obj)) {
-    struct json_object *val;
-    if (json_object_object_get_ex(obj, "warn_percent", &val)) {
-      config->warn_percent = json_object_get_double(val) / 100.0;
-    }
-    if (json_object_object_get_ex(obj, "critical_percent", &val)) {
-      config->critical_percent = json_object_get_double(val) / 100.0;
-    }
-    if (json_object_object_get_ex(obj, "hysteresis_percent", &val)) {
-      config->hysteresis_percent = json_object_get_double(val) / 100.0;
-    }
-    if (json_object_object_get_ex(obj, "cooldown_seconds", &val)) {
-      config->cooldown_seconds = json_object_get_int(val);
-    }
-  }
+  yyjson_val *thresholds = yyjson_obj_get(root, "thresholds");
+  val = config_value(thresholds, "warn_percent", "number", yyjson_is_num);
+  if (val)
+    config->warn_percent = yyjson_get_num(val) / 100.0;
+  val = config_value(thresholds, "critical_percent", "number", yyjson_is_num);
+  if (val)
+    config->critical_percent = yyjson_get_num(val) / 100.0;
+  val = config_value(thresholds, "hysteresis_percent", "number", yyjson_is_num);
+  if (val)
+    config->hysteresis_percent = yyjson_get_num(val) / 100.0;
+  val = config_value(thresholds, "cooldown_seconds", "number", yyjson_is_num);
+  if (val && pj_int(val, &n))
+    config->cooldown_seconds = n;
 
   // Source
-  if (json_object_object_get_ex(root, "source", &obj)) {
-    struct json_object *val;
+  source = yyjson_obj_get(root, "source");
 
-    // Mode selection: "cgroup" or "kubelet"
-    if (json_object_object_get_ex(obj, "mode", &val)) {
-      const char *mode = json_object_get_string(val);
-      if (strcmp(mode, "kubelet") == 0 || strcmp(mode, "cluster") == 0) {
-        config->source_mode = SOURCE_MODE_KUBELET;
-      } else {
-        config->source_mode = SOURCE_MODE_CGROUP;
-      }
-    }
+  // Mode selection: "cgroup" or "kubelet"
+  val = config_value(source, "mode", "string", yyjson_is_str);
+  if (val) {
+    const char *mode = yyjson_get_str(val);
+    if (strcmp(mode, "kubelet") == 0 || strcmp(mode, "cluster") == 0)
+      config->source_mode = SOURCE_MODE_KUBELET;
+    else
+      config->source_mode = SOURCE_MODE_CGROUP;
+  }
 
-    // Poll interval (applies to both modes)
-    if (json_object_object_get_ex(obj, "poll_interval_ms", &val)) {
-      config->poll_interval_ms = json_object_get_int(val);
-    }
+  // Poll interval (applies to both modes)
+  val = config_value(source, "poll_interval_ms", "number", yyjson_is_num);
+  if (val && pj_int(val, &n))
+    config->poll_interval_ms = n;
 
-    // Cgroup-specific settings
-    struct json_object *cgroup;
-    if (json_object_object_get_ex(obj, "cgroup", &cgroup)) {
-      if (json_object_object_get_ex(cgroup, "path", &val)) {
-        if (buffer_copy(config->cgroup_path, sizeof(config->cgroup_path),
-                        json_object_get_string(val), "cgroup path") != 0) {
-          json_object_put(root);
-          pressured_config_free(config);
-          return NULL;
-        }
-      }
-      if (json_object_object_get_ex(cgroup, "poll_interval_ms", &val)) {
-        config->poll_interval_ms = json_object_get_int(val);
-      }
-    }
-
-    // Kubelet-specific settings
-    struct json_object *kubelet;
-    if (json_object_object_get_ex(obj, "kubelet", &kubelet)) {
-      if (json_object_object_get_ex(kubelet, "namespace_filter", &val)) {
-        config->namespace_filter = strdup(json_object_get_string(val));
-      }
-      if (json_object_object_get_ex(kubelet, "label_selector", &val)) {
-        config->label_selector = strdup(json_object_get_string(val));
-      }
-      if (json_object_object_get_ex(kubelet, "poll_interval_ms", &val)) {
-        config->poll_interval_ms = json_object_get_int(val);
-      }
+  // Cgroup-specific settings
+  yyjson_val *cgroup = yyjson_obj_get(source, "cgroup");
+  val = config_value(cgroup, "path", "string", yyjson_is_str);
+  if (val) {
+    if (buffer_copy(config->cgroup_path, sizeof(config->cgroup_path),
+                    yyjson_get_str(val), "cgroup path") != 0) {
+      yyjson_doc_free(doc);
+      pressured_config_free(config);
+      return NULL;
     }
   }
+  val = config_value(cgroup, "poll_interval_ms", "number", yyjson_is_num);
+  if (val && pj_int(val, &n))
+    config->poll_interval_ms = n;
+
+  // Kubelet-specific settings
+  yyjson_val *kubelet = yyjson_obj_get(source, "kubelet");
+  val = config_value(kubelet, "namespace_filter", "string", yyjson_is_str);
+  if (val)
+    config->namespace_filter = strdup(yyjson_get_str(val));
+  val = config_value(kubelet, "label_selector", "string", yyjson_is_str);
+  if (val)
+    config->label_selector = strdup(yyjson_get_str(val));
+  val = config_value(kubelet, "poll_interval_ms", "number", yyjson_is_num);
+  if (val && pj_int(val, &n))
+    config->poll_interval_ms = n;
 
   // General
-  if (json_object_object_get_ex(root, "dry_run", &obj)) {
-    config->dry_run = json_object_get_boolean(obj);
-  }
-  if (json_object_object_get_ex(root, "log_level", &obj)) {
+  val = config_value(root, "dry_run", "boolean", yyjson_is_bool);
+  if (val)
+    config->dry_run = yyjson_get_bool(val);
+  val = config_value(root, "log_level", "string", yyjson_is_str);
+  if (val) {
     free(config->log_level);
-    config->log_level = strdup(json_object_get_string(obj));
+    config->log_level = strdup(yyjson_get_str(val));
   }
 
-  json_object_put(root);
+  yyjson_doc_free(doc);
 
   log_info("config loaded from %s", path);
   return config;

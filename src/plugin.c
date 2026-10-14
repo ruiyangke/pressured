@@ -7,10 +7,10 @@
 
 #include "fixed_buffer.h"
 #include "log.h"
+#include "pjson.h"
 #include "plugin_manager.h"
 #include <dirent.h>
 #include <dlfcn.h>
-#include <json-c/json.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -109,24 +109,19 @@ static int plugin_is_disabled(const char *plugin_name,
   if (!plugin_name || !config_json)
     return 0; /* No config = enabled (implicit) */
 
-  struct json_object *root = json_tokener_parse(config_json);
-  if (!root)
+  yyjson_doc *doc = pj_parse(config_json, strlen(config_json), PJ_READ_CONFIG,
+                             "plugin config");
+  if (!doc)
     return 0;
 
-  int disabled = 0;
-  struct json_object *plugins, *plugin_cfg, *enabled;
+  yyjson_val *root = yyjson_doc_get_root(doc);
+  yyjson_val *plugin_cfg =
+      yyjson_obj_get(yyjson_obj_get(root, "plugins"), plugin_name);
 
-  /* Navigate to plugins.<name>.enabled */
-  if (json_object_object_get_ex(root, "plugins", &plugins) &&
-      json_object_object_get_ex(plugins, plugin_name, &plugin_cfg) &&
-      json_object_object_get_ex(plugin_cfg, "enabled", &enabled)) {
-    /* Only disabled if explicitly set to false */
-    if (!json_object_get_boolean(enabled)) {
-      disabled = 1;
-    }
-  }
+  /* Only disabled if explicitly set to false */
+  int disabled = yyjson_is_false(yyjson_obj_get(plugin_cfg, "enabled"));
 
-  json_object_put(root);
+  yyjson_doc_free(doc);
   return disabled;
 }
 
