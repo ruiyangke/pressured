@@ -72,6 +72,10 @@ static void *serve(void *arg) {
                             "Connection: close\r\n\r\n";
     send_all(fd, response, sizeof(response) - 1);
     send_all(fd, expected, sizeof(expected));
+  } else if (strcmp(s->mode, "headers") == 0) {
+    const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                            "Connection: close\r\n\r\nok";
+    send_all(fd, response, sizeof(response) - 1);
   } else {
     if (strcmp(s->mode, "stream") == 0) {
       const char response[] =
@@ -232,6 +236,7 @@ int main(int argc, char **argv) {
     }
   } else {
     const char *mode = strcmp(test, "stream") == 0       ? "stream"
+                       : strcmp(test, "headers") == 0    ? "headers"
                        : strncmp(test, "binary", 6) == 0 ? "binary"
                                                          : "fetch";
     start_server(&server, mode);
@@ -241,6 +246,15 @@ int main(int argc, char **argv) {
       snprintf(call, sizeof(call),
                "local r=http.fetch('GET',url); assert(r.error); "
                "log.info('FETCH_OK')");
+    } else if (strcmp(test, "headers") == 0) {
+      snprintf(call, sizeof(call),
+               "local many={} for i=1,65 do many[i]='X-H'..i..': v' end; "
+               "local r=http.fetch('GET',url,{headers=many}); "
+               "assert(r.error and r.error:find('too many headers')); "
+               "local r2=http.fetch('GET',url,"
+               "{headers={'X-A: 1','X-B: 2'}}); "
+               "assert(not r2.error and r2.status==200); "
+               "log.info('HEADERS_OK')");
     } else if (strcmp(test, "download") == 0) {
       snprintf(call, sizeof(call),
                "local r=http.download(url,'%s/download'); "
@@ -381,6 +395,7 @@ int main(int argc, char **argv) {
     const char *marker = strcmp(test, "unlimited") == 0  ? "UNLIMITED_OK"
                          : strcmp(test, "order") == 0    ? "ORDER_OK"
                          : strcmp(test, "fetch") == 0    ? "FETCH_OK"
+                         : strcmp(test, "headers") == 0  ? "HEADERS_OK"
                          : strcmp(test, "download") == 0 ? "DOWNLOAD_OK"
                          : strcmp(test, "stream") == 0   ? "STREAM_OK"
                          : strcmp(test, "binary") == 0   ? "BINARY_OK"

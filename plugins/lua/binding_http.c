@@ -6,9 +6,13 @@
  */
 
 #include "bindings.h"
+#include "log.h"
 #include <lauxlib.h>
 #include <stdlib.h>
 #include <string.h>
+
+// Maximum number of user-supplied request headers.
+#define MAX_REQUEST_HEADERS 64
 
 // Get http_client from registry
 static http_client_t *get_http_client(lua_State *L) {
@@ -37,7 +41,7 @@ static int lua_http_fetch(lua_State *L) {
   http_client_t *client = get_http_client(L);
 
   http_request_t req = {0};
-  const char **headers = NULL;
+  const char *headers[MAX_REQUEST_HEADERS + 1];
 
   if (lua_istable(L, 3)) {
     lua_getfield(L, 3, "body");
@@ -55,17 +59,24 @@ static int lua_http_fetch(lua_State *L) {
     lua_getfield(L, 3, "headers");
     if (lua_istable(L, -1)) {
       int header_count = lua_rawlen(L, -1);
+      if (header_count > MAX_REQUEST_HEADERS) {
+        log_error("lua_http: too many headers (%d > %d)", header_count,
+                  MAX_REQUEST_HEADERS);
+        lua_newtable(L);
+        lua_pushinteger(L, 0);
+        lua_setfield(L, -2, "status");
+        lua_pushfstring(L, "too many headers (max %d)", MAX_REQUEST_HEADERS);
+        lua_setfield(L, -2, "error");
+        return 1;
+      }
       if (header_count > 0) {
-        headers = malloc((header_count + 1) * sizeof(char *));
-        if (headers) {
-          for (int i = 1; i <= header_count; i++) {
-            lua_rawgeti(L, -1, i);
-            headers[i - 1] = lua_tostring(L, -1);
-            lua_pop(L, 1);
-          }
-          headers[header_count] = NULL;
-          req.headers = headers;
+        for (int i = 1; i <= header_count; i++) {
+          lua_rawgeti(L, -1, i);
+          headers[i - 1] = lua_tostring(L, -1);
+          lua_pop(L, 1);
         }
+        headers[header_count] = NULL;
+        req.headers = headers;
       }
     }
     lua_pop(L, 1);
@@ -73,7 +84,6 @@ static int lua_http_fetch(lua_State *L) {
 
   req.timeout_ms = lua_budget_remaining(L);
   if (req.timeout_ms < 0) {
-    free(headers);
     return budget_error(L);
   }
   http_response_t *resp = http_fetch(client, method, url, &req);
@@ -97,7 +107,6 @@ static int lua_http_fetch(lua_State *L) {
   }
 
   http_response_free(resp);
-  free(headers);
 
   return 1;
 }
@@ -186,7 +195,7 @@ static int lua_http_stream(lua_State *L) {
 
   const char *method = "GET";
   http_request_t req = {0};
-  const char **headers = NULL;
+  const char *headers[MAX_REQUEST_HEADERS + 1];
 
   if (lua_istable(L, 3)) {
     lua_getfield(L, 3, "method");
@@ -210,17 +219,24 @@ static int lua_http_stream(lua_State *L) {
     lua_getfield(L, 3, "headers");
     if (lua_istable(L, -1)) {
       int header_count = lua_rawlen(L, -1);
+      if (header_count > MAX_REQUEST_HEADERS) {
+        log_error("lua_http: too many headers (%d > %d)", header_count,
+                  MAX_REQUEST_HEADERS);
+        lua_newtable(L);
+        lua_pushboolean(L, 0);
+        lua_setfield(L, -2, "ok");
+        lua_pushfstring(L, "too many headers (max %d)", MAX_REQUEST_HEADERS);
+        lua_setfield(L, -2, "error");
+        return 1;
+      }
       if (header_count > 0) {
-        headers = malloc((header_count + 1) * sizeof(char *));
-        if (headers) {
-          for (int i = 1; i <= header_count; i++) {
-            lua_rawgeti(L, -1, i);
-            headers[i - 1] = lua_tostring(L, -1);
-            lua_pop(L, 1);
-          }
-          headers[header_count] = NULL;
-          req.headers = headers;
+        for (int i = 1; i <= header_count; i++) {
+          lua_rawgeti(L, -1, i);
+          headers[i - 1] = lua_tostring(L, -1);
+          lua_pop(L, 1);
         }
+        headers[header_count] = NULL;
+        req.headers = headers;
       }
     }
     lua_pop(L, 1);
@@ -228,7 +244,6 @@ static int lua_http_stream(lua_State *L) {
 
   req.timeout_ms = lua_budget_remaining(L);
   if (req.timeout_ms < 0) {
-    free(headers);
     return budget_error(L);
   }
   lua_pushvalue(L, 2);
@@ -243,7 +258,6 @@ static int lua_http_stream(lua_State *L) {
   int ret = http_stream(client, method, url, &req, stream_write_cb, &stream_ctx,
                         NULL, NULL);
 
-  free(headers);
   luaL_unref(L, LUA_REGISTRYINDEX, callback_ref);
 
   lua_newtable(L);
