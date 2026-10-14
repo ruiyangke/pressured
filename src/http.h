@@ -68,6 +68,7 @@ typedef struct {
   size_t body_len;          // Body length, 0 = strlen(body)
   const char *content_type; // Content-Type header, NULL = none
   const char **headers;     // NULL-terminated array of "Name: Value" strings
+  int timeout_ms;           // Request timeout cap, 0 = client default
 } http_request_t;
 
 /** Response (caller must free with http_response_free) */
@@ -180,6 +181,11 @@ int http_stream(http_client_t *c, const char *method, const char *url,
  */
 int http_download(http_client_t *c, const char *url, const char *path,
                   http_progress_fn progress, void *ctx);
+
+/** Download with optional request options; existing download uses defaults. */
+int http_download_request(http_client_t *c, const char *url, const char *path,
+                          const http_request_t *req, http_progress_fn progress,
+                          void *ctx);
 
 /**
  * URL-encode a string

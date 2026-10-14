@@ -4,6 +4,7 @@
 #include "http.h"
 #include "storage.h"
 #include <lua.h>
+#include <stdint.h>
 
 /*
  * Lua Bindings - shared context and registration functions
@@ -19,6 +20,15 @@
 
 // Forward declarations
 typedef struct service_registry service_registry_t;
+
+typedef struct {
+  int64_t deadline_ns;
+  int timeout_ms;
+  int active;
+} lua_budget_t;
+
+// 0 outside a call, -1 when expired, otherwise remaining milliseconds.
+int lua_budget_remaining(lua_State *L);
 
 // Register binding modules
 void lua_register_log(lua_State *L);

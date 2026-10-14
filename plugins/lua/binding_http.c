@@ -18,6 +18,16 @@ static http_client_t *get_http_client(lua_State *L) {
   return client;
 }
 
+static int budget_error(lua_State *L) {
+  lua_budget_t *budget = *(lua_budget_t **)lua_getextraspace(L);
+  lua_newtable(L);
+  lua_pushboolean(L, 0);
+  lua_setfield(L, -2, "ok");
+  lua_pushfstring(L, "timeout after %d ms", budget->timeout_ms);
+  lua_setfield(L, -2, "error");
+  return 1;
+}
+
 /*
  * http.fetch(method, url, opts) -> {status=int, body=string, error=string|nil}
  */
@@ -32,7 +42,7 @@ static int lua_http_fetch(lua_State *L) {
   if (lua_istable(L, 3)) {
     lua_getfield(L, 3, "body");
     if (lua_isstring(L, -1)) {
-      req.body = lua_tostring(L, -1);
+      req.body = lua_tolstring(L, -1, &req.body_len);
     }
     lua_pop(L, 1);
 
@@ -61,8 +71,12 @@ static int lua_http_fetch(lua_State *L) {
     lua_pop(L, 1);
   }
 
-  http_response_t *resp =
-      http_fetch(client, method, url, req.body ? &req : NULL);
+  req.timeout_ms = lua_budget_remaining(L);
+  if (req.timeout_ms < 0) {
+    free(headers);
+    return budget_error(L);
+  }
+  http_response_t *resp = http_fetch(client, method, url, &req);
 
   lua_newtable(L);
 
@@ -96,7 +110,10 @@ static int lua_http_download(lua_State *L) {
   const char *path = luaL_checkstring(L, 2);
   http_client_t *client = get_http_client(L);
 
-  int ret = http_download(client, url, path, NULL, NULL);
+  http_request_t req = {.timeout_ms = lua_budget_remaining(L)};
+  if (req.timeout_ms < 0)
+    return budget_error(L);
+  int ret = http_download_request(client, url, path, &req, NULL, NULL);
 
   lua_newtable(L);
 
@@ -140,7 +157,8 @@ static size_t stream_write_cb(const void *data, size_t len, void *ctx) {
   lua_setfield(L, -2, "total");
 
   if (lua_pcall(L, 2, 1, 0) != LUA_OK) {
-    stream_ctx->error = strdup(lua_tostring(L, -1));
+    const char *error = lua_tostring(L, -1);
+    stream_ctx->error = strdup(error ? error : "Lua callback error");
     lua_pop(L, 1);
     stream_ctx->aborted = 1;
     return 0;
@@ -179,7 +197,7 @@ static int lua_http_stream(lua_State *L) {
 
     lua_getfield(L, 3, "body");
     if (lua_isstring(L, -1)) {
-      req.body = lua_tostring(L, -1);
+      req.body = lua_tolstring(L, -1, &req.body_len);
     }
     lua_pop(L, 1);
 
@@ -208,6 +226,11 @@ static int lua_http_stream(lua_State *L) {
     lua_pop(L, 1);
   }
 
+  req.timeout_ms = lua_budget_remaining(L);
+  if (req.timeout_ms < 0) {
+    free(headers);
+    return budget_error(L);
+  }
   lua_pushvalue(L, 2);
   int callback_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
@@ -217,10 +240,8 @@ static int lua_http_stream(lua_State *L) {
                              .aborted = 0,
                              .error = NULL};
 
-  int ret =
-      http_stream(client, method, url,
-                  (req.body || req.headers || req.content_type) ? &req : NULL,
-                  stream_write_cb, &stream_ctx, NULL, NULL);
+  int ret = http_stream(client, method, url, &req, stream_write_cb, &stream_ctx,
+                        NULL, NULL);
 
   free(headers);
   luaL_unref(L, LUA_REGISTRYINDEX, callback_ref);

@@ -220,8 +220,12 @@ static int stream_progress_cb(void *clientp, curl_off_t dltotal,
 // Fetch
 // ============================================================================
 
-static void setup_curl_opts(http_client_t *c, CURL *curl) {
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long)c->timeout_ms);
+static void setup_curl_opts(http_client_t *c, CURL *curl,
+                            const http_request_t *req) {
+  int timeout_ms = c->timeout_ms;
+  if (req && req->timeout_ms > 0 && req->timeout_ms < timeout_ms)
+    timeout_ms = req->timeout_ms;
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long)timeout_ms);
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS,
                    (long)c->connect_timeout_ms);
   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
@@ -324,7 +328,7 @@ http_response_t *http_fetch(http_client_t *c, const char *method,
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
 
   // Options
-  setup_curl_opts(c, curl);
+  setup_curl_opts(c, curl, req);
 
   // Execute
   CURLcode res = curl_easy_perform(curl);
@@ -445,7 +449,7 @@ int http_stream(http_client_t *c, const char *method, const char *url,
     curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &sctx);
   }
 
-  setup_curl_opts(c, curl);
+  setup_curl_opts(c, curl, req);
 
   CURLcode res = curl_easy_perform(curl);
 
@@ -473,6 +477,12 @@ static size_t file_write_fn(const void *data, size_t len, void *ctx) {
 
 int http_download(http_client_t *c, const char *url, const char *path,
                   http_progress_fn progress, void *ctx) {
+  return http_download_request(c, url, path, NULL, progress, ctx);
+}
+
+int http_download_request(http_client_t *c, const char *url, const char *path,
+                          const http_request_t *req, http_progress_fn progress,
+                          void *ctx) {
   if (!c || !url || !path)
     return -1;
 
@@ -482,7 +492,7 @@ int http_download(http_client_t *c, const char *url, const char *path,
     return -1;
   }
 
-  int ret = http_stream(c, "GET", url, NULL, file_write_fn, fp, progress, ctx);
+  int ret = http_stream(c, "GET", url, req, file_write_fn, fp, progress, ctx);
 
   if (fclose(fp) != 0) {
     log_error("http: failed to close file: %s", path);
