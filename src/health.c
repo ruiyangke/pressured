@@ -19,12 +19,19 @@ int health_remove(const char *path) {
 int health_write(const char *path, time_t now) {
   if (now < 0)
     return -1;
-  char *temporary = malloc(strlen(path) + sizeof(".tmp"));
+  char *temporary = malloc(strlen(path) + sizeof(".XXXXXX"));
   if (!temporary)
     return -1;
-  sprintf(temporary, "%s.tmp", path);
-  FILE *file = fopen(temporary, "w");
+  sprintf(temporary, "%s.XXXXXX", path);
+  int fd = mkstemp(temporary);
+  if (fd < 0) {
+    free(temporary);
+    return -1;
+  }
+  FILE *file = fdopen(fd, "w");
   if (!file) {
+    close(fd);
+    unlink(temporary);
     free(temporary);
     return -1;
   }

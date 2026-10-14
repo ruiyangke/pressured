@@ -218,6 +218,109 @@ static void test_age(kubelet_source_t *source) {
   }
 }
 
+static void format_timestamp(char *buffer, size_t size, time_t when,
+                             const char *suffix) {
+  struct tm tm;
+  assert(gmtime_r(&when, &tm));
+  size_t length = strftime(buffer, size, "%Y-%m-%dT%H:%M:%S", &tm);
+  assert(length > 0);
+  assert(strlen(buffer) + strlen(suffix) < size);
+  strcat(buffer, suffix);
+}
+
+static void test_series(void) {
+  time_t now = time(NULL);
+  char old[64], recent[64], fixture[1024];
+  format_timestamp(old, sizeof(old), now - 600, "Z");
+  format_timestamp(recent, sizeof(recent), now - 30, ".123456Z");
+  for (int series_old = 0; series_old < 2; series_old++) {
+    snprintf(fixture, sizeof(fixture),
+             "{\"series\":{\"lastObservedTime\":\"%s\"},"
+             "\"lastTimestamp\":\"%s\",\"eventTime\":\"%s\","
+             "\"firstTimestamp\":\"%s\"}",
+             series_old ? old : recent, series_old ? recent : old, old, old);
+    struct json_object *event = json_tokener_parse(fixture);
+    assert(event);
+    assert(oom_event_is_old(event, now) == (bool)series_old);
+    json_object_put(event);
+  }
+  const char *fields[] = {"lastTimestamp", "eventTime", "firstTimestamp"};
+  for (int i = 0; i < 3; i++) {
+    snprintf(fixture, sizeof(fixture),
+             "{\"series\":{\"lastObservedTime\":null},\"%s\":\"%s\"}",
+             fields[i], old);
+    struct json_object *event = json_tokener_parse(fixture);
+    assert(event);
+    assert(oom_event_is_old(event, now));
+    json_object_put(event);
+  }
+}
+
+static void test_timestamps(kubelet_source_t *source, bool pod_status) {
+  const struct {
+    const char *suffix;
+    int offset;
+    bool valid;
+  } cases[] = {
+      {"Z", 0, true},
+      {".123456Z", 0, true},
+      {"+05:30", 19800, true},
+      {"-07:00", -25200, true},
+      {".123456+05:30", 19800, true},
+      {".123456-07:00", -25200, true},
+      {"Zgarbage", 0, false},
+      {".123456Zgarbage", 0, false},
+      {"+05:30garbage", 0, false},
+      {"", 0, false},
+      {".Z", 0, false},
+      {"+24:00", 0, false},
+      {"+00:60", 0, false},
+      {"+5:30", 0, false},
+      {"+05", 0, false},
+      {"+0530", 0, false},
+  };
+  int failures = 0;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    for (int recent = 0; recent < 2; recent++) {
+      char timestamp[128], fixture[2048];
+      format_timestamp(timestamp, sizeof(timestamp),
+                       time(NULL) - (recent ? 30 : 600) + cases[i].offset,
+                       cases[i].suffix);
+      if (pod_status)
+        snprintf(
+            fixture, sizeof(fixture),
+            "{\"items\":[{\"metadata\":{\"namespace\":\"ns\",\"name\":\"pod\","
+            "\"uid\":\"%zu-%d\"},\"status\":{\"containerStatuses\":[{\"name\":"
+            "\"app\","
+            "\"restartCount\":1,\"lastState\":{\"terminated\":{\"reason\":"
+            "\"OOMKilled\",\"finishedAt\":\"%s\"}}}]}}]}",
+            i, recent, timestamp);
+      else
+        snprintf(fixture, sizeof(fixture),
+                 "{\"items\":[{\"metadata\":{\"uid\":\"%zu-%d\"},\"eventTime\":"
+                 "\"%s\","
+                 "\"involvedObject\":{\"kind\":\"Pod\",\"namespace\":\"ns\","
+                 "\"name\":\"pod\",\"fieldPath\":\"spec.containers{app}\"}}]}",
+                 i, recent, timestamp);
+      fixture_response = fixture;
+      pressured_memory_sample_t sample = {
+          .namespace = "ns", .pod_name = "pod", .container_name = "app"};
+      int count = 1;
+      int expected = recent || !cases[i].valid;
+      int collected =
+          pod_status ? collect_oom_from_pod_status(source, &sample, &count, 2)
+                     : collect_oom_events(source, &sample, &count, 2);
+      if (collected != expected ||
+          sample.oom_kill_count != (uint64_t)expected) {
+        fprintf(stderr, "timestamp %s: expected %d OOM, got %d\n", timestamp,
+                expected, collected);
+        failures++;
+      }
+    }
+  }
+  assert(failures == 0);
+}
+
 int main(int argc, char **argv) {
   assert(argc == 2);
   unsetenv("KUBERNETES_SERVICE_HOST");
@@ -229,6 +332,12 @@ int main(int argc, char **argv) {
     test_cache(source);
   else if (strcmp(argv[1], "age") == 0)
     test_age(source);
+  else if (strcmp(argv[1], "series") == 0)
+    test_series();
+  else if (strcmp(argv[1], "timestamps") == 0)
+    test_timestamps(source, false);
+  else if (strcmp(argv[1], "pod_timestamps") == 0)
+    test_timestamps(source, true);
   else if (strcmp(argv[1], "collection") == 0)
     test_collection();
   else

@@ -42,6 +42,7 @@ struct cgroup_source {
   char *base_path;       // Root cgroup path (e.g., /sys/fs/cgroup)
   char *discovered_path; // Auto-discovered pod/container path
   cgroup_version_t version;
+  bool collection_healthy;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -342,43 +343,30 @@ static char *discover_self_cgroup(const char *base_path) {
 /*
  * Read memory usage (cgroup v2: memory.current, v1: memory.usage_in_bytes)
  */
-uint64_t cgroup_read_memory_current(const char *path) {
-  char filepath[MAX_PATH];
-  FILE *f;
-  uint64_t value = 0;
-
-  // Try v2 first
-  snprintf(filepath, sizeof(filepath), "%s/memory.current", path);
-  f = fopen(filepath, "r");
-  if (f) {
-    if (fscanf(f, "%lu", &value) != 1)
-      value = 0;
-    fclose(f);
-    return value;
+static bool read_memory_current(const char *path, uint64_t *value) {
+  const char *files[] = {"memory.current", "memory.usage_in_bytes",
+                         "memory/memory.usage_in_bytes"};
+  *value = 0;
+  for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+    char filepath[MAX_PATH];
+    snprintf(filepath, sizeof(filepath), "%s/%s", path, files[i]);
+    FILE *file = fopen(filepath, "r");
+    if (!file)
+      continue;
+    bool success = fscanf(file, "%lu", value) == 1 && !ferror(file);
+    fclose(file);
+    if (!success)
+      *value = 0;
+    return success;
   }
-
-  // Try v1
-  snprintf(filepath, sizeof(filepath), "%s/memory.usage_in_bytes", path);
-  f = fopen(filepath, "r");
-  if (f) {
-    if (fscanf(f, "%lu", &value) != 1)
-      value = 0;
-    fclose(f);
-    return value;
-  }
-
-  // Try v1 with memory subdirectory
-  snprintf(filepath, sizeof(filepath), "%s/memory/memory.usage_in_bytes", path);
-  f = fopen(filepath, "r");
-  if (f) {
-    if (fscanf(f, "%lu", &value) != 1)
-      value = 0;
-    fclose(f);
-    return value;
-  }
-
   log_trace("cgroup: cannot read memory usage at %s", path);
-  return 0;
+  return false;
+}
+
+uint64_t cgroup_read_memory_current(const char *path) {
+  uint64_t value;
+  read_memory_current(path, &value);
+  return value;
 }
 
 /*
@@ -657,10 +645,11 @@ void cgroup_source_free(cgroup_source_t *source) {
 static int find_container_cgroups(const char *base_path,
                                   cgroup_version_t version,
                                   pressured_memory_sample_t *samples,
-                                  int *count, int max_count) {
+                                  int *count, int max_count,
+                                  bool *memory_read) {
   DIR *dir = opendir(base_path);
   if (!dir) {
-    return 0;
+    return -1;
   }
 
   const struct dirent *entry;
@@ -677,7 +666,10 @@ static int find_container_cgroups(const char *base_path,
     }
 
     // Check if this has memory stats
-    uint64_t usage = cgroup_read_memory_current(path);
+    uint64_t usage;
+    bool read = read_memory_current(path, &usage);
+    if (read && (strstr(path, "kubepods") || strstr(path, "pod")))
+      *memory_read = true;
     if (usage > 0) {
       // Check if it's a Kubernetes pod
       if (strstr(path, "kubepods") != NULL || strstr(path, "pod") != NULL) {
@@ -685,7 +677,8 @@ static int find_container_cgroups(const char *base_path,
 
         // Skip containers without limits
         if (limit == UINT64_MAX || limit == 0) {
-          find_container_cgroups(path, version, samples, count, max_count);
+          find_container_cgroups(path, version, samples, count, max_count,
+                                 memory_read);
           continue;
         }
 
@@ -712,7 +705,8 @@ static int find_container_cgroups(const char *base_path,
     }
 
     // Recurse into subdirectories
-    find_container_cgroups(path, version, samples, count, max_count);
+    find_container_cgroups(path, version, samples, count, max_count,
+                           memory_read);
   }
 
   closedir(dir);
@@ -721,6 +715,7 @@ static int find_container_cgroups(const char *base_path,
 
 pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count) {
   *count = 0;
+  source->collection_healthy = false;
 
   pressured_memory_sample_t *samples =
       calloc(MAX_CONTAINERS, sizeof(pressured_memory_sample_t));
@@ -739,6 +734,7 @@ pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count) {
 
     // Enumerate container cgroups within the pod cgroup
     DIR *dir = opendir(source->discovered_path);
+    bool root_readable = dir != NULL;
     if (dir) {
       struct dirent *entry;
       while ((entry = readdir(dir)) != NULL && *count < MAX_CONTAINERS) {
@@ -755,7 +751,9 @@ pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count) {
           snprintf(container_path, sizeof(container_path), "%s/%s",
                    source->discovered_path, entry->d_name);
 
-          uint64_t usage = cgroup_read_memory_current(container_path);
+          uint64_t usage;
+          if (read_memory_current(container_path, &usage))
+            source->collection_healthy = true;
           uint64_t limit = cgroup_read_memory_max(container_path);
 
           // Skip containers with no limit (like sidecars with no resource
@@ -808,8 +806,10 @@ pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count) {
     free(pod_container);
 
     // If no containers found, fall back to pod-level reading
-    if (*count == 0) {
-      uint64_t usage = cgroup_read_memory_current(source->discovered_path);
+    if (root_readable && *count == 0) {
+      uint64_t usage;
+      if (read_memory_current(source->discovered_path, &usage))
+        source->collection_healthy = true;
       uint64_t limit = cgroup_read_memory_max(source->discovered_path);
 
       if (usage > 0 && limit != UINT64_MAX && limit > 0) {
@@ -842,12 +842,19 @@ pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count) {
     }
   } else {
     // Cluster mode: scan all kubepods
-    find_container_cgroups(source->base_path, source->version, samples, count,
-                           MAX_CONTAINERS);
+    bool memory_read = false;
+    int result =
+        find_container_cgroups(source->base_path, source->version, samples,
+                               count, MAX_CONTAINERS, &memory_read);
+    source->collection_healthy = result == 0 && memory_read;
   }
 
   log_debug("cgroup: collected %d samples", *count);
   return samples;
+}
+
+bool cgroup_collect_healthy(const cgroup_source_t *source) {
+  return source && source->collection_healthy;
 }
 
 void cgroup_samples_free(pressured_memory_sample_t *samples, int count) {

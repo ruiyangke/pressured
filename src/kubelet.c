@@ -1,7 +1,9 @@
 #define _GNU_SOURCE // for strptime and timegm
 #include "internal.h"
 #include "log.h"
+#include <ctype.h>
 #include <curl/curl.h>
+#include <errno.h>
 #include <json-c/json.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -831,18 +833,70 @@ static void mark_event_seen(kubelet_source_t *source, const char *uid) {
   entry->timestamp = time(NULL);
 }
 
+static bool parse_rfc3339(const char *text, time_t *timestamp) {
+  if (!text || strlen(text) < 20)
+    return false;
+  const char *shape = "0000-00-00T00:00:00";
+  for (size_t i = 0; i < 19; i++) {
+    if (shape[i] == '0' ? !isdigit((unsigned char)text[i])
+                        : text[i] != shape[i])
+      return false;
+  }
+  struct tm tm = {0};
+  const char *end = strptime(text, "%Y-%m-%dT%H:%M:%S", &tm);
+  if (!end || tm.tm_sec > 60)
+    return false;
+  const int month_days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  int year = tm.tm_year + 1900;
+  int days = month_days[tm.tm_mon];
+  if (tm.tm_mon == 1 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0))
+    days++;
+  if (tm.tm_mday > days)
+    return false;
+  if (*end == '.') {
+    end++;
+    if (!isdigit((unsigned char)*end))
+      return false;
+    while (isdigit((unsigned char)*end))
+      end++;
+  }
+  int offset = 0;
+  if (*end == 'Z' && end[1] == '\0') {
+    // UTC needs no adjustment.
+  } else if ((*end == '+' || *end == '-') && strlen(end) == 6 &&
+             isdigit((unsigned char)end[1]) && isdigit((unsigned char)end[2]) &&
+             end[3] == ':' && isdigit((unsigned char)end[4]) &&
+             isdigit((unsigned char)end[5])) {
+    int hours = (end[1] - '0') * 10 + end[2] - '0';
+    int minutes = (end[4] - '0') * 10 + end[5] - '0';
+    if (hours > 23 || minutes > 59)
+      return false;
+    offset = (hours * 60 + minutes) * 60;
+    if (*end == '-')
+      offset = -offset;
+  } else {
+    return false;
+  }
+  errno = 0;
+  time_t utc = timegm(&tm);
+  if (errno == EOVERFLOW)
+    return false;
+  *timestamp = utc - offset;
+  return true;
+}
+
 static bool oom_event_is_old(struct json_object *event, time_t now) {
-  const char *fields[] = {"lastTimestamp", "eventTime", "firstTimestamp"};
+  struct json_object *series = NULL;
+  json_object_object_get_ex(event, "series", &series);
+  const char *fields[] = {"lastObservedTime", "lastTimestamp", "eventTime",
+                          "firstTimestamp"};
   for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
     struct json_object *value;
-    if (!json_object_object_get_ex(event, fields[i], &value))
+    if (!json_object_object_get_ex(i == 0 ? series : event, fields[i], &value))
       continue;
-    const char *timestamp = json_object_get_string(value);
-    if (!timestamp || !*timestamp)
-      continue;
-    struct tm tm = {0};
-    if (strptime(timestamp, "%Y-%m-%dT%H:%M:%S", &tm))
-      return difftime(now, timegm(&tm)) > 300;
+    time_t timestamp;
+    if (parse_rfc3339(json_object_get_string(value), &timestamp))
+      return difftime(now, timestamp) > 300;
   }
   return false;
 }
@@ -1122,19 +1176,14 @@ static int collect_oom_from_pod_status(kubelet_source_t *source,
       // restart The lastState persists until the next container termination, so
       // without this check, every pressured restart would re-report all
       // historical OOMs
-      if (finished_at) {
-        struct tm tm = {0};
-        // Parse ISO8601 format: "2025-12-12T21:08:37Z"
-        if (strptime(finished_at, "%Y-%m-%dT%H:%M:%S", &tm)) {
-          time_t event_time = timegm(&tm);
-          time_t now = time(NULL);
-          int age_seconds = (int)(now - event_time);
-          if (age_seconds > 300) { // 5 minutes
-            log_debug("skipping old OOM event: ns=%s pod=%s container=%s "
-                      "finished=%s age=%ds",
-                      ns, pod_name, container_name, finished_at, age_seconds);
-            continue;
-          }
+      time_t event_time;
+      if (parse_rfc3339(finished_at, &event_time)) {
+        double age_seconds = difftime(time(NULL), event_time);
+        if (age_seconds > 300) {
+          log_debug("skipping old OOM event: ns=%s pod=%s container=%s "
+                    "finished=%s age=%.0fs",
+                    ns, pod_name, container_name, finished_at, age_seconds);
+          continue;
         }
       }
 

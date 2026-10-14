@@ -30,6 +30,8 @@ typedef struct cgroup_source cgroup_source_t;
 cgroup_source_t *cgroup_source_new(const char *base_path);
 void cgroup_source_free(cgroup_source_t *source);
 pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count);
+// True when the cgroup root was readable and memory usage was read.
+bool cgroup_collect_healthy(const cgroup_source_t *source);
 void cgroup_samples_free(pressured_memory_sample_t *samples, int count);
 
 // Memory reading functions (support both v1 and v2)

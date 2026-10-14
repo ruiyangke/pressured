@@ -210,7 +210,7 @@ int main(int argc, char *argv[]) {
       healthy = kubelet_collect_healthy(kubelet_source);
     } else {
       samples = cgroup_collect(cgroup_source, &sample_count);
-      healthy = samples != NULL;
+      healthy = cgroup_collect_healthy(cgroup_source);
     }
 
     if (healthy && health_write(heartbeat_path, time(NULL)) != 0)

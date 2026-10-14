@@ -126,13 +126,14 @@ add_test(NAME test_health_check_cli
 
 add_executable(test_kubelet src/test_kubelet.c)
 target_link_libraries(test_kubelet pressured_core)
-foreach(case dedupe cache age collection)
+foreach(case dedupe cache age collection series timestamps pod_timestamps)
     add_test(NAME test_kubelet_${case} COMMAND test_kubelet ${case})
 endforeach()
 
 add_executable(test_health src/test_health.c)
 add_dependencies(test_health pressured)
-foreach(case probe heartbeat)
+target_link_libraries(test_health pressured_core)
+foreach(case probe heartbeat missing write)
     add_test(NAME test_health_${case} COMMAND test_health $<TARGET_FILE:pressured> ${case})
 endforeach()
 
