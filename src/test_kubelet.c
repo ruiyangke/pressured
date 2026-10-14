@@ -19,6 +19,7 @@ static CURLcode fixture_getinfo(CURL *curl, CURLINFO info, ...);
 
 static int scenario = -1;
 static int finished_cycles;
+static int cycle;
 static int finish_cycle(useconds_t delay);
 #define usleep finish_cycle
 #define main pressured_main
@@ -38,6 +39,8 @@ static int finish_cycle(useconds_t delay) {
 }
 
 static const char *fixture_response = "{\"items\":[]}";
+// When set, overrides the scenario modes and picks a response per request path.
+static const char *(*route)(const char *path);
 static http_buffer_t *response_buffer;
 static char request_path[2048];
 static int node_requests;
@@ -57,7 +60,9 @@ static CURLcode fixture_setopt(CURL *curl, CURLoption option, ...) {
 static CURLcode fixture_perform(CURL *curl) {
   (void)curl;
   response_code = forced_response_code;
-  if (scenario >= 0) {
+  if (route) {
+    fixture_response = route(request_path);
+  } else if (scenario >= 0) {
     fixture_response = "{\"items\":[]}";
     if (strstr(request_path, "/stats/summary")) {
       fixture_response = "{\"pods\":[]}";
@@ -791,6 +796,116 @@ static void test_token(kubelet_source_t *source) {
   assert(result == 0);
 }
 
+// Looks up an annotation value by key; order in the array does not matter.
+static const char *annotation_value(const pressured_memory_sample_t *sample,
+                                    const char *key) {
+  for (int i = 0; i < sample->annotations_count; i++) {
+    if (strcmp(sample->annotations[i].key, key) == 0)
+      return sample->annotations[i].value;
+  }
+  return NULL;
+}
+
+static const char *cycles_route(const char *path) {
+  if (strstr(path, "/stats/summary")) {
+    if (cycle == 3)
+      return "{\"pods\":["
+             "{\"podRef\":{\"namespace\":\"shop\",\"name\":\"web\"},"
+             "\"containers\":[{\"name\":\"app\",\"memory\":"
+             "{\"workingSetBytes\":600000}}]},"
+             "{\"podRef\":{\"namespace\":\"shop\",\"name\":\"api\"},"
+             "\"containers\":[{\"name\":\"app\",\"memory\":"
+             "{\"workingSetBytes\":700000}}]}]}";
+    return "{\"pods\":[{\"podRef\":{\"namespace\":\"shop\",\"name\":\"web\"},"
+           "\"containers\":[{\"name\":\"app\",\"memory\":"
+           "{\"workingSetBytes\":600000}}]}]}";
+  }
+  if (strstr(path, "/nodes"))
+    return "{\"items\":[{\"metadata\":{\"name\":\"n1\"},\"status\":"
+           "{\"addresses\":[{\"type\":\"InternalIP\",\"address\":"
+           "\"10.0.0.9\"}]}}]}";
+  if (strstr(path, "/pods")) {
+    if (cycle == 2)
+      return NULL;
+    if (cycle == 3)
+      return "{\"items\":["
+             "{\"metadata\":{\"namespace\":\"shop\",\"name\":\"web\","
+             "\"annotations\":{\"pressured.io/warn-percent\":\"60\","
+             "\"team\":\"b\"}},\"status\":{\"podIP\":\"10.1.0.1\"},"
+             "\"spec\":{\"containers\":[{\"name\":\"app\",\"resources\":"
+             "{\"limits\":{\"memory\":\"1Mi\"}}}]}},"
+             "{\"metadata\":{\"namespace\":\"shop\",\"name\":\"api\"},"
+             "\"spec\":{\"containers\":[{\"name\":\"app\",\"resources\":"
+             "{\"limits\":{\"memory\":\"2Mi\"}}}]}}]}";
+    return "{\"items\":[{\"metadata\":{\"namespace\":\"shop\",\"name\":\"web\","
+           "\"annotations\":{\"pressured.io/warn-percent\":\"50\","
+           "\"team\":\"a\"}},\"status\":{\"podIP\":\"10.1.0.1\"},"
+           "\"spec\":{\"containers\":[{\"name\":\"app\",\"resources\":"
+           "{\"limits\":{\"memory\":\"1Mi\"}}}]}}]}";
+  }
+  return "{\"items\":[]}";
+}
+
+// Pins the sample strings and pod cache across several collection cycles so a
+// later lifetime change that leaves a dangling pointer is caught here.
+static void test_cycles(kubelet_source_t *source) {
+  event_generator_t *gen = event_generator_new(0.8, 0.9, 0.05, 0, false);
+  assert(gen);
+  route = cycles_route;
+  for (cycle = 1; cycle <= 3; cycle++) {
+    int count = 0;
+    pressured_memory_sample_t *samples = kubelet_collect(source, &count);
+    assert(samples);
+    assert(count == (cycle == 3 ? 2 : 1));
+    for (int i = 0; i < count; i++) {
+      pressured_memory_sample_t *sample = &samples[i];
+      assert(strcmp(sample->namespace, "shop") == 0);
+      assert(strcmp(sample->container_name, "app") == 0);
+      assert(strcmp(sample->node_name, "n1") == 0);
+      const char *warn = annotation_value(sample, "pressured.io/warn-percent");
+      const char *team = annotation_value(sample, "team");
+      if (strcmp(sample->pod_name, "web") == 0) {
+        assert(strcmp(sample->pod_ip, "10.1.0.1") == 0);
+        assert(sample->annotations_count == 2);
+        assert(warn != NULL && team != NULL);
+        assert(strcmp(warn, cycle == 3 ? "60" : "50") == 0);
+        assert(strcmp(team, cycle == 3 ? "b" : "a") == 0);
+      } else {
+        assert(strcmp(sample->pod_name, "api") == 0);
+        assert(sample->pod_ip == NULL);
+        assert(sample->annotations == NULL);
+        assert(sample->annotations_count == 0);
+      }
+    }
+
+    int event_count = 0;
+    pressured_event_t *events =
+        event_generator_process(gen, samples, count, &event_count);
+    if (cycle == 1) {
+      // 600000 / 1048576 is about 57%, a warn-level event for web/app.
+      assert(event_count == 1);
+      assert(events[0].event_type == EVENT_TYPE_MEMORY_PRESSURE);
+      assert(strcmp(events[0].sample.namespace, "shop") == 0);
+      assert(strcmp(events[0].sample.pod_name, "web") == 0);
+      assert(strcmp(events[0].sample.container_name, "app") == 0);
+      assert(events[0].sample.annotations_count == 2);
+    } else {
+      // Cycle 2 and 3 event counts depend on hysteresis and cooldown; only the
+      // shared sample strings must remain readable.
+      for (int i = 0; i < event_count; i++) {
+        assert(strlen(events[i].sample.namespace) > 0);
+        assert(strlen(events[i].sample.pod_name) > 0);
+        assert(strlen(events[i].sample.container_name) > 0);
+      }
+    }
+
+    for (int i = 0; i < count; i++)
+      pressured_memory_sample_free(&samples[i]);
+  }
+  route = NULL;
+  event_generator_free(gen);
+}
+
 int main(int argc, char **argv) {
   assert(argc == 2);
   unsetenv("KUBERNETES_SERVICE_HOST");
@@ -820,6 +935,8 @@ int main(int argc, char **argv) {
     test_timestamps(source, true);
   else if (strcmp(argv[1], "collection") == 0)
     test_collection();
+  else if (strcmp(argv[1], "cycles") == 0)
+    test_cycles(source);
   else
     assert(0);
   kubelet_source_free(source);
