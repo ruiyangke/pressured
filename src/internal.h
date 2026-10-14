@@ -29,9 +29,15 @@ typedef struct cgroup_source cgroup_source_t;
 
 cgroup_source_t *cgroup_source_new(const char *base_path);
 void cgroup_source_free(cgroup_source_t *source);
+// Ownership: the returned array is owned by the source and reused by the next
+// cgroup_collect() call. The caller must free each sample's contents with
+// pressured_memory_sample_free() before the next collect, and must never free
+// the array itself.
 pressured_memory_sample_t *cgroup_collect(cgroup_source_t *source, int *count);
 // True when the cgroup root was readable and memory usage was read.
 bool cgroup_collect_healthy(const cgroup_source_t *source);
+// Frees the samples' contents only. The array itself is owned by the source
+// and must not be freed here.
 void cgroup_samples_free(pressured_memory_sample_t *samples, int count);
 
 // Memory reading functions (support both v1 and v2)
@@ -55,6 +61,10 @@ typedef struct kubelet_source kubelet_source_t;
 kubelet_source_t *kubelet_source_new(void);
 void kubelet_source_free(kubelet_source_t *source);
 int kubelet_source_init(kubelet_source_t *source);
+// Ownership: the returned array is owned by the source and reused by the next
+// kubelet_collect() call. The caller must free each sample's contents with
+// pressured_memory_sample_free() before the next collect, and must never free
+// the array itself.
 pressured_memory_sample_t *kubelet_collect(kubelet_source_t *source,
                                            int *count);
 // True only when node/pod discovery and at least one node stats request
@@ -76,9 +86,15 @@ event_generator_t *event_generator_new(double warn_percent,
                                        int cooldown_seconds,
                                        bool oom_count_cumulative);
 void event_generator_free(event_generator_t *gen);
+// Ownership: the returned events array is owned by the generator and reused by
+// the next event_generator_process() call. The caller must call
+// event_generator_events_clear() before the next process call; it frees only
+// the events' contents. The caller must never free the array itself.
 pressured_event_t *event_generator_process(event_generator_t *gen,
                                            pressured_memory_sample_t *samples,
                                            int sample_count, int *event_count);
+// Frees the events' contents only. The array itself is owned by the generator
+// and must not be freed here.
 void event_generator_events_clear(pressured_event_t *events, int count);
 pressured_severity_t event_generator_get_severity(event_generator_t *gen,
                                                   const char *namespace,
