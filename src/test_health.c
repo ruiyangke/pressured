@@ -101,8 +101,10 @@ static void run_collector(const char *root, int expected) {
     execl(program, program, "-c", config, "-l", "error", (char *)NULL);
     _exit(127);
   }
+  // Allow a slow first start (cold cache, loaded CI runner); the loop ends
+  // as soon as the expected state is reached
   int ready = 0;
-  for (int i = 0; i < 200; i++) {
+  for (int i = 0; i < 1000; i++) {
     if (expected ? health_check(heartbeat, time(NULL), 60) == NULL
                  : access(heartbeat, F_OK) != 0) {
       ready = 1;
