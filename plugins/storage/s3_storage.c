@@ -1175,6 +1175,10 @@ static size_t etag_header_callback(char *buffer, size_t size, size_t nitems,
       }
       value++;
     }
+    // Drop trailing spaces and tabs left after stripping the quotes
+    while (i > 0 && (hdr->etag[i - 1] == ' ' || hdr->etag[i - 1] == '\t')) {
+      i--;
+    }
     if (hdr->etag_size > 0) {
       hdr->etag[i] = '\0';
     }
@@ -1190,7 +1194,10 @@ static int s3_ensure_etag_capacity(s3_file_t *sf, int needed) {
   if (needed <= sf->etags_capacity)
     return 0;
 
-  int new_cap = sf->etags_capacity * 2;
+  int new_cap = sf->etags_capacity > 0 ? sf->etags_capacity : 16;
+  while (new_cap < needed)
+    new_cap *= 2;
+
   char (*new_etags)[S3_ETAG_MAX] =
       realloc(sf->etags, new_cap * sizeof *sf->etags);
   if (!new_etags)
