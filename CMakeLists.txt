@@ -62,13 +62,20 @@ link_directories(
     ${CRYPTO_LIBRARY_DIRS}
 )
 
-# Core library (no Lua dependency - Lua is in the plugin)
-# Vendored JSON parser (third_party/yyjson): built without our warning flags
+# Vendored JSON parser (third_party/yyjson): built without our warning flags,
+# reader only, nesting limited to 64 levels
 add_library(yyjson STATIC third_party/yyjson/yyjson.c)
 set_target_properties(yyjson PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(yyjson PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/yyjson)
 target_compile_options(yyjson PRIVATE -w)
+target_compile_definitions(yyjson PUBLIC
+    YYJSON_READER_DEPTH_LIMIT=64
+    YYJSON_DISABLE_WRITER=1
+    YYJSON_DISABLE_UTILS=1
+    YYJSON_DISABLE_INCR_READER=1
+)
 
+# Core library (no Lua dependency - Lua is in the plugin)
 add_library(pressured_core STATIC
     src/health.c
     src/config.c
@@ -128,6 +135,10 @@ add_test(NAME test_event_generator COMMAND test_event_generator)
 add_executable(test_config_corpus src/test_config_corpus.c)
 target_link_libraries(test_config_corpus pressured_core)
 add_test(NAME test_config_corpus COMMAND test_config_corpus)
+
+add_executable(test_pjson src/test_pjson.c)
+target_link_libraries(test_pjson pressured_core)
+add_test(NAME test_pjson COMMAND test_pjson)
 
 # The probe form used by the Helm chart (--health-check=N) and the
 # space-separated form, against the real binary
